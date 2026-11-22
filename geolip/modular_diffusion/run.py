@@ -5,6 +5,10 @@
 
 ``main(experiment, argv, **overrides)`` imports ``geolip.modular_diffusion.experiments.<experiment>`` and calls its
 ``main(argv, **overrides)`` (``key=value`` items and/or keywords, read with ``config.parse``).
+
+The experiments (``EXPERIMENTS``): time_split (what a stage costs when it shares nothing), chain_reads (reads on saved
+stage models), content (where and how the class enters; class experts; a class snapped in), closed_forms (heads solved
+by least squares; units trained on stored states).
 """
 from __future__ import annotations
 
@@ -15,6 +19,7 @@ from typing import Any, Iterable
 from .config import in_notebook
 
 EXPERIMENTS_PACKAGE = "geolip.modular_diffusion.experiments"
+EXPERIMENTS = ("time_split", "chain_reads", "content", "closed_forms")
 
 
 def main(experiment: str, argv: Iterable[str] = (), **overrides: Any):
@@ -24,7 +29,8 @@ def main(experiment: str, argv: Iterable[str] = (), **overrides: Any):
         mod = importlib.import_module(f"{EXPERIMENTS_PACKAGE}.{experiment}")
     except ModuleNotFoundError as e:
         if e.name == f"{EXPERIMENTS_PACKAGE}.{experiment}":
-            raise ValueError(f"no experiment named {experiment!r} in {EXPERIMENTS_PACKAGE}") from None
+            raise ValueError(f"no experiment named {experiment!r} in {EXPERIMENTS_PACKAGE}; known: "
+                             f"{list(EXPERIMENTS)}") from None
         raise
     return mod.main(list(argv), **overrides)
 

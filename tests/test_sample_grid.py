@@ -96,7 +96,7 @@ def test_picture_score_on_a_grid(setup, tmp_path):
     g = stage_grid(CUTS, [1, 3, 2])
     staged = picture_score(model, bed, judge, ref, n=40, batch=20, grid=g)
     assert staged["steps"] == 6 and staged["grid"] == g
-    assert set(staged) == {"score", "n", "steps", "seed", "judge", "seconds", "grid"}
+    assert set(staged) == {"score", "n", "steps", "seed", "judge", "seconds", "grid", "mean_term", "spread_term"}
     pics = sample_pictures(model, bed, 20, batch=20, grid=g)
     assert torch.equal(pics, sample_pictures(model, bed, 20, steps=3, batch=20, grid=g))
     sample_sheet(model, bed, str(tmp_path / "grid.png"), "cpu", per_class=1, grid=g)

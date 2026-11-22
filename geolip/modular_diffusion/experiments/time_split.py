@@ -30,7 +30,9 @@ variant are born with the same numbers and see the same pictures and noise at ea
 
 Arguments (key=value): variant, seed, data, out, device, heldout, batch, lr, warmup, log_every, threads, mem_fraction
 (applied on Windows only), scale (multiplies every step count, at least 2 per part), dim, score (0 / 1), judge
-(inception / fake), score_n, score_steps, ref (an npz caching the reference statistics), sheet, source, stem_from.
+(inception / fake), score_n, score_steps, ref (an npz caching the reference statistics), sheet, source, stem_from,
+avg (one-model variants only: a comma list of decays; each average of the trained parameters is exported as
+model_avg<digits after the point>/, read and scored after the last weights, and reported under "averaged").
 
 Output in ``out``: log.txt (its last line 'done'), result.json, samples.png (with sheet), the build folder(s) (model/,
 or stage_0 .. stage_2/ with staged.json).
@@ -76,7 +78,36 @@ VARIANTS = tuple(PLAIN) + ("tails_mixed",) + CLUSTERED
 
 DEFAULTS = dict(variant="", seed=0, data="", out="", device="cuda", heldout=2048, batch=128, lr=1e-3, warmup=100,
                 log_every=500, threads=4, mem_fraction=0.25, scale=1.0, dim=128, score=0, judge="inception",
-                score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="")
+                score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", avg="")
+
+
+def parse_averages(text: str) -> List[tuple]:
+    """``avg=`` text "0.999,0.9995" -> [(key "0.999", folder "model_avg999", decay 0.999), ...]: the key is the decay's
+    decimal text, the folder name carries the digits after the point."""
+    out = []
+    for item in str(text).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        d = float(item)
+        if not 0.0 < d < 1.0:
+            raise ValueError(f"an average's decay lies in (0, 1): {item!r}")
+        key = repr(d)
+        out.append((key, "model_avg" + key.split(".", 1)[1], d))
+    if len({k for k, _, _ in out}) != len(out):
+        raise ValueError(f"a decay is listed twice: {text!r}")
+    return out
+
+
+def export_averages(model, res: dict, averages: List[tuple], out: str, export) -> None:
+    """Each average's weights exported as a build folder of its own (``export(model, folder, recipe)`` with the
+    averaged values swapped in; the last weights are back in the model afterwards)."""
+    from ..train import use_average
+    for key, folder, d in averages:
+        rec = dict(res["recipe"], average_decay=d, average_rule="d_k = min(d, (1 + k) / (10 + k)); "
+                                                                "avg <- d_k avg + (1 - d_k) w after optimizer step k")
+        with use_average(model, res["averaged"][d]):
+            export(model, folder, rec)
 
 
 def steps_of(n: int, scale: float) -> int:
@@ -162,6 +193,10 @@ def main(argv=(), **overrides) -> dict:
         raise ValueError("tails_alone needs stem_from=<the folder of a finished plain_d4 run of the same seed>")
     if int(a["score"]) and a["judge"] not in JUDGES:
         raise ValueError(f"unknown judge {a['judge']!r}; known: {list(JUDGES)}")
+    averages = parse_averages(a["avg"])
+    if averages and kind_of(variant) == "clusters":
+        raise ValueError(f"avg= applies to the one-model variants; {variant} trains clusters (averages of clusters are "
+                         f"not supported)")
     torch.set_num_threads(int(a["threads"]))
     device = a["device"]
     if str(device).startswith("cuda"):
@@ -219,8 +254,13 @@ def main(argv=(), **overrides) -> dict:
             width = int(round(WIDE * dim)) if spec.get("wide") else dim
             model = born(spec.get("stem_depth", 7), 0, width)
             t_sampling = spec.get("t_sampling", "uniform")
-        res = fit_units(model, bed, seed, steps=n, t_sampling=t_sampling, expect_anchor_at_birth=True, **common)
+        res = fit_units(model, bed, seed, steps=n, t_sampling=t_sampling, expect_anchor_at_birth=True,
+                        averages=tuple(d for _, _, d in averages), **common)
         export(model, "model", res, _non_anchor(model))
+        if averages:
+            export_averages(model, res, averages, out, lambda m, f, rec: export_build(
+                m, os.path.join(out, f), seed=seed, trained=_non_anchor(m), recipe=rec, data=data_block,
+                marks={"loss_over_levels": None, "frozen_unchanged": res["frozen_unchanged"]}))
         parts.append(_part_row(name, "model", res))
         progress(name, n)
         final, _ = load_job(out, device=device, kind="model")
@@ -279,21 +319,39 @@ def main(argv=(), **overrides) -> dict:
             r = read(c, bed, int(a["heldout"]), device)
             alone.append({"loss_over_levels": r["loss_over_levels"], "by_level": _levels(r)})
         result["alone"] = alone
-    if int(a["score"]):
+    judged: Dict[str, Any] = {}
+
+    def score_of(m, tag: str = "") -> dict:
         # a failure of the judge (its weights, its memory) is recorded and the job still ends with its losses
         n_score = int(a["score_n"])
         try:
-            judge = make_judge(a["judge"], device)
-            ref = reference_stats(bed, judge, a["ref"] or None, batch=1000)
-            result["score"] = picture_score(final, bed, judge, ref, n=n_score, steps=int(a["score_steps"]),
-                                            batch=min(1000, n_score), device=device)
-            log(f"SCORE {result['score']['score']:.4f} on {n_score} pictures ({result['score']['judge']})")
+            if "judge" not in judged:
+                judged["judge"] = make_judge(a["judge"], device)
+                judged["ref"] = reference_stats(bed, judged["judge"], a["ref"] or None, batch=1000)
+            sc = picture_score(m, bed, judged["judge"], judged["ref"], n=n_score, steps=int(a["score_steps"]),
+                               batch=min(1000, n_score), device=device)
+            log(f"SCORE{tag} {sc['score']:.4f} on {n_score} pictures ({sc['judge']})")
+            return sc
         except Exception as e:
-            result["score"] = {"error": repr(e)}
-            log(f"SCORE not computed: {e!r}")
+            log(f"SCORE{tag} not computed: {e!r}")
+            return {"error": repr(e)}
+
+    if int(a["score"]):
+        result["score"] = score_of(final)
+    if averages:
+        result["averaged"] = {}
+        for key, folder, d in averages:
+            avg_model = link(os.path.join(out, folder), device=device)
+            log(f"READ the average {key} ({folder})")
+            r = read(avg_model, bed, int(a["heldout"]), device)
+            result["averaged"][key] = {"loss_over_levels": r["loss_over_levels"], "by_level": _levels(r),
+                                       "by_stage": by_stage(r, CUTS),
+                                       "score": score_of(avg_model, f" (average {key})") if int(a["score"]) else None}
     if int(a["sheet"]):
         sample_sheet(final, bed, os.path.join(out, "samples.png"), device)
-    result.update({"args": {k: a[k] for k in sorted(a)}, "torch": torch.__version__, "device": str(device),
+    # avg= is recorded only when given, so a job without averages writes the result of earlier versions
+    result.update({"args": {k: a[k] for k in sorted(a) if not (k == "avg" and not a[k])}, "torch": torch.__version__,
+                   "device": str(device),
                    "version": __version__})
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(result, fh, indent=1)
@@ -301,6 +359,7 @@ def main(argv=(), **overrides) -> dict:
     bs = ", ".join("-" if x is None else f"{x:.4f}" for x in result["by_stage"])
     log(f"RESULT {variant} seed {seed}: over ten levels {result['loss_over_levels']:.4f}; by stage {bs}"
         + (f"; wrong assembly {result['wrong_assembly']['loss_over_levels']:.4f}" if result["wrong_assembly"] else "")
+        + "".join(f"; average {k} {v['loss_over_levels']:.4f}" for k, v in (result.get("averaged") or {}).items())
         + f"; {(time.time() - t_job) / 60:.1f} min")
     log("done")
     return result

@@ -4,7 +4,8 @@
 (2) at ten fixed noise levels (on the first 1,024 held-out items): the error by frequency band, the anchor alone, the
     error of predicting nothing, every part switched off (its cost by band), each part's output share by band, all
     members off against the sum of the single removals (independence), and where each member's attention looks
-    (at t = 0.45); with classes, the error without the caption, by class and by class group.
+    (at t = 0.45); with classes, the error without the caption, by class and by class group. The anchor alone reads
+    the held-out class; a per-class anchor is also read without it (``linear_physics_without_caption``).
 
 Arithmetic (part of the result's definition): chunks of 256 items, each chunk weighted by its size over the level count,
 float64 band powers, and the means over levels taken with numpy over ten floats.
@@ -78,6 +79,7 @@ def read(model, bed, heldout: int, device) -> dict:
     levels = {}
     n_lv = min(n_held, LEVEL_ITEMS)
     member_parts = {m.part for m in model.members}
+    class_anchor = model.anchor is not None and getattr(model.anchor, "symbols", 0) > 0
     for t in T_GRID:
         acc = {}
         att = {}
@@ -97,7 +99,9 @@ def read(model, bed, heldout: int, device) -> dict:
                 acc[key] = acc.get(key, 0) + p * w
 
             add("err", band_power(model, full - target))
-            add("linear", band_power(model, model.anchor_velocity(zt, tt) - target))
+            add("linear", band_power(model, model.anchor_velocity(zt, tt, cls[sl]) - target))
+            if class_anchor:                                   # the per-class anchor read without the class
+                add("linear_null", band_power(model, model.anchor_velocity(zt, tt) - target))
             add("zero", band_power(model, target))
             mem = [k for k in parts if k in member_parts]
             if mem:
@@ -135,6 +139,8 @@ def read(model, bed, heldout: int, device) -> dict:
             return d
 
         row = {"error": by_band(acc["err"]), "linear_physics": by_band(acc["linear"]), "predict_nothing": by_band(acc["zero"])}
+        if "linear_null" in acc:
+            row["linear_physics_without_caption"] = by_band(acc["linear_null"])
         if "err_null" in acc:
             row["error_without_caption"] = by_band(acc["err_null"])
             row["error_by_class"] = [csum[c] / max(1, ccnt[c]) for c in range(10)]

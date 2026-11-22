@@ -62,5 +62,11 @@ def test_10_fake_judge_end_to_end_and_reference_cache(setup, tmp_path):
         reference_stats(bed, FakeJudge(dim=16, seed=1), path)
     s1 = picture_score(model, bed, judge, ref, n=64, steps=2, batch=32)
     s2 = picture_score(model, bed, judge, ref, n=64, steps=2, batch=32)
-    assert set(s1) == {"score", "n", "steps", "seed", "judge", "seconds"}
+    assert set(s1) == {"score", "n", "steps", "seed", "judge", "seconds", "mean_term", "spread_term"}
     assert s1["score"] == s2["score"] and s1["score"] > 0 and s1["n"] == 64 and s1["judge"] == judge.name
+    # the distance's two parts: the feature means' squared distance (computed here again) and the rest
+    from geolip.modular_diffusion.score import sample_pictures
+    feats = judge.features(sample_pictures(model, bed, 64, steps=2, batch=32))
+    gap = feats.mean(axis=0) - ref[0]
+    assert abs(s1["mean_term"] - float(gap @ gap)) <= 1e-12 * max(1.0, s1["mean_term"]) and s1["mean_term"] >= 0
+    assert s1["mean_term"] + s1["spread_term"] == pytest.approx(s1["score"], rel=1e-12)

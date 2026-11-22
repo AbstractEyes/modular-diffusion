@@ -6,6 +6,9 @@ windowed bodies (tails) are mixed by the stage weights before one head.
     mixed_tails_build(field_shape, stem_depth=4, tail_depth=3, cuts=(0, 0.25, 0.65, 1), soft=0.06)
                                                              anchor, stem, body_0 .. body_{S-1}, head
     adopt(model, folder, ["stem"])                           the named units' weights from a build folder
+    add_class_experts(build, [[0], [1]], window=(0, 0.25))   one ContentExpert per class set (expert_c0, expert_c1)
+    add_band_members(build, (0, 1, 2))                       one band-kept BandMember per band (member_b0 ..)
+    with_class_experts(folder, seed, [[9]])                  a finished build folder + newborn class experts
 
 Every unit keeps a fixed name (anchor, stem, body, head), so the units of different clusters are interchangeable.
 ``cluster_build(stem_depth=k)`` gives exactly the unit entries and geometry of the flat arguments ``arch=plain
@@ -14,7 +17,7 @@ plain_depth=k anchor=1 anchor_in=1`` (``compat.build_from_args``).
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -32,10 +35,22 @@ def geometry(field_shape: Sequence[int], grid: int = 16, dim: int = 128, heads: 
             "heads": int(heads), "time_freq": TIME_FREQ, "classes": NULL_CLASS + 1, "bands": int(bands)}
 
 
-def _anchor_stem(stem_depth: int, anchor_out: bool, anchor_in: int):
-    return [UnitEntry("anchor", "Anchor", {"site": "anchor"}, {"output": bool(anchor_out)}),
-            UnitEntry("stem", "Stem", {"site": "trunk", "slot": 0},
-                      {"depth": int(stem_depth), "anchor_in": int(anchor_in), "code": list(WHOLE)})]
+def _edge(x) -> str:
+    """A window edge as stored: a string is kept as written, a number becomes its exact decimal text."""
+    return x if isinstance(x, str) else num(x)
+
+
+def _anchor_stem(stem_depth: int, anchor_out: bool, anchor_in: int, anchor_symbols: int = 0,
+                 class_window: Optional[Sequence] = None):
+    aspec = {"output": bool(anchor_out)}
+    if int(anchor_symbols) > 0:
+        aspec["symbols"] = int(anchor_symbols)
+    sspec = {"depth": int(stem_depth), "anchor_in": int(anchor_in), "code": list(WHOLE)}
+    if class_window is not None:
+        lo, hi = class_window
+        sspec["class_window"] = [_edge(lo), _edge(hi)]
+    return [UnitEntry("anchor", "Anchor", {"site": "anchor"}, aspec),
+            UnitEntry("stem", "Stem", {"site": "trunk", "slot": 0}, sspec)]
 
 
 def _head():
@@ -44,15 +59,101 @@ def _head():
 
 def cluster_build(field_shape: Sequence[int], *, stem_depth: int, body_depth: int = 0, dim: int = 128, heads: int = 2,
                   grid: int = 16, anchor_out: bool = True, anchor_in: int = 1, name: str = "cluster",
-                  body_stream: Optional[str] = None) -> Build:
-    """anchor, stem (``stem_depth`` blocks), a whole-range body of ``body_depth`` blocks (none when 0), head."""
-    units = _anchor_stem(stem_depth, anchor_out, anchor_in)
+                  body_stream: Optional[str] = None, anchor_symbols: int = 0, class_window: Optional[Sequence] = None,
+                  bands: int = 1) -> Build:
+    """anchor, stem (``stem_depth`` blocks), a whole-range body of ``body_depth`` blocks (none when 0), head.
+
+    anchor_symbols K > 0: the per-class anchor (spec "symbols"; born from ``Model.born(..., class_stats=)``).
+    class_window (lo, hi): the stem reads the class only where lo <= t < hi (strings are stored as written).
+    bands: the geometry's band count (3 for band-kept members). The defaults give the build of earlier versions."""
+    units = _anchor_stem(stem_depth, anchor_out, anchor_in, anchor_symbols, class_window)
     if int(body_depth) > 0:
         units.append(UnitEntry("body", "Body", {"site": "trunk", "slot": 1}, {"depth": int(body_depth)}, stream=body_stream))
     units.append(_head())
-    build = Build(name=name, geometry=geometry(field_shape, grid, dim, heads), units=units, info={"stage_edges": []})
+    build = Build(name=name, geometry=geometry(field_shape, grid, dim, heads, bands), units=units,
+                  info={"stage_edges": []})
     build.validate()
     return build
+
+
+def expert_name(classes: Sequence[int], prefix: str = "expert") -> str:
+    """expert_c3 for [3], expert_c0-1 for [0, 1]."""
+    return f"{prefix}_c" + "-".join(str(int(c)) for c in classes)
+
+
+def add_class_experts(build: Build, classes: Sequence[Sequence[int]], window=(0.0, 1.0), soft: float = 0.0,
+                      depth: int = 1, prefix: str = "expert") -> List[str]:
+    """Append one ContentExpert per class set to ``build`` (in place) and return their names. Each: site "out", band
+    "all", the window and the crossfade half-width, the class list; spec depth, the whole position code, keep False;
+    its random stream is its own name."""
+    names = []
+    lo, hi = window
+    for cs in classes:
+        cs = [int(c) for c in cs]
+        if not cs:
+            raise ValueError("an expert needs at least one class")
+        n = expert_name(cs, prefix)
+        build.units.append(UnitEntry(n, "ContentExpert",
+                                     {"site": "out", "band": "all", "window": [_edge(lo), _edge(hi)], "soft": _edge(soft),
+                                      "classes": cs},
+                                     {"depth": int(depth), "code": list(WHOLE), "keep": False}))
+        names.append(n)
+    build.validate()
+    return names
+
+
+def add_band_members(build: Build, bands: Sequence[int] = (0, 1, 2), depth: int = 1, window=(0.0, 1.0),
+                     soft: float = 0.0, keep: bool = True, prefix: str = "member") -> List[str]:
+    """Append one zero-born BandMember per band (named member_b0, ...) to ``build`` (in place); returns their names.
+    Each: site "out", the band, the window and half-width, no class set; spec depth, the whole position code, keep. A
+    band-kept member needs a geometry of 3 bands."""
+    names = []
+    lo, hi = window
+    for b in bands:
+        n = f"{prefix}_b{int(b)}"
+        build.units.append(UnitEntry(n, "BandMember",
+                                     {"site": "out", "band": int(b), "window": [_edge(lo), _edge(hi)], "soft": _edge(soft),
+                                      "classes": None},
+                                     {"depth": int(depth), "code": list(WHOLE), "keep": bool(keep)}))
+        names.append(n)
+    build.validate()
+    return names
+
+
+def with_class_experts(folder: str, seed: int, classes: Sequence[Sequence[int]], window=(0.0, 1.0), soft: float = 0.0,
+                       depth: int = 1, prefix: str = "expert", device="cpu"):
+    """A finished build folder as a model with newborn class experts added -> (model, expert names).
+
+    The folder is linked strictly (every unit file checked against its card's content hash); the folder itself is
+    not changed. The experts are born from (seed, their name), zero-born, so the new model's velocity equals the
+    source's exactly (checked on the linker's probe batch). Export the trained model with ``base=folder`` and
+    ``trained=<expert names>``; removing the experts (``without_units``) gives back the source model."""
+    from .linker import born_gap, link
+    from .model import Model
+    from .units import born
+    src = link(folder, device="cpu", strict=True)
+    b = src.build
+    new = Build(name=b.name, geometry=dict(b.geometry), units=[UnitEntry.from_dict(e.to_dict()) for e in b.units],
+                info=dict(b.info))
+    names = add_class_experts(new, classes, window, soft, depth, prefix)
+    units = list(src.units)
+    for n in names:
+        e = new.entry(n)
+        units.append(born(e.type, seed, e.name, e.address, e.spec, new.geometry, stream=e.stream, index=e.index))
+    model = Model(new, units)
+    gap = born_gap(model, src)
+    if gap != 0.0:
+        raise AssertionError(f"the newborn experts change the source model's output: {gap}")
+    return model.to(device), names
+
+
+def without_units(model, names: Iterable[str]):
+    """The model with the named units left out (the same unit objects otherwise; absence, never a zero weight)."""
+    from .model import Model
+    drop = set(names)
+    b = model.build
+    nb = Build(name=b.name, geometry=dict(b.geometry), units=[e for e in b.units if e.name not in drop], info=dict(b.info))
+    return Model(nb, [u for u in model.units if u.name not in drop])
 
 
 def mixed_tails_build(field_shape: Sequence[int], *, stem_depth: int, tail_depth: int, cuts: Sequence[float], soft: float,

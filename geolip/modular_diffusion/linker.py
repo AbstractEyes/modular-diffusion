@@ -242,8 +242,15 @@ def probe_batch(geometry: Dict[str, Any], device="cpu", seed: int = 20251121):
 
 
 def _velocity(model, probe) -> Tensor:
+    """The velocity on the probe with the parts added one at a time, in the model's own order. A part that is exactly
+    zero then changes no digit on any device; a stacked sum may pair the other parts differently when one more part is
+    present, which moves the last digit on some devices although the added part is silent."""
     with torch.no_grad():
-        return model.velocity(*probe)
+        parts, _, _, _ = model.components(*probe)
+        v = torch.zeros_like(probe[0])
+        for p in parts.values():
+            v = v + p
+        return v
 
 
 def _device_of(model) -> torch.device:

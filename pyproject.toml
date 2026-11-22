@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modular-diffusion"
-version = "0.3.1"
+version = "0.4.0"
 description = "A flow-matching image model assembled from independently trainable units: noise-stage bodies, frequency-band members, content experts and a closed-form spectral anchor"
 readme = "README.md"
 requires-python = ">=3.10"

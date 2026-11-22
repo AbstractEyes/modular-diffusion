@@ -2,7 +2,10 @@
 
     h      = stem(tokens of z_t [+ the anchor's tokens], t, class), then the whole-range body (if any), then the stage
              units of its window of t
-    v_hat  = anchor(z_t, t) + head(h) + sum_m gate_m(t, class) x keep_band(m)[ member_m(h, t, class) ]
+    v_hat  = anchor(z_t, t [, class]) + head(h) + sum_m gate_m(t, class) x keep_band(m)[ member_m(h, t, class) ]
+
+A per-class anchor (spec "symbols") reads the row's class; the stem's anchor input is that answer. A stem with a class
+window reads "no class" outside its window; the anchor and the members' class gates keep the class they are given.
 
 Parts. ``components`` returns each unit's own contribution as a field [B, C, H, W], in the order anchor, head, members
 (build order); v_hat is ``torch.stack(parts).sum(0)``. A gated unit runs only on the samples whose gate is above zero,
@@ -86,11 +89,17 @@ class Model(nn.Module):
 
     # ------------------------------------------------------------------ construction
     @classmethod
-    def born(cls, build: Build, seed: int, spectrum: Optional[Tensor] = None) -> "Model":
-        """Every unit newborn from (seed, its stream), on the CPU."""
+    def born(cls, build: Build, seed: int, spectrum: Optional[Tensor] = None,
+             class_stats: Optional[Sequence[Tensor]] = None) -> "Model":
+        """Every unit newborn from (seed, its stream), on the CPU. An anchor with symbols takes ``class_stats`` =
+        (means [K, C, H, W], spectra [K, C, H, W]) (``PicturesBed.class_stats()``); it is required then."""
         units = []
         for e in build.units:
             kw = {"spectrum": spectrum} if e.type == "Anchor" else {}
+            if e.type == "Anchor" and int(e.spec.get("symbols", 0) or 0) > 0:
+                if class_stats is None:
+                    raise ValueError(f"the anchor {e.name!r} has symbols and no class statistics were given")
+                kw["class_stats"] = class_stats
             units.append(born(e.type, seed, e.name, e.address, e.spec, build.geometry, stream=e.stream, index=e.index, **kw))
         return cls(build, units)
 
@@ -140,10 +149,12 @@ class Model(nn.Module):
         return self.all_band if m.band == "all" else int(m.band)
 
     # ------------------------------------------------------------------ the parts
-    def anchor_velocity(self, zt: Tensor, t: Tensor) -> Tensor:
+    def anchor_velocity(self, zt: Tensor, t: Tensor, cls_idx: Optional[Tensor] = None) -> Tensor:
+        """The anchor's answer; a per-class anchor reads the row's class (None: "no class" for every row), the pooled
+        anchor ignores it."""
         if self.anchor is None:
             raise ValueError("the build has no Anchor")
-        return self.anchor(zt, t)
+        return self.anchor(zt, t, cls_idx)
 
     def gate(self, m: BandMember, t: Tensor, cls_idx: Tensor) -> Tensor:
         return m.gate(t, cls_idx)
@@ -182,7 +193,7 @@ class Model(nn.Module):
         out = {}
         anc = self.anchor
         use_out = anc is not None and anc.output and anc.name not in skip
-        va = self.anchor_velocity(zt, t) if (use_out or self.stem.anchor_in) else None
+        va = self.anchor_velocity(zt, t, cls_idx) if (use_out or self.stem.anchor_in) else None
         if use_out:
             out[anc.part] = va
         x = self.patchify(zt)

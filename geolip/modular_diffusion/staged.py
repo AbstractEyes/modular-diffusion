@@ -64,6 +64,10 @@ class Staged(nn.Module):
             for c in clusters[1:]:
                 if not torch.equal(c.anchor.spectrum.cpu(), first.anchor.spectrum.cpu()):
                     raise ValueError("the clusters' anchors hold different spectra")
+                if c.anchor.symbols != first.anchor.symbols or (first.anchor.symbols and not (
+                        torch.equal(c.anchor.means.cpu(), first.anchor.means.cpu())
+                        and torch.equal(c.anchor.spectra.cpu(), first.anchor.spectra.cpu()))):
+                    raise ValueError("the clusters' anchors hold different class statistics")
         self.adds_anchor = bool(all(adds))
         seen: Dict[str, int] = {}
         for c in clusters:
@@ -123,8 +127,8 @@ class Staged(nn.Module):
         """[S, B]: the stage weights at t."""
         return torch.stack([window_weight(t, lo, hi, self.soft) for lo, hi in self.windows()])
 
-    def anchor_velocity(self, zt: Tensor, t: Tensor) -> Tensor:
-        return self.clusters[0].anchor_velocity(zt, t)
+    def anchor_velocity(self, zt: Tensor, t: Tensor, cls_idx: Optional[Tensor] = None) -> Tensor:
+        return self.clusters[0].anchor_velocity(zt, t, cls_idx)
 
     def components(self, zt: Tensor, t: Tensor, cls_idx: Tensor, only: Optional[Iterable[str]] = None,
                    scale: Optional[Dict[str, Tensor]] = None, skip: Iterable[str] = ()):
@@ -136,7 +140,7 @@ class Staged(nn.Module):
         skip = set(skip)
         out: Dict[str, Tensor] = {}
         if self.adds_anchor and self.anchor.name not in skip:
-            out[self.anchor.part] = self.anchor_velocity(zt, t)
+            out[self.anchor.part] = self.anchor_velocity(zt, t, cls_idx)
         w = self.weights(t)
         for s, c in enumerate(self.clusters):
             idx = torch.nonzero(w[s] > 0, as_tuple=False).squeeze(1)

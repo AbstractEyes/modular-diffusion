@@ -6,7 +6,7 @@ with keys relative to the unit.
 
 | type          | owns                                        | acts                                                   |
 |---------------|---------------------------------------------|--------------------------------------------------------|
-| Anchor        | spectrum [C, H, W]                          | (z_t, t) -> the closed-form linear velocity            |
+| Anchor        | spectrum [C, H, W] (+ means, spectra)       | (z_t, t [, class]) -> the closed-form velocity         |
 | Stem          | embed, time, cls, blocks                    | tokens, t, class -> state h, context, time embedding    |
 | StageBody     | block                                       | h -> h inside its window of t                           |
 | GrowthBlock   | block (output layers zero at birth)         | as StageBody; the identity at birth                     |
@@ -30,7 +30,7 @@ from torch import Tensor
 
 from .blocks import Block, TimeEmbedding, ZeroHead, zero_linear
 from .rotary import AxialBandCode
-from .spectral import anchor_velocity
+from .spectral import anchor_velocity, class_anchor_velocity
 from .windows import window_weight
 
 NULL_CLASS = 10                      # the class index that means "no caption"
@@ -85,38 +85,80 @@ class Unit(nn.Module):
 
 class Anchor(Unit):
     """The closed-form linear predictor from a measured spectrum. spec: {"output": bool} (whether its answer is a part
-    of the prediction; a model may also use it only as an input to the stem, or only for reads)."""
+    of the prediction; a model may also use it only as an input to the stem, or only for reads), and optionally
+    {"symbols": K} (K > 0: the per-class anchor).
+
+    The per-class anchor owns two more tensors, ``means`` and ``spectra`` [K + 1, C, H, W]: row c holds class c's mean
+    field mu_c and the spectrum S_c of its pictures minus mu_c, and answers
+
+        a_c(z_t, t) = mu_c + anchor_velocity(z_t - t mu_c, t, S_c)
+
+    Row K is "no class": a zero mean and the pooled spectrum, so a row without a class gets exactly the pooled anchor's
+    answer. A class index of K or more (the null class included) reads row K. Without "symbols" (or with 0) the unit is
+    the pooled anchor, unchanged."""
     unit_type = "Anchor"
     part = "anchor"
 
-    def __init__(self, name, address, spec, geometry, spectrum: Optional[Tensor] = None):
+    def __init__(self, name, address, spec, geometry, spectrum: Optional[Tensor] = None,
+                 class_stats: Optional[Sequence[Tensor]] = None):
         super().__init__(name, address, spec, geometry)
         if spectrum is None:
             spectrum = torch.ones(tuple(geometry["field"]))
         self.register_buffer("spectrum", spectrum.float(), persistent=True)
+        k = self.symbols
+        if k > 0:
+            field = tuple(int(x) for x in geometry["field"])
+            means = torch.zeros((k + 1,) + field)
+            spectra = self.spectrum[None].repeat(k + 1, 1, 1, 1)
+            if class_stats is not None:
+                m, s = class_stats
+                if tuple(m.shape) != (k,) + field or tuple(s.shape) != (k,) + field:
+                    raise ValueError(f"class statistics of shape {tuple(m.shape)} / {tuple(s.shape)} do not fit "
+                                     f"{k} symbols on the field {field}")
+                means[:k] = m.detach().to("cpu", torch.float32)
+                spectra[:k] = s.detach().to("cpu", torch.float32)
+            self.register_buffer("means", means, persistent=True)
+            self.register_buffer("spectra", spectra, persistent=True)
+        elif class_stats is not None:
+            raise ValueError("class statistics were given to an anchor without symbols")
 
     @property
     def output(self) -> bool:
         return bool(self.spec.get("output", True))
 
+    @property
+    def symbols(self) -> int:
+        return int(self.spec.get("symbols", 0) or 0)
+
     @classmethod
     def _birth(cls, seed, name, address, spec, geometry, stream, index, **kw):
         return cls(name, address, spec, geometry, **kw)          # closed form: no random draws
 
-    def forward(self, zt: Tensor, t: Tensor) -> Tensor:
-        return anchor_velocity(zt, t, self.spectrum)
+    def forward(self, zt: Tensor, t: Tensor, cls_idx: Optional[Tensor] = None) -> Tensor:
+        k = self.symbols
+        if k == 0:
+            return anchor_velocity(zt, t, self.spectrum)
+        if cls_idx is None:
+            idx = torch.full((zt.shape[0],), k, dtype=torch.long, device=zt.device)
+        else:
+            idx = cls_idx.to(device=zt.device, dtype=torch.long).clamp(min=0, max=k)
+        return class_anchor_velocity(zt, t, self.means[idx], self.spectra[idx])
 
 
 class Stem(Unit):
     """Token embedding (optionally widened by the anchor's tokens), time and class embeddings, and the shared blocks.
-    spec: {"depth", "anchor_in" (0, 1 or 2), "code": [lo, hi]}. Random streams: "embed" for the embedding, then "body"
-    for the time embedding, the class table and the blocks, in that order."""
+    spec: {"depth", "anchor_in" (0, 1 or 2), "code": [lo, hi]} and optionally "class_window": [lo, hi] (strings): the
+    class is read only where lo <= t < hi and is "no class" elsewhere (["0", "0"] never reads it); without the key the
+    class is read at every noise level. Random streams: "embed" for the embedding, then "body" for the time embedding,
+    the class table and the blocks, in that order."""
     unit_type = "Stem"
 
     def __init__(self, name, address, spec, geometry, reseed: Optional[Callable[[str], None]] = None):
         super().__init__(name, address, spec, geometry)
         d, heads = geometry["dim"], geometry["heads"]
         self.anchor_in = int(spec.get("anchor_in", 0))
+        cw = spec.get("class_window")
+        self.class_window = None if cw is None else (float(cw[0]), float(cw[1]))
         if reseed is not None:
             reseed("embed")
         self.embed = nn.Linear(geometry["token_dim"] * (1 + self.anchor_in), d)
@@ -137,6 +179,10 @@ class Stem(Unit):
 
     def forward(self, x: Tensor, t: Tensor, cls_idx: Tensor):
         """tokens [B, N, P (1 + anchor_in)] -> (h [B, N, d], ctx [B, 1, d], e [B, d], the rotary)."""
+        if self.class_window is not None:
+            lo, hi = self.class_window
+            on = (t >= lo) & (t < hi)
+            cls_idx = torch.where(on, cls_idx, torch.full_like(cls_idx, NULL_CLASS))
         e = self.time(t)
         ctx = self.cls(cls_idx)[:, None, :]
         h = self.embed(x)

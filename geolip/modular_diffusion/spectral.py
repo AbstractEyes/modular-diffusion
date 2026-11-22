@@ -135,6 +135,55 @@ def anchor_velocity(zt: Tensor, t: Tensor, spectrum: Tensor) -> Tensor:
     return torch.fft.ifft2(torch.fft.fft2(zt.float()) * anchor_gain(t, spectrum)).real
 
 
+def class_anchor_velocity(zt: Tensor, t: Tensor, means: Tensor, spectra: Tensor) -> Tensor:
+    """The per-class closed-form velocity with per-row statistics: means and spectra [B, C, H, W] (the row's class),
+    a = mu + ifft2(fft2(z_t - t mu) g(t, S)), float32. With mu = 0 and the pooled spectrum it is ``anchor_velocity``
+    bit for bit (the same elementwise operations)."""
+    tt = t.view(-1, 1, 1, 1).float()
+    gain = (tt * spectra - (1 - tt)) / (tt * tt * spectra + (1 - tt) ** 2).clamp_min(1e-8)
+    return means + torch.fft.ifft2(torch.fft.fft2((zt.float() - tt * means)) * gain).real
+
+
+def class_statistics(x: Tensor, y: Tensor, n_classes: int, flips: bool = True, pooled: Tensor = None,
+                     chunk: int = 2000):
+    """Per class: the mean field and the power spectrum of the centered rows -> (means [K, C, H, W], spectra
+    [K, C, H, W]), computed in float64 and returned in float32 on the device of x.
+
+    Over the class's rows of x and, with ``flips``, their mirror images x.flip(-1) as well (a training stream that flips
+    half of its pictures sees both). The spectrum is the estimator of ``measure_spectrum`` applied to the rows minus
+    the class mean. A class with no rows gets a zero mean and ``pooled`` (required then)."""
+    k = int(n_classes)
+    shape = tuple(x.shape[1:])
+    means = torch.zeros((k,) + shape, dtype=torch.float64, device=x.device)
+    spectra = torch.zeros((k,) + shape, dtype=torch.float64, device=x.device)
+    side = x.shape[-1]
+    y = y.to(x.device)
+    for c in range(k):
+        rows = torch.nonzero(y == c, as_tuple=False).squeeze(1)
+        if rows.numel() == 0:
+            if pooled is None:
+                raise ValueError(f"class {c} has no rows and no pooled spectrum was given")
+            spectra[c] = pooled.to(device=x.device, dtype=torch.float64)
+            continue
+        views = (False, True) if flips else (False,)
+        count = rows.numel() * len(views)
+        total = torch.zeros(shape, dtype=torch.float64, device=x.device)
+        for i in range(0, rows.numel(), chunk):
+            xc = x[rows[i:i + chunk]].double()
+            for fl in views:
+                total += (xc.flip(-1) if fl else xc).sum(dim=0)
+        mu = total / count
+        power = torch.zeros(shape, dtype=torch.float64, device=x.device)
+        for i in range(0, rows.numel(), chunk):
+            xc = x[rows[i:i + chunk]].double()
+            for fl in views:
+                f = torch.fft.fft2((xc.flip(-1) if fl else xc) - mu) / side
+                power += (f.real ** 2 + f.imag ** 2).sum(dim=0)
+        means[c] = mu
+        spectra[c] = power / count
+    return means.float(), spectra.float()
+
+
 def floor(s, t):
     """The anchor's error power per frequency, S / (t^2 S + (1 - t)^2): the least error of any linear predictor."""
     return s / (t * t * s + (1 - t) ** 2)

@@ -10,7 +10,8 @@ For every step k the cache replays the training stream exactly as the trainer dr
 
 A step trained from the cache recomputes only the units being trained, from the stored h, and sums the parts in the
 model's own order, so K steps from the cache equal K steps of the trainer bit for bit. The cache covers steps 0..K-1 of
-one stream; training longer than the cache, or with member dropout, is not supported.
+one stream; training longer than the cache reads it again (``fit(passes=)``: step k reads stored step k mod K); member
+dropout is not supported. ``size_bytes()`` is the stored steps' size on disk.
 
     cache = FeatureCache.write(model, bed, seed=0, steps=200, batch=128, folder="cache", train=["x_b0_0-1"])
     cache = FeatureCache.open("cache", model)
@@ -94,7 +95,8 @@ class FeatureCache:
         meta = {"format": CACHE_FORMAT, "seed": int(seed), "steps": int(steps), "batch": int(batch),
                 "cond_drop": float(cond_drop), "t_sampling": t_sampling, "train": train,
                 "hashes": {u.name: content_hash(u) for u in model.units if u.name not in train},
-                "build": model.build.names(), "head": head_label, "torch": torch.__version__, "device": str(device)}
+                "build": model.build.names(), "head": head_label, "torch": torch.__version__, "device": str(device),
+                "write_seconds": time.time() - t0}
         with open(os.path.join(folder, META_FILE), "w", encoding="utf-8", newline="\n") as fh:
             json.dump(meta, fh, indent=1)
             fh.write("\n")
@@ -158,15 +160,28 @@ class FeatureCache:
         v = torch.stack(list(parts.values())).sum(dim=0) if parts else torch.zeros_like(rec["target"])
         return ((v - rec["target"]) ** 2).mean()
 
+    def size_bytes(self) -> int:
+        """The bytes of the stored steps' files."""
+        return sum(os.path.getsize(_step_file(self.folder, k)) for k in range(self.steps)
+                   if os.path.exists(_step_file(self.folder, k)))
+
     def fit(self, model, lr: float = 1e-3, warmup: int = 100, steps: Optional[int] = None, equalize: bool = False,
-            log_every: int = 500, log: Optional[Callable[[str], None]] = None) -> List[list]:
+            log_every: int = 500, log: Optional[Callable[[str], None]] = None, passes: int = 1) -> List[list]:
         """Train the cache's units with the trainer's recipe (Adam, betas 0.9 / 0.999, eps 1e-8, no weight decay, the
         learning rate warmed up linearly and set before every step); every other parameter is frozen. Returns the
-        curve [[step, loss], ...]."""
+        curve [[step, loss], ...].
+
+        passes: the stored steps are read again; step k (0 .. steps - 1, at most passes x cache.steps, the default)
+        reads stored step k mod cache.steps, and the warm-up runs over k once. With passes=1 it is the single pass."""
         from .train import equalize as equalize_grads
-        steps = self.steps if steps is None else int(steps)
-        if steps > self.steps:
-            raise ValueError(f"the cache holds {self.steps} steps, not {steps}")
+        passes = int(passes)
+        if passes < 1:
+            raise ValueError(f"passes must be at least 1, not {passes}")
+        limit = passes * self.steps
+        steps = limit if steps is None else int(steps)
+        if steps > limit:
+            raise ValueError(f"the cache holds {self.steps} steps" + (f" ({passes} passes: {limit})" if passes > 1 else "")
+                             + f", not {steps}")
         train = set(self.trained)
         for u in model.units:
             for p in u.parameters():
@@ -181,7 +196,7 @@ class FeatureCache:
         for step in range(steps):
             for group in opt.param_groups:
                 group["lr"] = lr * min(1.0, (step + 1) / max(1, warmup))
-            loss = self.loss(model, step)
+            loss = self.loss(model, step % self.steps)
             if not loss.requires_grad:
                 continue
             opt.zero_grad(set_to_none=True)

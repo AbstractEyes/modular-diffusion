@@ -14,7 +14,7 @@ Windows are stored as decimal strings and read with float(), so a stored edge ne
 
 Content hash of a unit: SHA-256 over the canonical JSON (sorted keys, compact separators) of {type, address, spec}, then
 for each owned tensor in sorted key order its key, dtype, shape and raw little-endian CPU bytes. Owned means the unit's
-parameters plus the anchor's spectrum; tables that follow from the spec (rotary tables, band and class masks, time
+parameters plus the anchor's spectrum (and a per-class anchor's means and spectra); tables that follow from the spec (rotary tables, band and class masks, time
 frequencies) are never stored and never hashed.
 """
 from __future__ import annotations

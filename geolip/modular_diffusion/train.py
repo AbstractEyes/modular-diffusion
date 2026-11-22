@@ -18,6 +18,7 @@ Outputs per seed, in ``out``: <tag>.json (the read, the curve and the arguments)
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -181,8 +182,13 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
               lr: float = 1e-3, warmup: int = 100,
               batch: int = 128, cond_drop: float = 0.1, mdrop: float = 0.0, equalize: bool = True, heldout: int = 2048,
               device="cpu", log: Callable[[str], None] = print, log_every: int = 500,
-              expect_anchor_at_birth: bool = False) -> dict:
+              expect_anchor_at_birth: bool = False, averages: Sequence[float] = ()) -> dict:
     """Train the named units of a model (a Model or a Staged) with the recipe and read it.
+
+    averages: decays d. For each, a float32 copy of every trainable parameter (on its device, no gradient) starts as
+    the parameters before the first step and, after optimizer step k = 0, 1, ..., becomes d_k avg + (1 - d_k) w with
+    d_k = min(d, (1 + k) / (10 + k)). Nothing else changes (the stream, the curve and the last weights are those of a
+    run without); the result then also holds "averaged": {d: {parameter name: tensor}} (keep it out of json files).
 
     Sets the trainable units; with ``expect_anchor_at_birth`` checks that the velocity equals the anchor's (or zero
     without an anchor) exactly on a 2-row probe; runs the loop; checks that the frozen parameters did not change; reads.
@@ -197,9 +203,10 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
         z = torch.randn((2,) + tuple(bed.field_shape), generator=gen).to(device)
         t2 = torch.tensor([0.3, 0.7], device=device)
         with torch.no_grad():
-            v = model.velocity(z, t2, torch.zeros(2, dtype=torch.long, device=device))
+            c2 = torch.zeros(2, dtype=torch.long, device=device)
+            v = model.velocity(z, t2, c2)
             use_anchor = model.anchor is not None and model.anchor.output
-            gap = float((v - (model.anchor_velocity(z, t2) if use_anchor else 0)).abs().max())
+            gap = float((v - (model.anchor_velocity(z, t2, c2) if use_anchor else 0)).abs().max())
         if gap != 0.0:
             raise AssertionError(f"the newborn model is not exactly its anchor (or zero): {gap}")
     n_par = model.trained_numbers()
@@ -210,8 +217,29 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
         torch.cuda.reset_peak_memory_stats()
     log(f"FIT {n_par:,} trained numbers of {n_all:,}; trainable {trainable if isinstance(trainable, str) else sorted(trainable)}; "
         f"{steps} steps; t in [{t_range[0]:g}, {t_range[1]:g}) ({t_sampling}" + (f", whole-range share {t_mix:g})" if t_mix else ")"))
+    decays = [float(d) for d in averages]
+    for d in decays:
+        if not 0.0 <= d < 1.0:
+            raise ValueError(f"an average's decay lies in [0, 1): {d}")
+    at_step = None
+    averaged = None
+    if decays:
+        live = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        with torch.no_grad():
+            averaged = {d: {n: p.detach().clone().float() for n, p in live} for d in decays}
+        updates = [0]
+
+        def at_step(done: int) -> None:                   # after every optimizer step k = 0, 1, ...
+            k = updates[0]
+            with torch.no_grad():
+                for d, state in averaged.items():
+                    dk = min(d, (1 + k) / (10 + k))
+                    for n, p in live:
+                        state[n].copy_(dk * state[n] + (1.0 - dk) * p.detach().float())    # the rule as written
+            updates[0] += 1
+
     curve, seconds = run_loop(model, bed, seed, steps, lr, warmup, batch, cond, mdrop, t_sampling, t_range, equalize,
-                              device, log, log_every, t_mix=float(t_mix))
+                              device, log, log_every, at_step=at_step, t_mix=float(t_mix))
     peak = torch.cuda.max_memory_allocated() / 2 ** 20 if is_cuda else None
     frozen_same = all(torch.equal(frozen_before[id(p)], p) for p in model.parameters() if id(p) in frozen_before)
     res = read(model, bed, heldout, device)
@@ -222,7 +250,29 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
                 "recipe": recipe(lr, warmup, batch, steps, t_sampling, t_range, cond, bed.kind == "pictures", equalize,
                                  mdrop, device, t_mix),
                 "torch": torch.__version__, "device": str(device)})
+    if averaged is not None:
+        res["averaged"] = averaged                        # tensors: never written into a json file
     return res
+
+
+@contextlib.contextmanager
+def use_average(model, state: Dict[str, torch.Tensor]):
+    """Put averaged values ({parameter name: tensor}, as in ``fit_units(...)["averaged"][decay]``) into the model's
+    parameters for the body of the ``with``; the last weights are put back exactly on exit (also when the body raises)."""
+    named = dict(model.named_parameters())
+    unknown = set(state) - set(named)
+    if unknown:
+        raise KeyError(f"no parameter named {sorted(unknown)} in the model")
+    kept = {n: named[n].detach().clone() for n in state}
+    try:
+        with torch.no_grad():
+            for n, v in state.items():
+                named[n].copy_(v.to(device=named[n].device, dtype=named[n].dtype))
+        yield model
+    finally:
+        with torch.no_grad():
+            for n, v in kept.items():
+                named[n].copy_(v)
 
 
 def run_tag(a: Dict[str, Any], seed: int) -> str:
@@ -266,8 +316,9 @@ def fit(a: Dict[str, Any], bed, seed: int, log: Callable[[str], None]) -> dict:
     z = torch.randn((2,) + tuple(bed.field_shape), device=device)
     with torch.no_grad():
         t2 = torch.tensor([0.3, 0.7], device=device)
-        v0 = model.velocity(z, t2, torch.zeros(2, dtype=torch.long, device=device))
-        born = float((v0 - (model.anchor_velocity(z, t2) if use_anchor else 0)).abs().max())
+        c2 = torch.zeros(2, dtype=torch.long, device=device)
+        v0 = model.velocity(z, t2, c2)
+        born = float((v0 - (model.anchor_velocity(z, t2, c2) if use_anchor else 0)).abs().max())
     if not a["init"] and born != 0.0:
         raise AssertionError(f"the newborn model is not exactly its anchor (or zero): {born}")
     if a["smoke"] and len(model.members):
