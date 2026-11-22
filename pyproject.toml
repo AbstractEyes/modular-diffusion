@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modular-diffusion"
+version = "0.1.0"
+description = "A flow-matching image model assembled from independently trainable units: noise-stage bodies, frequency-band members, content experts and a closed-form spectral anchor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AbstractPhil" }]
+# Floors only, and no torch pin: installing this package into a hosted notebook must not replace the torch that is there.
+# The exact set the tests run on is in requirements.txt.
+dependencies = [
+  "torch>=2.4",
+  "numpy>=1.26",
+  "pillow>=10.0",
+  "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+hub = ["huggingface_hub>=0.30"]
+judge = ["torchmetrics>=1.6", "torch-fidelity>=0.3", "torchvision>=0.19", "scipy>=1.11"]
+test = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["geolip*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

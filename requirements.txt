@@ -1,0 +1,23 @@
+# modular-diffusion: the exact set the tests run on (Python 3.12).
+#
+#     pip install -r requirements.txt
+#     pip install --no-deps -e .
+#
+# torch comes from PyTorch's CUDA 12.8 wheel index. The wheels carry their own CUDA runtime, so the machine needs only an
+# NVIDIA driver new enough for CUDA 12.8. pyproject.toml lists floors only: a hosted notebook keeps its own torch.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+numpy==2.5.3
+pillow==12.3.0
+safetensors==0.8.0
+huggingface_hub==1.31.0
+
+# the picture judge (Frechet and kernel distances on generated samples)
+scipy==1.18.1
+torchmetrics==1.9.0
+torch-fidelity==0.4.0
+
+# tests
+pytest==9.1.1

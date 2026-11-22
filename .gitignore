@@ -1,0 +1,15 @@
+.idea/
+.venv/
+__pycache__/
+*.pyc
+*.pt
+*.safetensors
+*.bin
+*.npy
+*.npz
+*.log
+out/
+.pytest_cache/
+build/
+dist/
+*.egg-info/
