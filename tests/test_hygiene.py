@@ -76,7 +76,8 @@ NEW_FILES = ["geolip/modular_diffusion/staged.py", "geolip/modular_diffusion/for
              "geolip/modular_diffusion/run.py", "geolip/modular_diffusion/experiments/__init__.py",
              "geolip/modular_diffusion/experiments/time_split.py", "tests/test_staged.py", "tests/test_body_range.py",
              "tests/test_fit_units.py", "tests/test_body_linker.py", "tests/test_score.py", "tests/test_data.py",
-             "tests/test_roster_more.py", "tests/test_time_split.py"]
+             "tests/test_roster_more.py", "tests/test_time_split.py",
+             "geolip/modular_diffusion/experiments/chain_reads.py", "tests/test_sample_grid.py", "tests/test_chain_reads.py"]
 MORE_WORDS = r"(?i)\bE\d\d\b|\bmd0|\bmr_|\bmind\b|prototype night"
 
 

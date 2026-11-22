@@ -8,7 +8,7 @@ import os
 import pytest
 import torch
 
-from geolip.modular_diffusion.experiments import time_split
+from geolip.modular_diffusion.experiments import chain_reads, time_split
 from geolip.modular_diffusion.staged import link_staged
 
 pytestmark = pytest.mark.skipif(os.environ.get("MD_TEST_CUDA") != "1" or not torch.cuda.is_available(),
@@ -35,3 +35,18 @@ def test_experiment_variants_on_the_card(synthetic_npz, tmp_path):
     staged = link_staged(str(tmp_path / "tails_joint"), device="cuda")
     assert len({id(c.stem) for c in staged.clusters}) == 1
     assert next(staged.parameters()).device.type == "cuda"
+    # one read of each chain-reads variant on the card, from the jobs above, each with a score
+    split, plain = str(tmp_path / "split_soft"), str(tmp_path / "plain")
+    read_kw = dict(device="cuda", heldout=64, score=1, judge="fake", score_n=40, score_steps=3, sheet=1, threads=2,
+                   mem_fraction=0.0, data=synthetic_npz, ref=str(tmp_path / "reference.npz"))
+    chain = {"twin": dict(variant="twin", base=split, donor=split, stage=1),
+             "swap": dict(variant="swap", base=plain, donor=split, stage=1),
+             "wrong": dict(variant="wrong", base=split),
+             "blend": dict(variant="blend", base=split, soft=0.0),
+             "steps": dict(variant="steps", base=split, plan="width", n=6)}
+    for name, kw in chain.items():
+        r = chain_reads.main(**dict(read_kw, out=str(tmp_path / "chain" / name), **kw))
+        assert r["device"] == "cuda" and isinstance(r["loss_over_levels"], float), name
+        assert "score" in r["score"], (name, r["score"])
+        assert os.path.exists(tmp_path / "chain" / name / "samples.png"), name
+    assert chain_reads.summarize(str(tmp_path / "chain")).count("\n") == 2 + len(chain)

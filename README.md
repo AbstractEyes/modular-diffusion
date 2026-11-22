@@ -51,16 +51,16 @@ anchor gain at a frequency of image power S:   g = (t S - (1 - t)) / (t^2 S + (1
 | `model` | the model assembled from a build: its parts, the velocity, the training loss (over a range of the noise level, with an optional share of whole-range draws) |
 | `staged` | a model of stage clusters: one whole model per stretch of the noise level, blended by the stage weights; shared units; staged folders, their links and stale lists |
 | `forms` | builds of the stage forms (a cluster: anchor, stem, body, head; one model with mixed tails) and adopting units from a build folder |
-| `score` | the picture score: the Frechet distance of a judge's features of generated and training pictures |
+| `score` | the picture score: the Frechet distance of a judge's features of generated and training pictures (pictures sampled with Euler steps, or on a time grid with `grid=`) |
 | `build` | the build file, the unit card, content hashes, unit files (safetensors + card JSON) |
 | `linker` | link a build folder (every file checked against its hash), snap units in and out, the stale list; convert a model or a flat weight file into a build folder |
 | `cache` | the feature cache: a frozen model's states over a training stream, so heads and members train without the stem |
 | `beds`, `data` | Gaussian fields and CIFAR-style pictures; CIFAR-10 from parquet to npz and the npz's content hash |
 | `train` | the recipe, the loop and the entry point (`python -m geolip.modular_diffusion.train key=value ...`); `fit_units` trains named units of any model |
 | `run` | the entry point of the experiments (`python -m geolip.modular_diffusion.run <experiment> key=value ...`) |
-| `experiments.time_split` | the time split: stage clusters trained alone, together, from copies, against one model over the whole range |
-| `read`, `sample` | the read at fixed noise levels (by band, by part, by class); Euler sampling and a sample sheet |
-| `report` | markdown tables from result files |
+| `experiments.time_split` | the time split: stage clusters trained alone, together, from copies, against one model over the whole range; `load_job` opens a finished job as a model |
+| `experiments.chain_reads` | reads of saved time-split jobs assembled in new ways, with no training: a stage swapped in from another job, clusters at the wrong stages, another crossfade width, sampling on a time grid |
+| `read`, `sample` | the read at fixed noise levels (by band, by part, by class); Euler sampling, sampling on a time grid (`euler_grid`, `stage_grid`, `share_counts`) and a sample sheet || `report` | markdown tables from result files |
 | `jobs` | a roster runner: one job at a time, a stop file, DONE / FAILED markers, a start guard, a wall cap; claims for several runners on one roster, a hook after each job, jobs that need others |
 | `hub` | upload a folder to the Hugging Face Hub with retries (token from `HF_TOKEN` only) |
 | `environment` | the installed versions against `requirements.txt` |

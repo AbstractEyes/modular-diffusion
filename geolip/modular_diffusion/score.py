@@ -7,20 +7,20 @@
 ``pip install modular-diffusion[judge]``; its weights are fetched on first use); ``FakeJudge`` is a fixed random
 projection for tests.
 
-Pictures are sampled with Euler steps (``sample.euler``), classes i mod 10 (balanced), every noise batch drawn in order
-from one generator seeded ``seed``, no caption drop and no guidance.
+Pictures are sampled with Euler steps (``sample.euler``, or ``sample.euler_grid`` on a given time grid), classes i mod 10
+(balanced), every noise batch drawn in order from one generator seeded ``seed``, no caption drop and no guidance.
 """
 from __future__ import annotations
 
 import os
 import time
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from .sample import euler
+from .sample import check_grid, euler, euler_grid
 from .spectral import token_filter
 
 SCORE_SEED = 20260101
@@ -57,8 +57,11 @@ def score_classes(n: int, device="cpu") -> Tensor:
 
 
 @torch.no_grad()
-def sample_pictures(model, bed, n: int, steps: int = 50, batch: int = 1000, seed: int = SCORE_SEED, device="cpu") -> Tensor:
-    """n generated pictures, uint8 [n, C, H, W] on the CPU (classes i mod 10)."""
+def sample_pictures(model, bed, n: int, steps: int = 50, batch: int = 1000, seed: int = SCORE_SEED, device="cpu",
+                    grid: Optional[Sequence[float]] = None) -> Tensor:
+    """n generated pictures, uint8 [n, C, H, W] on the CPU (classes i mod 10). With ``grid`` the pictures take the steps
+    of that time grid (``sample.euler_grid``) and ``steps`` is ignored."""
+    pts = None if grid is None else check_grid(grid)
     model.eval()
     gen = torch.Generator(device=device).manual_seed(int(seed))
     cls_all = score_classes(n, device)
@@ -66,7 +69,8 @@ def sample_pictures(model, bed, n: int, steps: int = 50, batch: int = 1000, seed
     for i in range(0, n, batch):
         cls = cls_all[i:i + batch]
         z = torch.randn((cls.shape[0],) + tuple(bed.field_shape), generator=gen, device=device)
-        out.append(to_pictures(euler(model, z, cls, steps), bed))
+        z = euler(model, z, cls, steps) if pts is None else euler_grid(model, z, cls, pts)
+        out.append(to_pictures(z, bed))
     return torch.cat(out) if out else torch.zeros((0,) + tuple(bed.field_shape), dtype=torch.uint8)
 
 
@@ -140,11 +144,18 @@ def reference_stats(bed, judge, path: Optional[str] = None, batch: int = 1000) -
 
 
 def picture_score(model, bed, judge, ref, n: int = 10000, steps: int = 50, batch: int = 1000, seed: int = SCORE_SEED,
-                  device="cpu") -> dict:
-    """The Frechet distance of n generated pictures against ``ref`` = (mu, cov, n) of the training pictures."""
+                  device="cpu", grid: Optional[Sequence[float]] = None) -> dict:
+    """The Frechet distance of n generated pictures against ``ref`` = (mu, cov, n) of the training pictures. With
+    ``grid`` the pictures are sampled on that time grid; the result then records "steps": K (the grid's step count) and
+    "grid": its points, and the ``steps`` argument is ignored."""
     t0 = time.time()
-    pics = sample_pictures(model, bed, n, steps, batch, seed, device)
+    pts = None if grid is None else check_grid(grid)
+    pics = sample_pictures(model, bed, n, steps, batch, seed, device, grid=pts)
     feats = np.concatenate([judge.features(pics[i:i + batch]) for i in range(0, pics.shape[0], batch)])
     mu, cov, _ = feature_stats(feats)
-    return {"score": frechet_distance(mu, cov, ref[0], ref[1]), "n": int(n), "steps": int(steps), "seed": int(seed),
-            "judge": judge.name, "seconds": time.time() - t0}
+    out = {"score": frechet_distance(mu, cov, ref[0], ref[1]), "n": int(n),
+           "steps": int(steps) if pts is None else len(pts) - 1, "seed": int(seed), "judge": judge.name,
+           "seconds": time.time() - t0}
+    if pts is not None:
+        out["grid"] = pts
+    return out

@@ -55,7 +55,7 @@ from ..model import Model
 from ..read import by_stage, read
 from ..sample import sample_sheet
 from ..score import make_judge, picture_score, reference_stats
-from ..staged import Staged, link_staged, share, write_staged
+from ..staged import STAGED_FILE, Staged, link_staged, share, write_staged
 from ..train import fit_units
 
 EXPERIMENT = "time_split"
@@ -113,6 +113,24 @@ def _levels(res: dict) -> dict:
 
 def _unique_numbers(model) -> int:
     return sum(p.numel() for p in model.parameters())
+
+
+def load_job(folder: str, device="cpu", kind: Optional[str] = None):
+    """A finished job folder of this experiment as a model -> (model, kind): its ``model/`` build folder linked strictly
+    (kind "model"), or its ``staged.json`` with the cluster folders (kind "clusters", a ``Staged``). Without ``kind`` the
+    folder decides: a staged file means clusters."""
+    if kind is None:
+        if os.path.exists(os.path.join(folder, STAGED_FILE)):
+            kind = "clusters"
+        elif os.path.isdir(os.path.join(folder, "model")):
+            kind = "model"
+        else:
+            raise ValueError(f"{folder} holds neither a staged file nor a model folder")
+    if kind == "clusters":
+        return link_staged(folder, device=device), kind
+    if kind == "model":
+        return link(os.path.join(folder, "model"), device=device), kind
+    raise ValueError(f"unknown kind {kind!r}; known: model, clusters")
 
 
 def plan(variant: str, scale: float) -> List[tuple]:
@@ -205,7 +223,7 @@ def main(argv=(), **overrides) -> dict:
         export(model, "model", res, _non_anchor(model))
         parts.append(_part_row(name, "model", res))
         progress(name, n)
-        final = link(os.path.join(out, "model"), device=device)
+        final, _ = load_job(out, device=device, kind="model")
         clusters_final = None
     else:
         folders = [f"stage_{s}" for s in range(3)]
@@ -241,7 +259,7 @@ def main(argv=(), **overrides) -> dict:
                 parts.append(_part_row(name, f, res))
                 progress(name, n)
         write_staged(out, folders, CUTS, SOFT, info={"experiment": EXPERIMENT, "variant": variant, "seed": seed})
-        final = link_staged(out, device=device)
+        final, _ = load_job(out, device=device, kind="clusters")
         clusters_final = list(final.clusters)
 
     log("READ the assembled model")
