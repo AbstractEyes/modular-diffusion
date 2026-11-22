@@ -110,7 +110,7 @@ def read(model, bed, heldout: int, device) -> dict:
                 full2 = torch.stack(list(parts2.values())).sum(dim=0) if parts2 else torch.zeros_like(zt)
                 add("off:stage_body", band_power(model, full2 - target))
                 add("out:stage_body", band_power(model, full - full2))
-            if i == 0 and abs(t - 0.45) < 1e-9:
+            if i == 0 and abs(t - 0.45) < 1e-9 and h is not None:       # a staged model returns no trunk state
                 for m in model.members:
                     if bool((m.gate(tt, cls[sl]) > 0).any()):
                         att[m.name] = attention_read(m, h, ctx, e, model.grid)
@@ -165,4 +165,14 @@ def read(model, bed, heldout: int, device) -> dict:
     if bed.n_classes:
         out["loss_without_caption_over_levels"] = float(np.mean([r["error_without_caption"]["all"] for r in levels.values()]))
     out["loss_over_levels"] = float(np.mean([r["error"]["all"] for r in levels.values()]))
+    return out
+
+
+def by_stage(res: dict, cuts) -> list:
+    """The mean of ``levels[t]["error"]["all"]`` over the fixed levels with cuts[s] <= t < cuts[s + 1], per stage (None
+    for a stage holding no fixed level)."""
+    out = []
+    for lo, hi in zip(cuts, cuts[1:]):
+        vals = [r["error"]["all"] for k, r in res["levels"].items() if float(lo) <= float(k) < float(hi)]
+        out.append(float(np.mean(vals)) if vals else None)
     return out

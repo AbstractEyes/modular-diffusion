@@ -1,6 +1,7 @@
 """The model assembled from a build.
 
-    h      = stem(tokens of z_t [+ the anchor's tokens], t, class), then the stage units of its window of t
+    h      = stem(tokens of z_t [+ the anchor's tokens], t, class), then the whole-range body (if any), then the stage
+             units of its window of t
     v_hat  = anchor(z_t, t) + head(h) + sum_m gate_m(t, class) x keep_band(m)[ member_m(h, t, class) ]
 
 Parts. ``components`` returns each unit's own contribution as a field [B, C, H, W], in the order anchor, head, members
@@ -11,7 +12,7 @@ zero to switch a unit off).
 Stage units. With hard windows a stage block replaces the rows of h whose t lies in [lo, hi) (t = 1 is in no stage
 window). With a crossfade half-width w > 0 every stage block whose weight is above zero runs, and h becomes
 sum_s w_s(t) block_s(h); for growth blocks (identity at birth) it becomes h + sum_s w_s(t) (block_s(h) - h), which is
-exactly h at birth even inside an overlap.
+exactly h at birth even inside an overlap. Windowed Body units are stage units of the first kind (several blocks each).
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from torch import Tensor
 
 from .build import Build
 from .spectral import band_masks, keep_band, patchify, unpatchify
-from .units import (Anchor, BandMember, GrowthBlock, Head, StageBody, Stem, Unit, UNIT_TYPES, born, make)
+from .units import (Anchor, BandMember, Body, GrowthBlock, Head, StageBody, Stem, Unit, UNIT_TYPES, born, make)
 from .windows import window_weight
 
 NULL_CLASS = 10
@@ -55,9 +56,19 @@ class Model(nn.Module):
             raise ValueError("a build needs exactly one Stem")
         if len(anchors) > 1 or len(heads) > 1:
             raise ValueError("a build holds at most one Anchor and one Head")
+        bodies = by_type(Body)
+        whole = [u for u in bodies if u.whole_range]
+        windowed = [u for u in bodies if not u.whole_range]
+        others = [u for u in by_type(StageBody) if not isinstance(u, Body)]
+        if len(whole) > 1:
+            raise ValueError("a build holds at most one whole-range Body")
+        if whole and (windowed or others):
+            raise ValueError("a whole-range Body cannot be combined with windowed stage units")
+        if windowed and others:
+            raise ValueError("windowed Body units cannot be mixed with StageBody or GrowthBlock units in one build")
         # plain lists and tuples, so the units stay registered once (under self.units) and the state dict has no aliases
-        self._roles = (anchors[0] if anchors else None, stems[0], heads[0] if heads else None)
-        self.stage_units: List[StageBody] = by_type(StageBody)
+        self._roles = (anchors[0] if anchors else None, stems[0], heads[0] if heads else None, whole[0] if whole else None)
+        self.stage_units: List[StageBody] = [u for u in by_type(StageBody) if not (isinstance(u, Body) and u.whole_range)]
         self.members: List[BandMember] = by_type(BandMember)
         if self.stem.anchor_in and self.anchor is None:
             raise ValueError("the stem reads the anchor, and the build has none")
@@ -99,6 +110,11 @@ class Model(nn.Module):
     @property
     def head(self) -> Optional[Head]:
         return self._roles[2]
+
+    @property
+    def body(self) -> Optional[Body]:
+        """The whole-range Body (None when the build has none)."""
+        return self._roles[3]
 
     def unit(self, name: str) -> Unit:
         for u in self.units:
@@ -175,6 +191,8 @@ class Model(nn.Module):
             if self.stem.anchor_in > 1:
                 x = torch.cat([x, self.patchify(zt + (1 - t.view(-1, 1, 1, 1)) * va)], dim=-1)
         h, ctx, e, rot = self.stem(x, t, cls_idx)
+        if self.body is not None and self.body.name not in skip:
+            h = self.body(h, ctx, e, rot)
         h = self._stages(h, t, ctx, e, rot, skip)
         if self.head is not None and self.head.name not in skip:
             out[self.head.part] = self.head_part(h)
@@ -216,11 +234,12 @@ class Model(nn.Module):
         return torch.stack(list(parts.values())).sum(dim=0)
 
     def loss(self, z1: Tensor, cls_idx: Tensor, gen: torch.Generator, cond_drop: float, mdrop: float = 0.0,
-             t_sampling: str = "uniform") -> Tensor:
+             t_sampling: str = "uniform", t_range: Sequence[float] = (0.0, 1.0), t_mix: float = 0.0) -> Tensor:
         """The flow-matching loss of one batch. Random draws from ``gen`` in this order: noise, t, the class drop (only
-        when cond_drop > 0), then one draw per member (only for member dropout in training)."""
+        when cond_drop > 0), then one draw per member (only for member dropout in training). t_range, t_mix: see
+        ``draw``."""
         b = z1.shape[0]
-        zt, t, cls_idx, target = self.draw(z1, cls_idx, gen, cond_drop, t_sampling)
+        zt, t, cls_idx, target = self.draw(z1, cls_idx, gen, cond_drop, t_sampling, t_range, t_mix)
         scale = None
         if self.training and mdrop > 0 and len(self.members):
             scale = {m.name: (torch.rand(b, generator=gen, device=z1.device) >= mdrop).to(z1.dtype) for m in self.members}
@@ -229,17 +248,40 @@ class Model(nn.Module):
         return ((v - target) ** 2).mean()
 
     @staticmethod
-    def draw(z1: Tensor, cls_idx: Tensor, gen: torch.Generator, cond_drop: float, t_sampling: str = "uniform"):
+    def draw(z1: Tensor, cls_idx: Tensor, gen: torch.Generator, cond_drop: float, t_sampling: str = "uniform",
+             t_range: Sequence[float] = (0.0, 1.0), t_mix: float = 0.0):
         """The noisy input of one batch -> (z_t, t, class after the drop, target). Draws from ``gen``: noise, t, then the
-        class drop (only when cond_drop > 0)."""
+        class drop (only when cond_drop > 0).
+
+        t_range (lo, hi): uniform t is drawn as before and mapped to lo + (hi - lo) t when the range is not exactly
+        (0, 1), so the draws and their order do not depend on the range. logit_normal takes the whole range only.
+        t_mix p in [0, 1): with p > 0 and a range other than (0, 1), two more draws right after t: m = rand < p, then a
+        whole-range t' = rand, and t = t' where m; otherwise nothing more is drawn."""
         if t_sampling not in ("uniform", "logit_normal"):
             raise ValueError("t_sampling must be uniform or logit_normal")
+        lo, hi = (float(x) for x in t_range)
+        whole = (lo, hi) == (0.0, 1.0)
+        p = float(t_mix)
+        if not 0.0 <= lo < hi <= 1.0:
+            raise ValueError(f"t_range must satisfy 0 <= lo < hi <= 1: {(lo, hi)}")
+        if not 0.0 <= p < 1.0:
+            raise ValueError(f"t_mix must lie in [0, 1): {p}")
+        if t_sampling == "logit_normal" and not whole:
+            raise ValueError("t_sampling logit_normal takes the whole range (0, 1) only")
+        if t_sampling == "logit_normal" and p > 0:
+            raise ValueError("t_mix applies to uniform t_sampling only")
         b = z1.shape[0]
         z0 = torch.randn(z1.shape, generator=gen, device=z1.device)
         if t_sampling == "logit_normal":
             t = torch.sigmoid(torch.randn(b, generator=gen, device=z1.device))
         else:
             t = torch.rand(b, generator=gen, device=z1.device)
+            if not whole:
+                t = lo + (hi - lo) * t
+                if p > 0:
+                    m = torch.rand(b, generator=gen, device=z1.device) < p
+                    t_whole = torch.rand(b, generator=gen, device=z1.device)
+                    t = torch.where(m, t_whole, t)
         if cond_drop > 0:
             drop = torch.rand(b, generator=gen, device=z1.device) < cond_drop
             cls_idx = torch.where(drop, torch.full_like(cls_idx, NULL_CLASS), cls_idx)

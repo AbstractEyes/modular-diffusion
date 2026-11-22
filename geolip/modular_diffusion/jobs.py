@@ -3,8 +3,9 @@ cap enforced by this (the parent) process.
 
 Roster lines (re-read every round, so lines can be added while it runs):
 
-    tag | wall cap in minutes | program | arguments
+    tag | wall cap in minutes | program | arguments [| needs=<tag>[,<tag>]]
           program: a Python module name (run as ``python -m <module>``) or a path to a .py file
+          needs: the job waits until each named job holds DONE (and fails when one FAILED)
           the runner appends ``out=<out>/<tag>``; a line starting with # is a comment; a line END ends the roster
 
 Every round: if the stop file exists, no new job starts and the runner ends. Otherwise the first line whose job folder
@@ -32,28 +33,43 @@ Job = Tuple[str, float, str, List[str]]
 Guard = Callable[[], Tuple[bool, str]]
 
 
-def read_roster(path: str) -> Tuple[List[Job], bool]:
-    """-> (jobs, ended): the roster's jobs in order, and whether an END line was reached."""
+def parse_roster(path: str) -> Tuple[List[Job], bool, Dict[str, List[str]]]:
+    """-> (jobs, ended, needs): the roster's jobs in order, whether an END line was reached, and {tag: [needed tags]}
+    for the lines with a fifth field ``needs=<tag>[,<tag>]``."""
     jobs: List[Job] = []
+    needs: Dict[str, List[str]] = {}
     try:
         with open(path, encoding="utf-8") as fh:
             lines = fh.read().splitlines()
     except OSError:
-        return jobs, False
+        return jobs, False, needs
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if line == "END":
-            return jobs, True
+            return jobs, True, needs
         parts = [p.strip() for p in line.split("|")]
-        if len(parts) != 4:
+        if len(parts) == 5 and parts[4].startswith("needs="):
+            wanted = [x.strip() for x in parts[4][len("needs="):].split(",") if x.strip()]
+            parts = parts[:4]
+        elif len(parts) != 4:
             continue
+        else:
+            wanted = []
         try:
             jobs.append((parts[0], float(parts[1]), parts[2], parts[3].split()))
         except ValueError:
             continue
-    return jobs, False
+        if wanted:
+            needs[parts[0]] = wanted
+    return jobs, False, needs
+
+
+def read_roster(path: str) -> Tuple[List[Job], bool]:
+    """-> (jobs, ended): the roster's jobs in order, and whether an END line was reached."""
+    jobs, ended, _ = parse_roster(path)
+    return jobs, ended
 
 
 def _no_window() -> int:
@@ -147,12 +163,19 @@ def run_job(job: Job, out: str, python: str = sys.executable, env: Optional[Dict
 def run_roster(roster: str, out: str, stop: str, log: str, python: str = sys.executable, card_room_mib: Optional[int] = 14000,
                ram_free_gb: Optional[float] = 8.0, max_hours: float = 11.0, env: Optional[Dict[str, str]] = None,
                guard: Optional[Guard] = None, idle_exit: bool = True, poll_s: float = 2.0, wait_s: float = 30.0,
-               hide_token: bool = True, end_at_cap: bool = False) -> dict:
+               hide_token: bool = True, end_at_cap: bool = False, claim: bool = False,
+               after_job: Optional[Callable[[str, str, bool], None]] = None) -> dict:
     """Run the roster's jobs one at a time until the stop file appears, an END line is reached with nothing pending,
     the roster runs dry (``idle_exit``), or ``max_hours`` pass. Returns {"done", "failed", "capped", "ended"}.
 
     env: variables added to the runner's own environment for every job (an empty HF_TOKEN is added when
-    ``hide_token``, so a job cannot write to the Hub). guard: a callable -> (ok, reason) replacing the default guard."""
+    ``hide_token``, so a job cannot write to the Hub). guard: a callable -> (ok, reason) replacing the default guard.
+
+    claim: a job is taken by creating <out>/<tag>/CLAIM exclusively, and a job whose CLAIM exists is not pending, so
+    several runners (processes or threads) can share one roster; the CLAIM of a job whose launch raised is removed.
+    after_job(tag, folder, ok): called after a job's marker is written; an exception inside it is logged and the
+    runner goes on. needs: a job whose roster line names ``needs=<tag>[,<tag>]`` is pending only when every named job's
+    folder holds DONE; when a named job FAILED (or is not in the roster), the job is marked FAILED with that reason."""
     guard = guard or default_guard(card_room_mib, ram_free_gb)
     job_env = dict(os.environ)
     job_env.update({"PYTHONUNBUFFERED": "1", "PYTHONUTF8": "1"})
@@ -179,10 +202,35 @@ def run_roster(roster: str, out: str, stop: str, log: str, python: str = sys.exe
             result["ended"] = "the stop file is present"
             note("stop file seen; no new job starts")
             break
-        jobs, end = read_roster(roster)
-        pending = [j for j in jobs if not os.path.exists(os.path.join(out, j[0], "DONE"))
-                   and not os.path.exists(os.path.join(out, j[0], "FAILED"))]
-        if not pending:
+        jobs, end, needs = parse_roster(roster)
+        marked = lambda tag, m: os.path.exists(os.path.join(out, tag, m))
+        tags = {j[0] for j in jobs}
+        pending = [j for j in jobs if not marked(j[0], "DONE") and not marked(j[0], "FAILED")
+                   and not (claim and marked(j[0], "CLAIM"))]
+        ready, blocked, newly_failed = [], [], False
+        for j in pending:
+            wanted = needs.get(j[0], [])
+            bad = [w for w in wanted if marked(w, "FAILED") or (w not in tags and not marked(w, "DONE"))]
+            if bad:
+                reason = ", ".join(f"{w} {'FAILED' if marked(w, 'FAILED') else 'is not in the roster'}" for w in bad)
+                d = os.path.join(out, j[0])
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "FAILED"), "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + f"not run: needs {reason}\n")
+                result["failed"].append(j[0])
+                note(f"END {j[0]} FAILED: not run, needs {reason}")
+                _after(after_job, j[0], d, False, note)
+                newly_failed = True
+            elif all(marked(w, "DONE") for w in wanted):
+                ready.append(j)
+            else:
+                blocked.append(j)
+        if not ready:
+            if blocked:
+                time.sleep(wait_s)
+                continue
+            if newly_failed:
+                continue                                   # a failure may reach further jobs: look again
             if end or idle_exit:
                 result["ended"] = "END line reached" if end else "nothing pending"
                 note(result["ended"])
@@ -192,28 +240,52 @@ def run_roster(roster: str, out: str, stop: str, log: str, python: str = sys.exe
         ok, why = guard()
         if not ok:
             if time.time() - last_note > 300:
-                note(f"waiting: {why}; next {pending[0][0]}")
+                note(f"waiting: {why}; next {ready[0][0]}")
                 last_note = time.time()
             time.sleep(wait_s)
             continue
-        job = pending[0]
+        job = ready[0]
         tag, cap_min, program, args = job
-        note(f"START {tag} (cap {cap_min:g} min; {why}; {len(pending) - 1} more pending): {program} {' '.join(args)}")
+        folder_j = os.path.join(out, tag)
+        if claim:
+            os.makedirs(folder_j, exist_ok=True)
+            try:
+                os.close(os.open(os.path.join(folder_j, "CLAIM"), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            except FileExistsError:
+                continue                                   # another runner took it first
+        note(f"START {tag} (cap {cap_min:g} min; {why}; {len(pending) - 1} more pending):{program} {' '.join(args)}")
         try:
             rc, secs, capped = run_job(job, out, python, job_env, poll_s, end_at_cap=end_at_cap)
         except Exception as e:
             rc, secs, capped = -999, 0.0, False
             note(f"launch of {tag} raised {e!r}")
+            if claim:
+                try:
+                    os.remove(os.path.join(folder_j, "CLAIM"))
+                except OSError:
+                    pass
         mark = "DONE" if rc == 0 and not capped else "FAILED"
-        with open(os.path.join(out, tag, mark), "w", encoding="utf-8", newline="\n") as fh:
+        os.makedirs(folder_j, exist_ok=True)
+        with open(os.path.join(folder_j, mark), "w", encoding="utf-8", newline="\n") as fh:
             fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + f"rc={rc} seconds={secs:.0f}" + (" wall cap" if capped else "") + "\n")
         result["done" if mark == "DONE" else "failed"].append(tag)
         if capped:
             result["capped"].append(tag)
         past = " (ended by the wall cap)" if capped else (" (ran past its wall cap)" if secs > cap_min * 60 else "")
         note(f"END {tag} rc={rc} {mark} after {secs / 60:.1f} min" + past)
+        _after(after_job, tag, folder_j, mark == "DONE", note)
     note("roster end: " + result["ended"])
     return result
+
+
+def _after(after_job, tag: str, folder: str, ok: bool, note: Callable[[str], None]) -> None:
+    """Call ``after_job(tag, folder, ok)``; an exception is logged, never raised."""
+    if after_job is None:
+        return
+    try:
+        after_job(tag, folder, ok)
+    except Exception as e:
+        note(f"after_job for {tag} raised {e!r}")
 
 
 DEFAULTS = dict(roster="", out="", stop="", log="", python=sys.executable, card_room_mib=14000, ram_free_gb=8.0,

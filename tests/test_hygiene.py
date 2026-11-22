@@ -72,6 +72,37 @@ def test_17_notebook_cells_have_no_outputs():
             assert c.get("outputs") == [] and c.get("execution_count") is None, path
 
 
+NEW_FILES = ["geolip/modular_diffusion/staged.py", "geolip/modular_diffusion/forms.py", "geolip/modular_diffusion/score.py",
+             "geolip/modular_diffusion/run.py", "geolip/modular_diffusion/experiments/__init__.py",
+             "geolip/modular_diffusion/experiments/time_split.py", "tests/test_staged.py", "tests/test_body_range.py",
+             "tests/test_fit_units.py", "tests/test_body_linker.py", "tests/test_score.py", "tests/test_data.py",
+             "tests/test_roster_more.py", "tests/test_time_split.py"]
+MORE_WORDS = r"(?i)\bE\d\d\b|\bmd0|\bmr_|\bmind\b|prototype night"
+
+
+def test_17_subpackage_sources_are_clean():
+    files = sorted(glob.glob(os.path.join(PKG, "**", "*.py"), recursive=True))
+    sub = [p for p in files if os.path.dirname(p) != PKG]
+    assert sub, "no subpackage sources found"
+    for path in files:
+        text = open(path, encoding="utf-8").read()
+        for what, pattern in FORBIDDEN.items():
+            m = re.search(pattern, text)
+            assert m is None, (os.path.relpath(path, ROOT), what, text[max(0, m.start() - 40):m.end() + 40])
+
+
+def test_17_new_files_are_clean():
+    for rel in NEW_FILES:
+        path = os.path.join(ROOT, *rel.split("/"))
+        text = open(path, encoding="utf-8").read()
+        for what, pattern in dict(FORBIDDEN, more=MORE_WORDS).items():
+            m = re.search(pattern, text)
+            assert m is None, (rel, what, text[max(0, m.start() - 40):m.end() + 40])
+    for path in NOTEBOOKS:
+        text = "\n".join("".join(c["source"]) for c in json.load(open(path, encoding="utf-8"))["cells"])
+        assert re.search(MORE_WORDS, text) is None, path
+
+
 def test_17_readme_links_the_notebook():
     with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as fh:
         text = fh.read()

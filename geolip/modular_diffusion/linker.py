@@ -7,7 +7,7 @@ Rules.
    frozen or co-trained:
      - upstream units whose window of the noise level overlaps its own (the anchor is upstream only when the stem reads
        it; stage units of overlapping windows count as each other's upstream, since they share one mix);
-     - for a trunk unit (stem, stage body, growth block), also the downstream units its loss passed through;
+     - for a trunk unit (stem, stage body, growth block, body), also the downstream units its loss passed through;
      - for an output unit (anchor answer, head, band member, content expert), also the output units whose band, window
        and classes overlap its own.
    ``parent_hash`` is the SHA-256 of the canonical parents map.
@@ -44,10 +44,10 @@ from .build import (BIRTH_STATE_OF, BUILD_FILE, CARD_SUFFIX, MARK_KEYS, WEIGHTS_
 from .model import Model
 from .units import born, make
 
-TRUNK = ("Stem", "StageBody", "GrowthBlock")
-STAGE = ("StageBody", "GrowthBlock")
+TRUNK = ("Stem", "StageBody", "GrowthBlock", "Body")
+STAGE = ("StageBody", "GrowthBlock", "Body")
 OUTPUT_UNITS = ("Head", "BandMember", "ContentExpert")
-_POS = {"Anchor": 0, "Stem": 1, "StageBody": 2, "GrowthBlock": 2, "Head": 3, "BandMember": 3, "ContentExpert": 3}
+_POS = {"Anchor": 0, "Stem": 1, "StageBody": 2, "GrowthBlock": 2, "Body": 2, "Head": 3, "BandMember": 3, "ContentExpert": 3}
 
 
 class StaleUnit(Exception):
@@ -246,9 +246,14 @@ def _velocity(model, probe) -> Tensor:
         return model.velocity(*probe)
 
 
+def _device_of(model) -> torch.device:
+    return next((x.device for x in list(model.parameters()) + list(model.buffers())), torch.device("cpu"))
+
+
 def born_gap(with_unit, without_unit) -> float:
-    """The largest change of the velocity on the probe batch when a unit is added."""
-    probe = probe_batch(with_unit.build.geometry)
+    """The largest change of the velocity on the probe batch when a unit is added (the probe is drawn on the CPU and
+    moved to the models' device, so its values do not depend on the device)."""
+    probe = probe_batch(with_unit.build.geometry, device=_device_of(with_unit))
     return float((_velocity(with_unit, probe) - _velocity(without_unit, probe)).abs().max())
 
 
@@ -385,9 +390,11 @@ def export_build(model, folder: str, seed: Optional[int] = None, base: Union[Non
                 if not frozen:
                     card.marks["frozen_unchanged"] = None
             if card.zero_born and newborn is not None:
-                newborn = newborn.to(next(iter(model.parameters())).device)
+                dev = _device_of(model)
+                newborn = newborn.to(dev)
                 units = [newborn if x.name == u.name else x for x in model.units]
-                card.marks["born_gap"] = born_gap(Model(b, units), Model(_without(b, u.name), [x for x in model.units if x.name != u.name]))
+                card.marks["born_gap"] = born_gap(Model(b, units).to(dev),
+                                                  Model(_without(b, u.name), [x for x in model.units if x.name != u.name]).to(dev))
             save_unit(u, card, folder)
         entries.append(UnitEntry(e.name, e.type, dict(e.address), dict(e.spec), stream=e.stream, index=e.index,
                                  file=u.name + WEIGHTS_SUFFIX, hash=h))

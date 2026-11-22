@@ -17,7 +17,7 @@ from typing import Callable, Optional, Sequence
 
 from .config import in_notebook, parse
 
-IGNORE = ("run.log", "DONE", "FAILED", "STOP", "*.tmp", "__pycache__/*")
+IGNORE = ("run.log", "DONE", "FAILED", "STOP", "CLAIM", "*.tmp", "__pycache__/*")
 
 
 def token() -> str:

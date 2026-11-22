@@ -86,6 +86,10 @@ class PicturesBed:
     def heldout(self, n: int) -> Tuple[Tensor, Tensor]:
         return self.xte[:n], self.yte[:n]
 
+    def train_pictures(self) -> Tensor:
+        """Every training picture in model space, unflipped, on the bed's device (the picture score's reference)."""
+        return self.xtr
+
 
 def make_bed(a: dict, device="cpu"):
     """The bed of an argument set (keys bed, data, grid, channels, slope, dc_share, tilt)."""

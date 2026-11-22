@@ -10,6 +10,7 @@ with keys relative to the unit.
 | Stem          | embed, time, cls, blocks                    | tokens, t, class -> state h, context, time embedding    |
 | StageBody     | block                                       | h -> h inside its window of t                           |
 | GrowthBlock   | block (output layers zero at birth)         | as StageBody; the identity at birth                     |
+| Body          | blocks                                      | h -> h on every row (whole-range) or in its window      |
 | Head          | proj (zero at birth)                        | h -> a field over every band                            |
 | BandMember    | blocks, head.proj (zero at birth)           | (h, context, e) -> a field kept to one band and window  |
 | ContentExpert | as BandMember                               | as BandMember, for its class set only                   |
@@ -174,6 +175,36 @@ class GrowthBlock(StageBody):
     zero_birth = True
 
 
+class Body(StageBody):
+    """``depth`` blocks after the stem, run with the stem's rotary. spec: {"depth": k}.
+
+    Whole-range (no window, or the window ["0", "1"], and soft 0): runs on every row, t = 1 included. Windowed: acts as a
+    stage unit (hard: the rows with lo <= t < hi; with a half-width: a weighted mix of states). Random stream: its name
+    unless the build entry gives one; the blocks are drawn in order from the stream (a position ``index`` in a shared
+    stream first draws and discards ``index * depth`` blocks)."""
+    unit_type = "Body"
+
+    def __init__(self, name, address, spec, geometry):
+        Unit.__init__(self, name, address, spec, geometry)
+        self.blocks = nn.ModuleList([Block(geometry["dim"], geometry["heads"]) for _ in range(int(spec["depth"]))])
+
+    @property
+    def whole_range(self) -> bool:
+        return self.lo <= 0.0 and self.hi >= 1.0 and self.soft == 0.0
+
+    @classmethod
+    def _birth(cls, seed, name, address, spec, geometry, stream, index, **kw):
+        _reseeder(seed)(stream)
+        for _ in range(index * int(spec["depth"])):
+            Block(geometry["dim"], geometry["heads"])
+        return cls(name, address, spec, geometry, **kw)
+
+    def forward(self, h, ctx, e, rot):
+        for blk in self.blocks:
+            h = blk(h, ctx, None, e, rot)
+        return h
+
+
 class Head(Unit):
     """The trunk's own output: LayerNorm then a zero-born projection to token values, over every band."""
     unit_type = "Head"
@@ -240,7 +271,7 @@ class ContentExpert(BandMember):
     unit_type = "ContentExpert"
 
 
-UNIT_TYPES = {c.unit_type: c for c in (Anchor, Stem, StageBody, GrowthBlock, Head, BandMember, ContentExpert)}
+UNIT_TYPES = {c.unit_type: c for c in (Anchor, Stem, StageBody, GrowthBlock, Body, Head, BandMember, ContentExpert)}
 
 
 def born(cls, seed: int, name: str, address: Dict[str, Any], spec: Dict[str, Any], geometry: Dict[str, Any],

@@ -131,7 +131,10 @@ def _legacy_prefixes(model) -> List[Tuple[str, Any, str]]:
 
 
 def legacy_parameter_map(model) -> Dict[str, Tensor]:
-    """{flat key: the model's parameter} for every parameter of the model."""
+    """{flat key: the model's parameter} for every parameter of the model. A model with a Body unit has no flat layout
+    (ValueError)."""
+    if any(u.unit_type == "Body" for u in model.units):
+        raise ValueError("a model with a Body unit has no flat layout; save it as a build folder (linker.export_build)")
     out = {}
     for flat, unit, rel in _legacy_prefixes(model):
         for k, p in unit.named_parameters():
@@ -194,7 +197,7 @@ def describe(a: Dict[str, Any]) -> str:
     """The run name an argument set gives (used in output file names)."""
     if a["arch"] == "plain":
         return (f"plain{a['plain_depth']}" + ("_anchor" if a["anchor"] else "") + (f"_ain{a['anchor_in']}" if a["anchor_in"] else "")
-                + ("" if a["body_code"] == "whole" else f"_body{a['body_code']}"))
+                + ("" if a["body_code"] == "whole" else f"_body{a['body_code']}") + _range_suffix(a))
     s = f"b{a['bands']}{'k' if a['keep'] and a['bands'] > 1 else 'u'}_{a['codes']}_st{a['stages']}"
     s += (f"soft{a['soft']:g}" if a["soft"] > 0 else "") + ("_anchor" if a["anchor"] else "") + ("" if a["body_out"] else "_nobodyhead")
     s += (f"_bd{a['body_depth']}" if a["body_depth"] != 1 else "") + (f"_md{a['member_depth']}" if a["member_depth"] != 1 else "")
@@ -206,7 +209,15 @@ def describe(a: Dict[str, Any]) -> str:
     s += ("_xdeep" if a["xdeep"] else "") + (f"_ain{a['anchor_in']}" if a["anchor_in"] else "") + ("_sz" if a["stage_zero"] else "")
     s += f"_ssoft{a['stage_soft']:g}" if a["stage_soft"] > 0 else ""
     s += "_tln" if a["t_sampling"] == "logit_normal" else ""
-    return s
+    return s + _range_suffix(a)
+
+
+def _range_suffix(a: Dict[str, Any]) -> str:
+    """``_t<lo>-<hi>`` when the training range of the noise level is not (0, 1); ``_tmix<p>`` when the whole-range share
+    is above 0."""
+    lo, hi = float(a.get("t_lo", 0.0)), float(a.get("t_hi", 1.0))
+    p = float(a.get("t_mix", 0.0))
+    return ("" if (lo, hi) == (0.0, 1.0) else f"_t{lo:g}-{hi:g}") + (f"_tmix{p:g}" if p > 0 else "")
 
 
 # ------------------------------------------------------------------ flat files to units
