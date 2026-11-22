@@ -9,6 +9,9 @@ windowed bodies (tails) are mixed by the stage weights before one head.
     add_class_experts(build, [[0], [1]], window=(0, 0.25))   one ContentExpert per class set (expert_c0, expert_c1)
     add_band_members(build, (0, 1, 2))                       one band-kept BandMember per band (member_b0 ..)
     with_class_experts(folder, seed, [[9]])                  a finished build folder + newborn class experts
+    add_class_experts(build, [[0], [1]], gate="symbol")      parts gated by a random symbol (expert_s0, expert_s1)
+    add_class_experts(build, [[0]], depth=0)                 a part with no block: a class head on the trunk's states
+    with_parts(folder, seed, [dict(classes=..., ...), ...])  several groups of newborn parts at once
 
 Every unit keeps a fixed name (anchor, stem, body, head), so the units of different clusters are interchangeable.
 ``cluster_build(stem_depth=k)`` gives exactly the unit entries and geometry of the flat arguments ``arch=plain
@@ -81,22 +84,35 @@ def expert_name(classes: Sequence[int], prefix: str = "expert") -> str:
     return f"{prefix}_c" + "-".join(str(int(c)) for c in classes)
 
 
+def symbol_name(symbols: Sequence[int], prefix: str = "expert") -> str:
+    """expert_s3 for the symbol [3] (a symbol-gated part), expert_s0-1 for [0, 1]."""
+    return f"{prefix}_s" + "-".join(str(int(c)) for c in symbols)
+
+
 def add_class_experts(build: Build, classes: Sequence[Sequence[int]], window=(0.0, 1.0), soft: float = 0.0,
-                      depth: int = 1, prefix: str = "expert") -> List[str]:
+                      depth: int = 1, prefix: str = "expert", gate: str = "class") -> List[str]:
     """Append one ContentExpert per class set to ``build`` (in place) and return their names. Each: site "out", band
     "all", the window and the crossfade half-width, the class list; spec depth, the whole position code, keep False;
-    its random stream is its own name."""
+    its random stream is its own name.
+
+    depth 0: a part with no block, the head's own reading of the trunk's last states (a norm and one zero-born linear
+    layer to the token values). gate "symbol": each list is a list of symbols, not classes (spec "gate": "symbol";
+    named <prefix>_s<symbols>); gate "class" writes the entry of earlier versions (no "gate" key)."""
+    if gate not in ("class", "symbol"):
+        raise ValueError(f"gate is class or symbol, not {gate!r}")
     names = []
     lo, hi = window
     for cs in classes:
         cs = [int(c) for c in cs]
         if not cs:
             raise ValueError("an expert needs at least one class")
-        n = expert_name(cs, prefix)
+        n = expert_name(cs, prefix) if gate == "class" else symbol_name(cs, prefix)
+        spec = {"depth": int(depth), "code": list(WHOLE), "keep": False}
+        if gate == "symbol":
+            spec["gate"] = "symbol"
         build.units.append(UnitEntry(n, "ContentExpert",
                                      {"site": "out", "band": "all", "window": [_edge(lo), _edge(hi)], "soft": _edge(soft),
-                                      "classes": cs},
-                                     {"depth": int(depth), "code": list(WHOLE), "keep": False}))
+                                      "classes": cs}, spec))
         names.append(n)
     build.validate()
     return names
@@ -121,13 +137,21 @@ def add_band_members(build: Build, bands: Sequence[int] = (0, 1, 2), depth: int 
 
 
 def with_class_experts(folder: str, seed: int, classes: Sequence[Sequence[int]], window=(0.0, 1.0), soft: float = 0.0,
-                       depth: int = 1, prefix: str = "expert", device="cpu"):
+                       depth: int = 1, prefix: str = "expert", device="cpu", gate: str = "class"):
     """A finished build folder as a model with newborn class experts added -> (model, expert names).
 
     The folder is linked strictly (every unit file checked against its card's content hash); the folder itself is
     not changed. The experts are born from (seed, their name), zero-born, so the new model's velocity equals the
     source's exactly (checked on the linker's probe batch). Export the trained model with ``base=folder`` and
     ``trained=<expert names>``; removing the experts (``without_units``) gives back the source model."""
+    return with_parts(folder, seed, [dict(classes=classes, window=window, soft=soft, depth=depth, prefix=prefix,
+                                          gate=gate)], device=device)
+
+
+def with_parts(folder: str, seed: int, groups: Sequence[Dict[str, Any]], device="cpu"):
+    """A finished build folder with several groups of newborn parts -> (model, part names): each group is the keyword
+    arguments of ``add_class_experts`` (classes, window, soft, depth, prefix, gate), appended in order. As
+    ``with_class_experts`` otherwise (the newborn parts change no digit of the source's output)."""
     from .linker import born_gap, link
     from .model import Model
     from .units import born
@@ -135,7 +159,9 @@ def with_class_experts(folder: str, seed: int, classes: Sequence[Sequence[int]],
     b = src.build
     new = Build(name=b.name, geometry=dict(b.geometry), units=[UnitEntry.from_dict(e.to_dict()) for e in b.units],
                 info=dict(b.info))
-    names = add_class_experts(new, classes, window, soft, depth, prefix)
+    names = []
+    for g in groups:
+        names += add_class_experts(new, **g)
     units = list(src.units)
     for n in names:
         e = new.entry(n)

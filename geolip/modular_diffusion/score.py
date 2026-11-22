@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from .sample import check_grid, euler, euler_grid
+from .sample import check_grid, euler, euler_grid, picture_symbols
 from .spectral import token_filter
 
 SCORE_SEED = 20260101
@@ -65,11 +65,13 @@ def sample_pictures(model, bed, n: int, steps: int = 50, batch: int = 1000, seed
     model.eval()
     gen = torch.Generator(device=device).manual_seed(int(seed))
     cls_all = score_classes(n, device)
+    sym_all = picture_symbols(model, n, seed, device)          # None for a model without symbol-gated units
     out = []
     for i in range(0, n, batch):
         cls = cls_all[i:i + batch]
+        sym = None if sym_all is None else sym_all[i:i + batch]
         z = torch.randn((cls.shape[0],) + tuple(bed.field_shape), generator=gen, device=device)
-        z = euler(model, z, cls, steps) if pts is None else euler_grid(model, z, cls, pts)
+        z = euler(model, z, cls, steps, symbols=sym) if pts is None else euler_grid(model, z, cls, pts, symbols=sym)
         out.append(to_pictures(z, bed))
     return torch.cat(out) if out else torch.zeros((0,) + tuple(bed.field_shape), dtype=torch.uint8)
 

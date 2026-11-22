@@ -47,22 +47,25 @@ anchor gain at a frequency of image power S:   g = (t S - (1 - t)) / (t^2 S + (1
 | `blocks`, `rotary` | the transformer block, zero-born layers, the time embedding; axial rotary codes for one band of wavelengths |
 | `spectral` | token layout, band masks and the band filter, power spectra, the closed-form anchor, the per-class anchor (a mean field and a spectrum per class) and its statistics |
 | `windows` | windows of the noise level, hard and crossfaded |
-| `units` | the unit types (anchor, optionally per class; stem, optionally reading the class only in a window of the noise level; stage body, growth block, body, head, band member, content expert) and per-name birth |
+| `units` | the unit types (anchor, optionally per class; stem, optionally reading the class only in a window of the noise level; stage body, growth block, body, depth block (a block appended before the head, the exact identity at birth), head, band member, content expert, gated by the class or by a random label, with or without a block of its own) and per-name birth |
 | `model` | the model assembled from a build: its parts, the velocity, the training loss (over a range of the noise level, with an optional share of whole-range draws) |
 | `staged` | a model of stage clusters: one whole model per stretch of the noise level, blended by the stage weights; shared units; staged folders, their links and stale lists |
 | `forms` | builds of the stage forms (a cluster: anchor, stem, body, head; one model with mixed tails), adopting units from a build folder, class experts and band members added to a finished build |
 | `score` | the picture score: the Frechet distance of a judge's features of generated and training pictures (pictures sampled with Euler steps, or on a time grid with `grid=`), with its mean part and its spread part; a class reader (a closed-form ridge map from the judge's features to the classes) and its check on the test pictures |
-| `closed` | heads solved by least squares on a frozen, finished model (normal equations over the training stream, in float64); one head per stage by a solve, written as a staged folder |
+| `closed` | heads solved by least squares on a frozen, finished model (normal equations over the training stream, in float64); one head per stage by a solve, written as a staged folder; added parts with no block (class heads) solved jointly |
+| `determinism` | the `det=` switch of every experiment: `warn` names the operations that are not deterministic on the device, `on` takes their deterministic algorithms (on a card the attention kernel's backward pass is not deterministic by default, so two runs of one job can differ in their last digits) |
 | `build` | the build file, the unit card, content hashes, unit files (safetensors + card JSON) |
 | `linker` | link a build folder (every file checked against its hash), snap units in and out, the stale list; convert a model or a flat weight file into a build folder |
 | `cache` | the feature cache: a frozen model's states over a training stream, so heads and members train without the stem; the stored steps can be passed more than once |
 | `beds`, `data` | Gaussian fields and CIFAR-style pictures (the training stream can leave classes out or keep only some); CIFAR-10 from parquet to npz and the npz's content hash |
-| `train` | the recipe, the loop and the entry point (`python -m geolip.modular_diffusion.train key=value ...`); `fit_units` trains named units of any model and can keep exponential averages of the trained weights beside the last weights (`averages=`, `use_average`) |
+| `train` | the recipe, the loop and the entry point (`python -m geolip.modular_diffusion.train key=value ...`); `fit_units` trains named units of any model, can keep averages of the trained weights beside the last weights (`averages=`: a decay, a power-law average `g8`, a tail average `tail100`; `use_average`), and can continue another run exactly (its optimizer state, its stream position, its average: `start_step`, `optimizer_state`, `average_start`; `write_state`, `read_state`) |
 | `run` | the entry point of the experiments (`python -m geolip.modular_diffusion.run <experiment> key=value ...`) |
 | `experiments.time_split` | the time split: stage clusters trained alone, together, from copies, against one model over the whole range; `load_job` opens a finished job as a model |
 | `experiments.chain_reads` | reads of saved time-split jobs assembled in new ways, with no training: a stage swapped in from another job, clusters at the wrong stages, another crossfade width, sampling on a time grid |
 | `experiments.content` | content as an element: the class read by the body at every noise level, only in the first stage, or never; the per-class closed-form anchor; class experts added to a finished model; a class added to a model that never saw it |
-| `experiments.closed_forms` | parts that need no training or no card: a head solved by least squares, one head per stage by a solve, band members trained through the live body and from stored states |
+| `experiments.closed_forms` | parts that need no training or no card: a head solved by least squares, one head per stage by a solve, class heads added by a solve, band members trained through the live body and from stored states |
+| `experiments.stages` | how many stages and where the cuts go: copies of a shared model that continue its run on one stage each, tails trained alone on a frozen stem, a model grown one block at a time |
+| `experiments.load` | a CPU load beside another job (for measuring whether a busy machine changes a job's numbers) |
 | `read`, `sample` | the read at fixed noise levels (by band, by part, by class); Euler sampling, sampling on a time grid (`euler_grid`, `stage_grid`, `share_counts`) and a sample sheet |
 | `report` | markdown tables from result files |
 | `jobs` | a roster runner: one job at a time, a stop file, DONE / FAILED markers, a start guard, a wall cap; claims for several runners on one roster, a hook after each job, jobs that need others |
@@ -77,6 +80,7 @@ anchor gain at a frequency of image power S:   g = (t S - (1 - t)) / (t^2 S + (1
 | `colab/base.ipynb` | install at a tag, a 50-step smoke run, one 6,000-step base run on CIFAR-10 | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.1.0/colab/base.ipynb) |
 | `colab/time_split.ipynb` | the time split on CIFAR-10: the data and its content hash, a smoke run with the picture score, the roster run by several runners, the summary | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.3.1/colab/time_split.ipynb) |
 | `colab/elements.ipynb` | content and closed forms on CIFAR-10: the finished time-split runs it starts from, a smoke run with the picture score and the class reader checked, the roster, the summary | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.4.0/colab/elements.ipynb) |
+| `colab/stages.ipynb` | stages, growth and content on averaged weights on CIFAR-10: a check of whether a job repeats beside a busy CPU, then the job list with deterministic algorithms on | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.5.0/colab/stages.ipynb) |
 
 ## Install
 

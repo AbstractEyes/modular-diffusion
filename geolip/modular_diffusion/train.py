@@ -95,24 +95,117 @@ def set_trainable(model, spec: str, loaded: Optional[dict] = None) -> None:
                 p.requires_grad_(True)
 
 
+BETAS = (0.9, 0.999)
+EPS = 1e-8
+STATE_WEIGHTS = "adam.safetensors"
+STATE_FILE = "state.json"
+
+
+def _scalar_dtype() -> torch.dtype:
+    """The dtype of Adam's step count on the CPU (as the optimizer makes it)."""
+    return torch.float64 if torch.get_default_dtype() == torch.float64 else torch.float32
+
+
+def _trainable_named(model) -> List[Tuple[str, torch.nn.Parameter]]:
+    return [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+
+
+def adam_state(opt, model, step: int, lr: float) -> Dict[str, Any]:
+    """The optimizer's state by parameter name -> {"step": the next global step, "m", "v": {name: tensor}, "t": {name:
+    the parameter's own step count}, "lr", "betas", "eps"} (copies, on the parameters' device). A parameter that never
+    took a step has no entry."""
+    out: Dict[str, Any] = {"step": int(step), "m": {}, "v": {}, "t": {}, "lr": float(lr), "betas": list(BETAS), "eps": EPS}
+    for n, p in _trainable_named(model):
+        st = opt.state.get(p)
+        if not st:
+            continue
+        out["m"][n] = st["exp_avg"].detach().clone()
+        out["v"][n] = st["exp_avg_sq"].detach().clone()
+        out["t"][n] = int(float(st["step"]))
+    return out
+
+
+def load_adam_state(opt, model, state: Dict[str, Any]) -> None:
+    """Load a state of ``adam_state`` into a newly made Adam over the model's trainable parameters, by parameter name.
+    Every name of the state must be a trainable parameter and every trainable parameter must be in the state (a
+    KeyError names the difference)."""
+    named = dict(_trainable_named(model))
+    have = set(state["m"])
+    if have != set(named):
+        raise KeyError(f"the optimizer state and the trainable parameters differ: only in the state "
+                       f"{sorted(have - set(named))[:5]}, only trainable {sorted(set(named) - have)[:5]}")
+    for n, p in named.items():
+        opt.state[p] = {"step": torch.tensor(float(state["t"][n]), dtype=_scalar_dtype()),
+                        "exp_avg": state["m"][n].detach().to(device=p.device, dtype=p.dtype).clone(),
+                        "exp_avg_sq": state["v"][n].detach().to(device=p.device, dtype=p.dtype).clone()}
+
+
+def write_state(folder: str, state: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> None:
+    """Write a trainer state (``fit_units(..., keep_state=True)["optimizer_state"]``) into ``folder``: adam.safetensors
+    (keys m/<parameter name> and v/<parameter name>) and state.json (the next global step, the per-parameter step
+    counts, lr, betas, eps and ``extra``). Each file is written under a process-own name and moved into place."""
+    from safetensors.torch import save_file
+    os.makedirs(folder, exist_ok=True)
+    tensors = {}
+    for n in sorted(state["m"]):
+        tensors["m/" + n] = state["m"][n].detach().to("cpu").contiguous()
+        tensors["v/" + n] = state["v"][n].detach().to("cpu").contiguous()
+    meta = {"format": "modular-diffusion/trainer-state/1", "step": int(state["step"]),
+            "t": {n: int(state["t"][n]) for n in sorted(state["t"])}, "lr": state.get("lr"),
+            "betas": list(state.get("betas", BETAS)), "eps": state.get("eps", EPS), "extra": dict(extra or {})}
+    wpath = os.path.join(folder, STATE_WEIGHTS)
+    jpath = os.path.join(folder, STATE_FILE)
+    tmp_w, tmp_j = f"{wpath}.{os.getpid()}.tmp", f"{jpath}.{os.getpid()}.tmp"
+    save_file(tensors, tmp_w)
+    with open(tmp_j, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(meta, fh, indent=1)
+        fh.write("\n")
+    os.replace(tmp_w, wpath)
+    os.replace(tmp_j, jpath)
+
+
+def read_state(folder: str, device="cpu") -> Dict[str, Any]:
+    """A trainer state written by ``write_state`` -> {"step", "m", "v", "t", "lr", "betas", "eps", "extra"}."""
+    from safetensors.torch import load_file
+    with open(os.path.join(folder, STATE_FILE), encoding="utf-8") as fh:
+        meta = json.load(fh)
+    tensors = load_file(os.path.join(folder, STATE_WEIGHTS), device=str(device))
+    m = {k[2:]: v for k, v in tensors.items() if k.startswith("m/")}
+    v = {k[2:]: t for k, t in tensors.items() if k.startswith("v/")}
+    return {"step": int(meta["step"]), "m": m, "v": v, "t": {n: int(x) for n, x in meta["t"].items()},
+            "lr": meta.get("lr"), "betas": meta.get("betas"), "eps": meta.get("eps"), "extra": meta.get("extra", {})}
+
+
 def run_loop(model, bed, seed: int, steps: int, lr: float, warmup: int, batch: int, cond_drop: float, mdrop: float,
              t_sampling: str, t_range: Sequence[float], equalize_members, device, log: Callable[[str], None], log_every: int,
-             at_step: Optional[Callable[[int], None]] = None, t_mix: float = 0.0) -> Tuple[List[list], float]:
+             at_step: Optional[Callable[[int], None]] = None, t_mix: float = 0.0, start_step: int = 0,
+             optimizer_state: Optional[Dict[str, Any]] = None,
+             state_out: Optional[Dict[str, Any]] = None) -> Tuple[List[list], float]:
     """The training loop of the recipe over the model's trainable parameters -> (curve [[step, loss], ...], seconds).
 
     t_range and t_mix: see ``Model.draw``. A step whose loss reaches no trained unit is skipped. ``at_step(steps done)`` is called after each step that trained.
-    Nothing happens when no parameter trains or steps <= 0."""
+    Nothing happens when no parameter trains or steps <= 0.
+
+    A run that continues another: the loop runs the global steps start_step .. start_step + steps - 1; global step s
+    takes the learning rate lr min(1, (s + 1) / max(1, warmup)) and the stream ``step_generator(seed, s)``. With
+    ``optimizer_state`` (``adam_state``) the Adam over the trainable parameters is loaded from it by parameter name
+    before the first step. The curve's step numbers and ``at_step`` stay local (0 .. steps - 1). With ``state_out`` (a
+    dict) the optimizer's state at the end is put into it. start_step=0 and no state is the loop of earlier versions."""
     params = [p for p in model.parameters() if p.requires_grad]
     curve: List[list] = []
     t0 = time.time()
+    start_step = int(start_step)
     if not params or steps <= 0:
         return curve, time.time() - t0
-    opt = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
+    opt = torch.optim.Adam(params, lr=lr, betas=BETAS, eps=EPS, weight_decay=0.0)
+    if optimizer_state is not None:
+        load_adam_state(opt, model, optimizer_state)
     model.train()
     for step in range(steps):
+        s = start_step + step
         for group in opt.param_groups:
-            group["lr"] = lr * min(1.0, (step + 1) / max(1, warmup))
-        gen = step_generator(seed, step, device)
+            group["lr"] = lr * min(1.0, (s + 1) / max(1, warmup))
+        gen = step_generator(seed, s, device)
         x, cls = bed.train_batch(batch, gen)
         loss = model.loss(x, cls, gen, cond_drop, mdrop=mdrop, t_sampling=t_sampling, t_range=t_range, t_mix=t_mix)
         if not loss.requires_grad:               # no sample of this batch reached a trained unit
@@ -129,6 +222,8 @@ def run_loop(model, bed, seed: int, steps: int, lr: float, warmup: int, batch: i
                 f"left about {spent / (step + 1) * (steps - step - 1):.0f} s")
         if at_step is not None:
             at_step(step + 1)
+    if state_out is not None:
+        state_out.update(adam_state(opt, model, start_step + steps, lr))
     return curve, time.time() - t0
 
 
@@ -182,13 +277,29 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
               lr: float = 1e-3, warmup: int = 100,
               batch: int = 128, cond_drop: float = 0.1, mdrop: float = 0.0, equalize: bool = True, heldout: int = 2048,
               device="cpu", log: Callable[[str], None] = print, log_every: int = 500,
-              expect_anchor_at_birth: bool = False, averages: Sequence[float] = ()) -> dict:
+              expect_anchor_at_birth: bool = False, averages: Sequence[Union[float, str]] = (),
+              start_step: int = 0, optimizer_state: Optional[Dict[str, Any]] = None, keep_state: bool = False,
+              average_start: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
+              average_step: Optional[int] = None) -> dict:
     """Train the named units of a model (a Model or a Staged) with the recipe and read it.
 
-    averages: decays d. For each, a float32 copy of every trainable parameter (on its device, no gradient) starts as
-    the parameters before the first step and, after optimizer step k = 0, 1, ..., becomes d_k avg + (1 - d_k) w with
-    d_k = min(d, (1 + k) / (10 + k)). Nothing else changes (the stream, the curve and the last weights are those of a
-    run without); the result then also holds "averaged": {d: {parameter name: tensor}} (keep it out of json files).
+    averages: decays d and named averages. For each, a float32 copy of every trainable parameter (on its device, no
+    gradient). A decay d (a float): the copy starts as the parameters before the first step and, after optimizer step
+    k = 0, 1, ..., becomes d_k avg + (1 - d_k) w with d_k = min(d, (1 + k) / (10 + k)). A name "g<number>" ("g8"):
+    d_k = (1 + k) / (k + g + 2) with the same arithmetic ("g8" gives the bits of the decay 0.999 for every k < 8,990).
+    A name "tail<number>" ("tail100"): the plain mean of the trainable parameters after each of the last <number>
+    optimizer steps of this fit (after all of them when the fit has fewer), summed in float64, divided, cast to
+    float32. Nothing else changes (the stream, the curve and the last weights are those of a run without); the result
+    then also holds "averaged": {the entry as given (a float, or the name): {parameter name: tensor}} (keep it out of
+    json files).
+
+    A carried average: ``average_start`` {"g<number>": {parameter name: tensor}} starts that average from the given
+    values (every trainable parameter must be given) instead of the parameters before the first step, and its k counts
+    from ``average_step`` (default: ``start_step``): k = average_step, average_step + 1, ... Only g names carry.
+
+    A run that continues another: ``start_step`` and ``optimizer_state`` (see ``run_loop``). ``keep_state``: the result
+    also holds "optimizer_state" {"step": start_step + steps, "m", "v": {name: tensor}, "t": {name: int}, "lr",
+    "betas", "eps"} (tensors: keep it out of json files; ``write_state`` writes it).
 
     Sets the trainable units; with ``expect_anchor_at_birth`` checks that the velocity equals the anchor's (or zero
     without an anchor) exactly on a 2-row probe; runs the loop; checks that the frozen parameters did not change; reads.
@@ -217,29 +328,73 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
         torch.cuda.reset_peak_memory_stats()
     log(f"FIT {n_par:,} trained numbers of {n_all:,}; trainable {trainable if isinstance(trainable, str) else sorted(trainable)}; "
         f"{steps} steps; t in [{t_range[0]:g}, {t_range[1]:g}) ({t_sampling}" + (f", whole-range share {t_mix:g})" if t_mix else ")"))
-    decays = [float(d) for d in averages]
-    for d in decays:
-        if not 0.0 <= d < 1.0:
-            raise ValueError(f"an average's decay lies in [0, 1): {d}")
+    specs = [average_spec(x) for x in averages]
+    if len({key for key, _, _ in specs}) != len(specs):
+        raise ValueError(f"an average is listed twice: {list(averages)}")
+    carried = dict(average_start or {})
+    for name in carried:
+        if not any(key == name and kind == "g" for key, kind, _ in specs):
+            raise ValueError(f"only a listed g average can be carried, not {name!r}")
+    first_k = int(start_step if average_step is None else average_step)
     at_step = None
     averaged = None
-    if decays:
+    tails: Dict[str, list] = {}
+    if specs:
         live = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        averaged = {}
         with torch.no_grad():
-            averaged = {d: {n: p.detach().clone().float() for n, p in live} for d in decays}
+            for key, kind, value in specs:
+                if kind == "tail":
+                    tails[key] = [None, 0]                     # [float64 sums, count]
+                    continue
+                if key in carried:
+                    given = carried[key]
+                    missing = [n for n, _ in live if n not in given]
+                    if missing:
+                        raise KeyError(f"the carried average {key!r} lacks the trainable parameters {missing[:5]}")
+                    averaged[key] = {n: given[n].detach().to(device=p.device, dtype=torch.float32).clone()
+                                     for n, p in live}
+                else:
+                    averaged[key] = {n: p.detach().clone().float() for n, p in live}
         updates = [0]
+        n_steps = int(steps)
 
         def at_step(done: int) -> None:                   # after every optimizer step k = 0, 1, ...
             k = updates[0]
             with torch.no_grad():
-                for d, state in averaged.items():
-                    dk = min(d, (1 + k) / (10 + k))
+                for key, kind, value in specs:
+                    if kind == "tail":
+                        if done > n_steps - value:            # one of the last <value> steps of this fit
+                            acc = tails[key]
+                            if acc[0] is None:
+                                acc[0] = {n: p.detach().double().clone() for n, p in live}
+                            else:
+                                for n, p in live:
+                                    acc[0][n] += p.detach().double()
+                            acc[1] += 1
+                        continue
+                    state = averaged[key]
+                    if kind == "decay":
+                        dk = min(value, (1 + k) / (10 + k))
+                    else:
+                        kk = first_k + k if key in carried else k
+                        dk = (1 + kk) / (kk + value + 2)
                     for n, p in live:
                         state[n].copy_(dk * state[n] + (1.0 - dk) * p.detach().float())    # the rule as written
             updates[0] += 1
 
+    state_out: Optional[Dict[str, Any]] = {} if keep_state else None
     curve, seconds = run_loop(model, bed, seed, steps, lr, warmup, batch, cond, mdrop, t_sampling, t_range, equalize,
-                              device, log, log_every, at_step=at_step, t_mix=float(t_mix))
+                              device, log, log_every, at_step=at_step, t_mix=float(t_mix), start_step=int(start_step),
+                              optimizer_state=optimizer_state, state_out=state_out)
+    if tails:
+        with torch.no_grad():
+            for key, (sums, count) in tails.items():
+                if sums is None:                               # no step trained: the parameters as they are
+                    averaged[key] = {n: p.detach().clone().float() for n, p in live}
+                else:
+                    averaged[key] = {n: (s / count).float() for n, s in sums.items()}
+        averaged = {key: averaged[key] for key, _, _ in specs}          # in the order given
     peak = torch.cuda.max_memory_allocated() / 2 ** 20 if is_cuda else None
     frozen_same = all(torch.equal(frozen_before[id(p)], p) for p in model.parameters() if id(p) in frozen_before)
     res = read(model, bed, heldout, device)
@@ -250,9 +405,41 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
                 "recipe": recipe(lr, warmup, batch, steps, t_sampling, t_range, cond, bed.kind == "pictures", equalize,
                                  mdrop, device, t_mix),
                 "torch": torch.__version__, "device": str(device)})
+    if int(start_step) or optimizer_state is not None:     # recorded only for a run that continues another
+        res["start_step"] = int(start_step)
+        res["recipe"]["start_step"] = int(start_step)
+        res["recipe"]["optimizer_state"] = "continued" if optimizer_state is not None else "new"
     if averaged is not None:
         res["averaged"] = averaged                        # tensors: never written into a json file
+    if keep_state:
+        if not state_out:                                 # no step trained: the state as it was given
+            state_out = dict(optimizer_state) if optimizer_state is not None else {
+                "step": int(start_step), "m": {}, "v": {}, "t": {}, "lr": float(lr), "betas": list(BETAS), "eps": EPS}
+            state_out["step"] = int(start_step)
+        res["optimizer_state"] = state_out                # tensors: never written into a json file
     return res
+
+
+def average_spec(x: Union[float, str]) -> Tuple[Union[float, str], str, Union[float, int]]:
+    """An entry of ``averages`` -> (key, kind, value): a float (or a number's text) -> (the float, "decay", d); "g8" ->
+    ("g8", "g", 8); "tail100" -> ("tail100", "tail", 100)."""
+    if isinstance(x, str):
+        text = x.strip()
+        if text.startswith("g") and len(text) > 1:
+            g = float(text[1:])
+            if g < 0:
+                raise ValueError(f"a g average's number is not negative: {x!r}")
+            return text, "g", int(g) if g.is_integer() else g
+        if text.startswith("tail") and len(text) > 4:
+            n = int(text[4:])
+            if n < 1:
+                raise ValueError(f"a tail average needs at least one step: {x!r}")
+            return text, "tail", n
+        x = float(text)
+    d = float(x)
+    if not 0.0 <= d < 1.0:
+        raise ValueError(f"an average's decay lies in [0, 1): {d}")
+    return d, "decay", d
 
 
 @contextlib.contextmanager

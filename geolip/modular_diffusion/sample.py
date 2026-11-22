@@ -18,12 +18,28 @@ from .spectral import token_filter
 SHEET_SEED = 2026
 
 
+SYMBOL_OFFSET = 7919                 # sampled pictures' symbols: fixed_symbols(n, the sampling seed + SYMBOL_OFFSET)
+
+
+def picture_symbols(model, n: int, seed: int, device):
+    """The symbols of n sampled pictures for a model with symbol-gated units (one fixed draw per picture from a
+    generator seeded from the sampling seed, so the noise of every picture is the noise of a model without them), or
+    None (nothing is drawn)."""
+    from .model import fixed_symbols, symbol_gated
+    return fixed_symbols(n, int(seed) + SYMBOL_OFFSET, device) if symbol_gated(model) else None
+
+
+def _kw(symbols) -> dict:
+    return {} if symbols is None else {"symbols": symbols}
+
+
 @torch.no_grad()
-def euler(model, z: torch.Tensor, cls: torch.Tensor, steps: int = 50) -> torch.Tensor:
-    """z_{i+1} = z_i + v(z_i, i / steps) / steps for i = 0 .. steps - 1 (the last velocity is taken at t = 1 - 1/steps)."""
+def euler(model, z: torch.Tensor, cls: torch.Tensor, steps: int = 50, symbols: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """z_{i+1} = z_i + v(z_i, i / steps) / steps for i = 0 .. steps - 1 (the last velocity is taken at t = 1 - 1/steps).
+    symbols: the rows' symbols for a model with symbol-gated units."""
     for i in range(steps):
         t = torch.full((cls.shape[0],), i / steps, device=z.device)
-        z = z + model.velocity(z, t, cls) / steps
+        z = z + model.velocity(z, t, cls, **_kw(symbols)) / steps
     return z
 
 
@@ -48,13 +64,14 @@ def check_grid(ts: Sequence[float]) -> List[float]:
 
 
 @torch.no_grad()
-def euler_grid(model, z: torch.Tensor, cls: torch.Tensor, ts: Sequence[float]) -> torch.Tensor:
+def euler_grid(model, z: torch.Tensor, cls: torch.Tensor, ts: Sequence[float],
+               symbols: Optional[torch.Tensor] = None) -> torch.Tensor:
     """z <- z + v(z, ts[k]) (ts[k + 1] - ts[k]) for k = 0 .. K - 1 on a grid of K + 1 points (``check_grid``); the
     differences are taken in Python floats."""
     pts = check_grid(ts)
     for k in range(len(pts) - 1):
         t = torch.full((cls.shape[0],), pts[k], device=z.device)
-        z = z + model.velocity(z, t, cls) * (pts[k + 1] - pts[k])
+        z = z + model.velocity(z, t, cls, **_kw(symbols)) * (pts[k + 1] - pts[k])
     return z
 
 
@@ -124,7 +141,8 @@ def sample_sheet(model, bed, path: str, device, steps: int = 50, per_class: int 
     cls = torch.arange(10, device=device).repeat_interleave(per_class)
     gen = torch.Generator(device=device).manual_seed(SHEET_SEED)
     z = torch.randn((cls.shape[0],) + tuple(bed.field_shape), generator=gen, device=device)
-    z = euler(model, z, cls, steps) if grid is None else euler_grid(model, z, cls, grid)
+    sym = picture_symbols(model, cls.shape[0], SHEET_SEED, device)
+    z = euler(model, z, cls, steps, symbols=sym) if grid is None else euler_grid(model, z, cls, grid, symbols=sym)
     if bed.tilt is not None:                 # back to ordinary pictures for viewing
         z = token_filter(z, 1.0 / bed.tilt.to(device), bed.grid)
     x = (z * bed.std.to(device) + bed.mean.to(device)).clamp(0, 1)

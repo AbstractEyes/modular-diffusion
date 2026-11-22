@@ -31,8 +31,11 @@ variant are born with the same numbers and see the same pictures and noise at ea
 Arguments (key=value): variant, seed, data, out, device, heldout, batch, lr, warmup, log_every, threads, mem_fraction
 (applied on Windows only), scale (multiplies every step count, at least 2 per part), dim, score (0 / 1), judge
 (inception / fake), score_n, score_steps, ref (an npz caching the reference statistics), sheet, source, stem_from,
-avg (one-model variants only: a comma list of decays; each average of the trained parameters is exported as
-model_avg<digits after the point>/, read and scored after the last weights, and reported under "averaged").
+avg (one-model variants only: a comma list of decays and named averages, ``train.fit_units``; each average of the
+trained parameters is exported as model_avg<digits after the point>/ for a decay or model_avg_<name>/ for a name (g8,
+tail100), read and scored after the last weights, and reported under "averaged" by its decimal text or its name),
+score_last (0: the last weights are read and not scored), score_avg (empty: every average is scored; a comma list:
+only those; every average is read), det (empty, warn or on: ``determinism``).
 
 Output in ``out``: log.txt (its last line 'done'), result.json, samples.png (with sheet), the build folder(s) (model/,
 or stage_0 .. stage_2/ with staged.json).
@@ -51,6 +54,7 @@ from .. import __version__
 from ..beds import PicturesBed
 from ..config import in_notebook, parse
 from ..data import npz_content_hash
+from ..determinism import mode as det_mode
 from ..forms import adopt, cluster_build, mixed_tails_build
 from ..linker import export_build, link
 from ..model import Model
@@ -78,16 +82,24 @@ VARIANTS = tuple(PLAIN) + ("tails_mixed",) + CLUSTERED
 
 DEFAULTS = dict(variant="", seed=0, data="", out="", device="cuda", heldout=2048, batch=128, lr=1e-3, warmup=100,
                 log_every=500, threads=4, mem_fraction=0.25, scale=1.0, dim=128, score=0, judge="inception",
-                score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", avg="")
+                score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", avg="", score_last=1,
+                score_avg="", det="")
 
 
 def parse_averages(text: str) -> List[tuple]:
-    """``avg=`` text "0.999,0.9995" -> [(key "0.999", folder "model_avg999", decay 0.999), ...]: the key is the decay's
-    decimal text, the folder name carries the digits after the point."""
+    """``avg=`` text "0.999,0.9995,g8,tail100" -> [(key "0.999", folder "model_avg999", decay 0.999), ...,
+    ("g8", "model_avg_g8", "g8"), ("tail100", "model_avg_tail100", "tail100")]: a decay's key is its decimal text and
+    its folder name carries the digits after the point; a named average ("g<number>", "tail<number>",
+    ``train.average_spec``) is its own key and its folder is model_avg_<name>."""
+    from ..train import average_spec
     out = []
     for item in str(text).split(","):
         item = item.strip()
         if not item:
+            continue
+        if item[0].isalpha():
+            key, _, _ = average_spec(item)
+            out.append((key, "model_avg_" + key, key))
             continue
         d = float(item)
         if not 0.0 < d < 1.0:
@@ -95,19 +107,59 @@ def parse_averages(text: str) -> List[tuple]:
         key = repr(d)
         out.append((key, "model_avg" + key.split(".", 1)[1], d))
     if len({k for k, _, _ in out}) != len(out):
-        raise ValueError(f"a decay is listed twice: {text!r}")
+        raise ValueError(f"an average is listed twice: {text!r}")
     return out
 
 
-def export_averages(model, res: dict, averages: List[tuple], out: str, export) -> None:
+AVERAGE_RULES = {"decay": "d_k = min(d, (1 + k) / (10 + k)); avg <- d_k avg + (1 - d_k) w after optimizer step k",
+                 "g": "d_k = (1 + k) / (k + g + 2); avg <- d_k avg + (1 - d_k) w after optimizer step k",
+                 "tail": "the mean of the weights after each of the last n optimizer steps (float64 sums)"}
+
+
+def average_recipe(recipe: dict, entry, carried: Optional[dict] = None) -> dict:
+    """A card recipe for an average's weights: a decay's keys of earlier versions (average_decay, average_rule); a
+    named average's name, its rule and, when it was carried, where it started."""
+    from ..train import average_spec
+    key, kind, _ = average_spec(entry)
+    if kind == "decay":
+        return dict(recipe, average_decay=key, average_rule=AVERAGE_RULES["decay"])
+    rec = dict(recipe, average=key, average_rule=AVERAGE_RULES[kind])
+    if carried:
+        rec["average_carried_from"] = dict(carried)
+    return rec
+
+
+def export_averages(model, res: dict, averages: List[tuple], out: str, export, carried: Optional[dict] = None) -> None:
     """Each average's weights exported as a build folder of its own (``export(model, folder, recipe)`` with the
-    averaged values swapped in; the last weights are back in the model afterwards)."""
+    averaged values swapped in; the last weights are back in the model afterwards). ``carried``: {key: a note of
+    where a carried average started}, written into its recipe."""
     from ..train import use_average
     for key, folder, d in averages:
-        rec = dict(res["recipe"], average_decay=d, average_rule="d_k = min(d, (1 + k) / (10 + k)); "
-                                                                "avg <- d_k avg + (1 - d_k) w after optimizer step k")
+        rec = average_recipe(res["recipe"], d, (carried or {}).get(key))
         with use_average(model, res["averaged"][d]):
             export(model, folder, rec)
+
+
+NEW_ARGS = {"score_last": 1, "score_avg": "", "det": "", "source_model": "", "stem_model": ""}
+
+
+def recorded_args(a: dict) -> dict:
+    """The arguments written into a result: every argument but avg= when empty and the arguments of the sixth pass
+    at their defaults, so a job without the new options writes the result of earlier versions."""
+    return {k: a[k] for k in sorted(a) if not (k == "avg" and not a[k]) and not (k in NEW_ARGS and a[k] == NEW_ARGS[k])}
+
+
+def scored_keys(a: dict, averages: List[tuple]) -> set:
+    """The keys of the averages that are scored: every one when score_avg= is empty; else the listed ones (each must
+    be an average of avg=, ValueError otherwise)."""
+    keys = {k for k, _, _ in averages}
+    if not str(a.get("score_avg", "")).strip():
+        return keys
+    want = {k for k, _, _ in parse_averages(a["score_avg"])}
+    unknown = want - keys
+    if unknown:
+        raise ValueError(f"score_avg= names averages that avg= does not list: {sorted(unknown)}")
+    return want
 
 
 def steps_of(n: int, scale: float) -> int:
@@ -164,6 +216,45 @@ def load_job(folder: str, device="cpu", kind: Optional[str] = None):
     raise ValueError(f"unknown kind {kind!r}; known: model, clusters")
 
 
+def stored_key(model_folder: str) -> Optional[str]:
+    """The key of a job's result under which a folder's read is stored: None for ``model`` (the result's own
+    loss_over_levels); the average's key for an average's folder (model_avg999 -> "0.999", model_avg_g8 -> "g8", a
+    staged average's folder avg_g8 -> "g8")."""
+    name = model_folder.replace("\\", "/").strip("/")
+    if name in ("model", ""):
+        return None
+    if name.startswith("model_avg_"):
+        return name[len("model_avg_"):]
+    if name.startswith("model_avg"):
+        return "0." + name[len("model_avg"):]
+    if name.startswith("avg_"):
+        return name[len("avg_"):]
+    raise ValueError(f"not a model folder of a job: {model_folder!r}")
+
+
+def source_read(job: str, model_folder: str, bed, heldout: int, device, log=None) -> Dict[str, Any]:
+    """A source job's folder read again before it is used as a base -> {"folder", "loss_over_levels", "by_level",
+    "stored_loss_over_levels", "equals_stored"}: equals_stored compares with the job's stored number for that folder
+    (``stored_key``; None when the job's result.json does not hold it)."""
+    path = os.path.join(job, model_folder)
+    model = link_staged(path, device=device) if os.path.exists(os.path.join(path, STAGED_FILE)) else link(path, device=device)
+    r = read(model, bed, int(heldout), device)
+    stored = None
+    res_path = os.path.join(job, "result.json")
+    if os.path.exists(res_path):
+        with open(res_path, encoding="utf-8") as fh:
+            res = json.load(fh)
+        key = stored_key(model_folder)
+        stored = res.get("loss_over_levels") if key is None else ((res.get("averaged") or {}).get(key) or {}).get(
+            "loss_over_levels")
+    out = {"folder": model_folder, "loss_over_levels": r["loss_over_levels"], "by_level": _levels(r),
+           "stored_loss_over_levels": stored, "equals_stored": None if stored is None else r["loss_over_levels"] == stored}
+    if log is not None:
+        log(f"AS SOURCE {model_folder}: over ten levels {r['loss_over_levels']:.6f} (stored {stored}; "
+            f"equal {out['equals_stored']})")
+    return out
+
+
 def plan(variant: str, scale: float) -> List[tuple]:
     """(part name, steps) of every training part of a variant, in order."""
     if variant in PLAIN:
@@ -181,6 +272,11 @@ def plan(variant: str, scale: float) -> List[tuple]:
 def main(argv=(), **overrides) -> dict:
     """Run one variant of one seed; writes the outputs into ``out`` and returns the result."""
     a = parse(DEFAULTS, argv, **overrides)
+    with det_mode(a["det"]) as det:
+        return _run(a, det)
+
+
+def _run(a: dict, det) -> dict:
     variant = a["variant"]
     if variant not in VARIANTS:
         raise ValueError(f"unknown variant {variant!r}; known: {list(VARIANTS)}")
@@ -197,6 +293,7 @@ def main(argv=(), **overrides) -> dict:
     if averages and kind_of(variant) == "clusters":
         raise ValueError(f"avg= applies to the one-model variants; {variant} trains clusters (averages of clusters are "
                          f"not supported)")
+    to_score = scored_keys(a, averages)
     torch.set_num_threads(int(a["threads"]))
     device = a["device"]
     if str(device).startswith("cuda"):
@@ -336,7 +433,7 @@ def main(argv=(), **overrides) -> dict:
             log(f"SCORE{tag} not computed: {e!r}")
             return {"error": repr(e)}
 
-    if int(a["score"]):
+    if int(a["score"]) and int(a["score_last"]):
         result["score"] = score_of(final)
     if averages:
         result["averaged"] = {}
@@ -344,15 +441,16 @@ def main(argv=(), **overrides) -> dict:
             avg_model = link(os.path.join(out, folder), device=device)
             log(f"READ the average {key} ({folder})")
             r = read(avg_model, bed, int(a["heldout"]), device)
+            scored = int(a["score"]) and key in to_score
             result["averaged"][key] = {"loss_over_levels": r["loss_over_levels"], "by_level": _levels(r),
                                        "by_stage": by_stage(r, CUTS),
-                                       "score": score_of(avg_model, f" (average {key})") if int(a["score"]) else None}
+                                       "score": score_of(avg_model, f" (average {key})") if scored else None}
     if int(a["sheet"]):
         sample_sheet(final, bed, os.path.join(out, "samples.png"), device)
-    # avg= is recorded only when given, so a job without averages writes the result of earlier versions
-    result.update({"args": {k: a[k] for k in sorted(a) if not (k == "avg" and not a[k])}, "torch": torch.__version__,
-                   "device": str(device),
+    # avg= and the newer options are recorded only when given, so a job without them writes the result of earlier versions
+    result.update({"args": recorded_args(a), "torch": torch.__version__, "device": str(device),
                    "version": __version__})
+    det.record(result)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(result, fh, indent=1)
         fh.write("\n")
@@ -379,16 +477,32 @@ def summarize(root: str) -> str:
             if r.get("experiment") == EXPERIMENT:
                 rows.append(r)
     rows.sort(key=lambda r: (r["variant"], r["seed"]))
-    lines = ["| variant | seed | steps | numbers (all / trained) | seconds | total | by stage | wrong assembly | score |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    with_avg = any(r.get("averaged") for r in rows)
+    lines = ["| variant | seed | steps | numbers (all / trained) | seconds | total | by stage | wrong assembly | score |"
+             + (" averages (total / score) |" if with_avg else ""),
+             "|---|---|---|---|---|---|---|---|---|" + ("---|" if with_avg else "")]
     for r in rows:
         steps = sum(int(p["steps"]) for p in r["parts"])
         stages = " / ".join(_fmt(x) for x in r["by_stage"])
         wrong = _fmt(r["wrong_assembly"]["loss_over_levels"]) if r.get("wrong_assembly") else "-"
         score = _fmt(r["score"]["score"], 2) if (r.get("score") or {}).get("score") is not None else "-"
-        lines.append(f"| {r['variant']} | {r['seed']} | {steps:,} | {r['numbers']['all']:,} / {r['numbers']['trained']:,} | "
-                     f"{r['train_seconds']:.0f} | {_fmt(r['loss_over_levels'])} | {stages} | {wrong} | {score} |")
+        line = (f"| {r['variant']} | {r['seed']} | {steps:,} | {r['numbers']['all']:,} / {r['numbers']['trained']:,} | "
+                f"{r['train_seconds']:.0f} | {_fmt(r['loss_over_levels'])} | {stages} | {wrong} | {score} |")
+        if with_avg:
+            line += f" {averages_cell(r.get('averaged'))} |"
+        lines.append(line)
     return "\n".join(lines) + "\n"
+
+
+def averages_cell(averaged: Optional[dict]) -> str:
+    """'g8 0.1234 / 12.34; tail100 0.1240 / -' for a result's averaged block ('-' when there is none)."""
+    if not averaged:
+        return "-"
+    out = []
+    for key, v in averaged.items():
+        sc = (v.get("score") or {}).get("score")
+        out.append(f"{key} {_fmt(v.get('loss_over_levels'))} / {_fmt(sc, 2)}")
+    return "; ".join(out)
 
 
 if __name__ == "__main__" and not in_notebook():

@@ -11,6 +11,7 @@ with keys relative to the unit.
 | StageBody     | block                                       | h -> h inside its window of t                           |
 | GrowthBlock   | block (output layers zero at birth)         | as StageBody; the identity at birth                     |
 | Body          | blocks                                      | h -> h on every row (whole-range) or in its window      |
+| DepthBlock    | block (output layers zero at birth)         | h -> h on every row, after the trunk; one after another |
 | Head          | proj (zero at birth)                        | h -> a field over every band                            |
 | BandMember    | blocks, head.proj (zero at birth)           | (h, context, e) -> a field kept to one band and window  |
 | ContentExpert | as BandMember                               | as BandMember, for its class set only                   |
@@ -221,6 +222,22 @@ class GrowthBlock(StageBody):
     zero_birth = True
 
 
+class DepthBlock(Unit):
+    """One block after the trunk (after the stem, the whole-range body and the stage units, before the head and the
+    members), on every row, t = 1 included. Its three residual output layers start at zero, so it is the identity at
+    birth: a model grows by one block, exactly unchanged, by appending one. Depth blocks run one after another in build
+    order. spec: {}. Random stream: its name."""
+    unit_type = "DepthBlock"
+
+    def __init__(self, name, address, spec, geometry):
+        super().__init__(name, address, spec, geometry)
+        self.block = Block(geometry["dim"], geometry["heads"])
+        self.block.zero_outputs()
+
+    def forward(self, h, ctx, e, rot):
+        return self.block(h, ctx, None, e, rot)
+
+
 class Body(StageBody):
     """``depth`` blocks after the stem, run with the stem's rotary. spec: {"depth": k}.
 
@@ -268,13 +285,24 @@ class Head(Unit):
 class BandMember(Unit):
     """Blocks with their own position code and a zero-born head; the model keeps its output to one band of the token
     grid's frequencies (address "band": 0, 1, 2 or "all") and gates it by its window of t.
-    spec: {"depth", "code": [lo, hi], "keep": bool}."""
+    spec: {"depth", "code": [lo, hi], "keep": bool} and optionally "gate": "class" (the same as no key) or "symbol".
+
+    The class list (address "classes") gates the unit by the row's class, or, with spec "gate": "symbol", by the row's
+    symbol: a label drawn at random per row (``model.draw_symbols``), not the class. A symbol-gated unit is off for a
+    row whose symbol is the null index and for every row when no symbols are given. A depth of 0 is a unit with no
+    block: its head reads the trunk state directly."""
     unit_type = "BandMember"
 
     def __init__(self, name, address, spec, geometry):
         super().__init__(name, address, spec, geometry)
         d, heads = geometry["dim"], geometry["heads"]
+        gate_kind = self.spec.get("gate", "class")
+        if gate_kind not in ("class", "symbol"):
+            raise ValueError(f"a unit's gate is class or symbol, not {gate_kind!r}")
         classes = address.get("classes")
+        if gate_kind == "symbol" and classes is None:
+            raise ValueError("a symbol-gated unit needs its list of symbols (address classes)")
+        self.symbol_gate = gate_kind == "symbol"
         self.classes = None if classes is None else tuple(int(c) for c in classes)
         mask = torch.ones(geometry["classes"]) if self.classes is None else torch.zeros(geometry["classes"])
         if self.classes is not None:
@@ -297,11 +325,17 @@ class BandMember(Unit):
     def keep(self) -> bool:
         return bool(self.spec.get("keep", False)) and self.band != "all"
 
-    def gate(self, t: Tensor, cls_idx: Tensor) -> Tensor:
-        """[B]: the window weight times the class mask."""
+    def gate(self, t: Tensor, cls_idx: Tensor, symbols: Optional[Tensor] = None) -> Tensor:
+        """[B]: the window weight times the class mask (of the row's symbol for a symbol-gated unit; zero for every
+        row when ``symbols`` is None)."""
         w = window_weight(t, self.lo, self.hi, self.soft)
         if self.classes is not None:
-            w = w * self.cls_mask[cls_idx]
+            if self.symbol_gate:
+                if symbols is None:
+                    return torch.zeros_like(w)
+                w = w * self.cls_mask[symbols]
+            else:
+                w = w * self.cls_mask[cls_idx]
         return w
 
     def forward(self, h: Tensor, ctx: Tensor, e: Tensor):
@@ -317,7 +351,8 @@ class ContentExpert(BandMember):
     unit_type = "ContentExpert"
 
 
-UNIT_TYPES = {c.unit_type: c for c in (Anchor, Stem, StageBody, GrowthBlock, Body, Head, BandMember, ContentExpert)}
+UNIT_TYPES = {c.unit_type: c for c in (Anchor, Stem, StageBody, GrowthBlock, Body, Head, BandMember, ContentExpert,
+                                       DepthBlock)}
 
 
 def born(cls, seed: int, name: str, address: Dict[str, Any], spec: Dict[str, Any], geometry: Dict[str, Any],

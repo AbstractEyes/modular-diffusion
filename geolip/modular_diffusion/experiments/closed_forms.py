@@ -16,12 +16,21 @@ the frozen body's stored states.
 | cache_write         | the same model, its states for ``steps`` steps written to ``cache=``; seconds and bytes              |
 | members_cached      | the members trained from that cache: ``steps`` steps (at most passes x the cache's), ``passes`` passes |
 |                     | (step k reads stored step k mod the cache's steps); read=0 skips the read and the score              |
+| class_heads         | source + ten class heads with no block (depth 0: a norm and one zero-born linear layer reading the   |
+|                     | trunk's last states, one per class, on at every noise level), solved together by least squares on   |
+|                     | ``batches`` batches (``closed.part_equations``; the system is solved class by class)                 |
+| class_stage_heads   | source + thirty such heads: per class one per registered stage (the time split's cuts and crossfade), |
+|                     | the three of a class solved jointly                                                                  |
 
 members_live and members_cached at passes=1 use the same trainer settings (no member dropout, the trainer's default
 gradient equalization), so on one device they give the same curve and the same read.
 
 Arguments (key=value): those of the time split, plus batches (default 200), steps (default 1,500; times ``scale``, at
-least 2), ridge (1e-6), cache (a folder), passes (1), read (1). log_every defaults to 50.
+least 2), ridge (1e-6), cache (a folder), passes (1), read (1), source_model (the folder of the source job used as the
+base, default model; when given, or for the class-head variants, the folder is read again first and recorded under
+"as_source"), reader (the class read on the scored pictures; needs score=1 and ref=), det. log_every defaults to 50.
+The class-head variants also write by_class, class_worth and exact (one head left out: the largest change on the rows
+of the other classes, which must be 0.0, and the mean change on its own class's rows).
 
 Output in ``out``: log.txt (its last line 'done'), result.json, and the model: model/ (head_solved and the member
 variants) or stage_0 .. stage_2/ with staged.json (heads_staged_solved). result.json holds the time split's keys where they
@@ -42,26 +51,43 @@ from .. import __version__
 from ..beds import PicturesBed
 from ..build import read_build
 from ..cache import FeatureCache
-from ..closed import solve_model_head, solve_stage_heads
+from ..closed import install_parts, part_equations, solve_model_head, solve_parts, solve_stage_heads
 from ..config import in_notebook, parse
 from ..data import npz_content_hash
-from ..forms import add_band_members, adopt, cluster_build
+from ..determinism import mode as det_mode
+from ..forms import add_band_members, adopt, cluster_build, with_parts
 from ..linker import export_build, link
 from ..model import Model
 from ..read import by_stage, read
 from ..sample import sample_sheet
-from ..score import make_judge, picture_score, reference_stats
+from ..score import class_reader, make_judge, picture_score, reference_classes, reference_stats
 from ..train import fit_units, recipe
-from .time_split import CUTS, JUDGES, SOFT, TRAIN_RANGES, _levels, _marks, _part_row, _unique_numbers, load_job, steps_of
+from .content import class_numbers, exactness
+from .time_split import (CUTS, JUDGES, SOFT, TRAIN_RANGES, _levels, _marks, _part_row, _unique_numbers, load_job,
+                         recorded_args, source_read, steps_of, stored_key)
 
 EXPERIMENT = "closed_forms"
 VARIANTS = ("head_solved", "heads_staged_solved", "members_live", "cache_write", "members_cached")
 MEMBER_VARIANTS = ("members_live", "cache_write", "members_cached")
+CLASS_HEAD_VARIANTS = ("class_heads", "class_stage_heads")
+ALL_VARIANTS = VARIANTS + CLASS_HEAD_VARIANTS        # VARIANTS keeps the list of earlier versions
+NEW_DEFAULTS = {"reader": 0}
 
 DEFAULTS = dict(variant="", seed=0, data="", out="", device="cuda", heldout=2048, batch=128, lr=1e-3, warmup=100,
                 log_every=50, threads=4, mem_fraction=0.25, scale=1.0, dim=128, score=0, judge="inception",
                 score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", batches=200, steps=1500,
-                ridge=1e-6, cache="", passes=1, read=1)
+                ridge=1e-6, cache="", passes=1, read=1, source_model="", reader=0, det="")
+
+
+def class_head_groups(variant: str) -> List[dict]:
+    """The parts a class-head variant adds (``forms.with_parts`` groups): class_heads, one depth-0 part per class over
+    the whole range (class_head_c0 ..); class_stage_heads, one per class and registered stage (the time split's cuts
+    and crossfade; class_head_s0_c0 ..)."""
+    ten = [[c] for c in range(10)]
+    if variant == "class_heads":
+        return [dict(classes=ten, window=(0.0, 1.0), soft=0.0, depth=0, prefix="class_head")]
+    return [dict(classes=ten, window=(CUTS[s], CUTS[s + 1]), soft=SOFT, depth=0, prefix=f"class_head_s{s}")
+            for s in range(len(CUTS) - 1)]
 
 
 def members_model(source_model_folder: str, seed: int, bed) -> tuple:
@@ -83,9 +109,14 @@ def members_model(source_model_folder: str, seed: int, bed) -> tuple:
 def main(argv=(), **overrides) -> dict:
     """Run one variant of one seed; writes the outputs into ``out`` and returns the result."""
     a = parse(DEFAULTS, argv, **overrides)
+    with det_mode(a["det"]) as det:
+        return _run(a, det)
+
+
+def _run(a: dict, det) -> dict:
     variant = a["variant"]
-    if variant not in VARIANTS:
-        raise ValueError(f"unknown variant {variant!r}; known: {list(VARIANTS)}")
+    if variant not in ALL_VARIANTS:
+        raise ValueError(f"unknown variant {variant!r}; known: {list(ALL_VARIANTS)}")
     for k in ("data", "out", "source"):
         if not a[k]:
             raise ValueError(f"{k}= is required")
@@ -93,6 +124,8 @@ def main(argv=(), **overrides) -> dict:
         raise ValueError(f"{variant} needs cache=<a folder for the stored states>")
     if int(a["score"]) and a["judge"] not in JUDGES:
         raise ValueError(f"unknown judge {a['judge']!r}; known: {list(JUDGES)}")
+    if int(a["reader"]) and not (int(a["score"]) and a["ref"]):
+        raise ValueError("reader=1 needs score=1 and ref=<the reference file>")
     torch.set_num_threads(int(a["threads"]))
     device = a["device"]
     if str(device).startswith("cuda"):
@@ -112,8 +145,10 @@ def main(argv=(), **overrides) -> dict:
     seed, scale = int(a["seed"]), float(a["scale"])
     batches, ridge = int(a["batches"]), float(a["ridge"])
     n = steps_of(int(a["steps"]), scale)
-    base = os.path.join(a["source"], "model")
-    log(f"JOB {EXPERIMENT} {variant} seed {seed}: source {a['source']}; "
+    source_model = a["source_model"] or "model"
+    base = os.path.join(a["source"], source_model)
+    log(f"JOB {EXPERIMENT} {variant} seed {seed}: source {a['source']}" + (f" ({source_model})" if a["source_model"] else "")
+        + "; "
         + (f"{batches} batches" if variant not in MEMBER_VARIANTS else f"{n} steps") + f", on {device}; "
         f"torch {torch.__version__}; out {out}")
     t_job = time.time()
@@ -131,15 +166,37 @@ def main(argv=(), **overrides) -> dict:
     final = None
     do_read = bool(int(a["read"]))
     torch.manual_seed(seed)
+    if a["source_model"] or variant in CLASS_HEAD_VARIANTS:
+        result["as_source"] = source_read(a["source"], source_model, bed, heldout, device, log)
 
-    if variant in ("head_solved", "heads_staged_solved"):
+    if variant in CLASS_HEAD_VARIANTS:
+        model, names = with_parts(base, seed, class_head_groups(variant), device=device)
+        log(f"PART {len(names)} class head(s) with no block on {base}; solved on {batches} batches")
+        t0 = time.time()
+        eq = part_equations(model, bed, seed, batches, names, batch=int(a["batch"]), cond_drop=0.1)
+        solution = solve_parts(eq, ridge)
+        prov = install_parts(model, solution, eq)
+        result["train_seconds"] = time.time() - t0
+        log(f"SOLVE {len(names)} parts in {len(eq['groups'])} group(s): mse over the equations' rows "
+            f"{prov['all']['mse_before']:.5f} -> {prov['all']['mse_after']:.5f}"
+            + (f"; never on: {solution['unsolved']}" if solution["unsolved"] else ""))
+        rec = {"optimizer": None, "fit": "joint least squares per class (closed form)", "batches": batches,
+               "batch": int(a["batch"]), "t_range": [0.0, 1.0], "ridge": ridge, "seed": seed}
+        export_build(model, os.path.join(out, "model"), seed=seed, base=base, trained=names, recipe=rec,
+                     data=data_block, marks={"frozen_unchanged": True})
+        result["solve"] = prov
+        final, _ = load_job(out, device=device, kind="model")
+    elif variant in ("head_solved", "heads_staged_solved"):
         model = link(base, device=device)
         log("READ the source as trained")
         first = read(model, bed, heldout, device)
         stored = None
         if os.path.exists(os.path.join(a["source"], "result.json")):
             with open(os.path.join(a["source"], "result.json"), encoding="utf-8") as fh:
-                stored = json.load(fh).get("loss_over_levels")
+                src_res = json.load(fh)
+            key = stored_key(source_model)
+            stored = src_res.get("loss_over_levels") if key is None else (
+                (src_res.get("averaged") or {}).get(key) or {}).get("loss_over_levels")
         result["as_trained"] = {"loss_over_levels": first["loss_over_levels"], "by_level": _levels(first),
                                 "by_stage": by_stage(first, CUTS), "stored_loss_over_levels": stored,
                                 "equals_stored": None if stored is None else first["loss_over_levels"] == stored}
@@ -229,21 +286,36 @@ def main(argv=(), **overrides) -> dict:
                 r = read(c, bed, heldout, device)
                 alone.append({"loss_over_levels": r["loss_over_levels"], "by_level": _levels(r)})
             result["alone"] = alone
+        if variant in CLASS_HEAD_VARIANTS:
+            cn = class_numbers(whole)
+            result["by_class"], result["class_worth"] = cn["by_class"], cn["class_worth"]
+            names = [u.name for u in final.members]
+            result["exact"] = exactness(final, bed, heldout, device, names[0])
+            log(f"EXACT {names[0]} left out: other classes' rows change at most {result['exact']['others_max_abs']!r}")
         if int(a["score"]):
             n_score = int(a["score_n"])
             try:
                 judge = make_judge(a["judge"], device)
-                ref = reference_stats(bed, judge, a["ref"] or None, batch=1000)
+                rdr = None
+                if int(a["reader"]):
+                    ref_all = reference_classes(bed, judge, a["ref"] or None, batch=1000)
+                    ref = (ref_all["mu"], ref_all["cov"], ref_all["n"])
+                    rdr = class_reader(ref_all)
+                else:
+                    ref = reference_stats(bed, judge, a["ref"] or None, batch=1000)
                 result["score"] = picture_score(final, bed, judge, ref, n=n_score, steps=int(a["score_steps"]),
-                                                batch=min(1000, n_score), device=device)
-                log(f"SCORE {result['score']['score']:.4f} on {n_score} pictures ({result['score']['judge']})")
+                                                batch=min(1000, n_score), device=device, reader=rdr)
+                log(f"SCORE {result['score']['score']:.4f} on {n_score} pictures ({result['score']['judge']})"
+                    + (f"; class read {result['score']['class_read']['accuracy']:.4f}" if rdr is not None else ""))
             except Exception as e:
                 result["score"] = {"error": repr(e)}
                 log(f"SCORE not computed: {e!r}")
         if int(a["sheet"]):
             sample_sheet(final, bed, os.path.join(out, "samples.png"), device)
-    result.update({"args": {k: a[k] for k in sorted(a)}, "torch": torch.__version__, "device": str(device),
-                   "version": __version__})
+    # the newer options are recorded only when given, so a job without them writes the result of earlier versions
+    args = {k: v for k, v in recorded_args(a).items() if not (k in NEW_DEFAULTS and v == NEW_DEFAULTS[k])}
+    result.update({"args": args, "torch": torch.__version__, "device": str(device), "version": __version__})
+    det.record(result)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(result, fh, indent=1)
         fh.write("\n")
@@ -273,7 +345,10 @@ def summarize(root: str) -> str:
         stages = " / ".join(_fmt(x) for x in r["by_stage"]) if r.get("by_stage") else "-"
         trained = _fmt((r.get("as_trained") or {}).get("loss_over_levels"))
         solve = r.get("solve") or {}
-        mse = " / ".join(_fmt(p["mse_after"], 5) for p in solve.values()) if solve else "-"
+        if "all" in solve:                                   # parts solved together: the error over every row
+            mse = _fmt(solve["all"]["mse_after"], 5)
+        else:
+            mse = " / ".join(_fmt(p["mse_after"], 5) for p in solve.values()) if solve else "-"
         cache = f"{r['cache']['bytes']:,}" if r.get("cache") else "-"
         sc = r.get("score") or {}
         score = _fmt(sc["score"], 2) if sc.get("score") is not None else "-"

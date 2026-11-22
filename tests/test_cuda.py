@@ -2,14 +2,21 @@
 moved to a device while its probe, mask or reference stays behind is caught only here).
 
 Off by default: set MD_TEST_CUDA=1 on a machine with a card (the suite itself runs with the card hidden). Small and short:
-width 32, a few steps per part, under a gigabyte of card memory."""
+width 32, a few steps per part, under a gigabyte of card memory.
+
+The third function runs its jobs with det=on (``determinism``): by default the attention kernel's backward pass is not
+deterministic on a card, so two runs of one job can differ in the last digits; with the switch on they must be equal.
+The matrix library's fixed workspace has to be in the environment before anything touches the card, so it is set here,
+before torch is imported."""
 import os
 
-import pytest
-import torch
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
-from geolip.modular_diffusion.experiments import chain_reads, closed_forms, content, time_split
-from geolip.modular_diffusion.staged import link_staged
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+from geolip.modular_diffusion.experiments import chain_reads, closed_forms, content, time_split  # noqa: E402
+from geolip.modular_diffusion.staged import link_staged  # noqa: E402
 
 pytestmark = pytest.mark.skipif(os.environ.get("MD_TEST_CUDA") != "1" or not torch.cuda.is_available(),
                                 reason="MD_TEST_CUDA=1 and a visible card are needed")
@@ -116,3 +123,72 @@ def test_content_and_closed_forms_on_the_card(synthetic_npz, tmp_path):
     for name in ("head_solved", "heads_staged_solved", "members_live", "members_cached", "members_cycle"):
         assert f[name]["device"] == "cuda" and isinstance(f[name]["loss_over_levels"], float), name
         assert "score" in f[name]["score"], (name, f[name]["score"])
+
+
+def test_stages_symbols_and_class_heads_on_the_card(synthetic_npz, tmp_path):
+    """On the card, every job with det=on: a run continued from a saved trainer state equals the straight run (the last
+    weights and the carried average), the straight run repeats, copies with 3 and 8 stages, copies with a new optimizer,
+    tails, a grown model, symbol-gated parts, class heads by a solve; and the warn mode names what is not deterministic."""
+    from geolip.modular_diffusion.experiments import stages
+    small = dict(SMALL, data=synthetic_npz, ref=str(tmp_path / "reference.npz"), det="on")
+    root = tmp_path / "stages"
+    plain = time_split.main(**dict(small, variant="plain", out=str(root / "plain"), avg="g8"))
+    src = stages.main(**dict(small, variant="source", out=str(root / "source"), total=4000, score=0, sheet=0))
+    assert os.path.exists(root / "source" / "state" / "state.json")
+    copy = dict(small, variant="copies", source=str(root / "source"), source_model="model", total=2000, reader=1)
+    k1 = stages.main(**dict(copy, out=str(root / "k1"), cuts="", score_last=0, score_avg="tail100"))
+    # the control of the stage experiment: continued over the whole range it is the straight run, on a card too, and
+    # the straight run repeats to the last digit
+    again = time_split.main(**dict(small, variant="plain", out=str(root / "plain_again"), avg="g8", score=0, sheet=0))
+    assert again["loss_over_levels"] == plain["loss_over_levels"]
+    assert k1["loss_over_levels"] == plain["loss_over_levels"]
+    assert k1["averaged"]["g8"]["loss_over_levels"] == plain["averaged"]["g8"]["loss_over_levels"]
+    assert k1["as_source"]["equals_stored"] is True
+    assert k1["score"] is None and k1["averaged"]["g8"]["score"] is None
+    assert "class_read" in k1["averaged"]["tail100"]["score"]
+    s = {}
+    for name, kw in (("k3", dict(cuts="0.25,0.65")), ("k8", dict(cuts="0.064,0.145,0.262,0.411,0.588,0.764,0.908")),
+                     ("k3_fresh", dict(cuts="0.25,0.65", fresh=1))):
+        s[name] = stages.main(**dict(copy, out=str(root / name), **kw))
+        assert set(s[name]["averaged"]) == {"g8", "tail100"} and len(s[name]["by_stage"]) == 3, name
+        assert "score" in s[name]["score"] and "class_read" in s[name]["averaged"]["tail100"]["score"], name
+    assert len(s["k8"]["parts"]) == 8 and s["k8"]["soft"] == 0.016
+    assert all(p["start_step"] == src["parts"][0]["steps"] for p in s["k3"]["parts"])
+    assert all(p["start_step"] == 0 for p in s["k3_fresh"]["parts"])
+    time_split.main(**dict(small, variant="plain_d4", out=str(root / "d4"), avg="g8", score=0, sheet=0))
+    stem = dict(stem_from=str(root / "d4"), stem_model="model_avg_g8")
+    for name, kw in (("tails_k1", dict(cuts="")), ("tails_k3", dict(cuts="0.25,0.65"))):
+        r = stages.main(**dict(small, variant="tails", out=str(root / name), total=6000, score_last=0, **stem, **kw))
+        assert r["as_source"]["equals_stored"] is True and "score" in r["averaged"]["g8"]["score"], name
+        assert all(p["frozen_unchanged"] for p in r["parts"]), name
+    g = stages.main(**dict(small, variant="grow", out=str(root / "grow"), blocks=2, steps_each=2000, **stem))
+    assert [x["birth_gap"] for x in g["steps"]] == [0.0, 0.0] and all(x["earlier_unchanged"] for x in g["steps"])
+    assert g["steps"][0]["stream_seed"] != g["steps"][1]["stream_seed"] and "score" in g["score"]
+    assert stages.summarize(str(root)).count("| copies |") >= 4
+
+    croot = tmp_path / "content"
+    for v in ("plain", "blind"):
+        content.main(**dict(small, variant=v, out=str(croot / v), reader=1, avg="g8"))
+    mid = content.main(**dict(small, variant="class_to_mid", out=str(croot / "class_to_mid"), reader=1, avg="g8"))
+    assert mid["class_worth"]["by_stage"][2] == 0.0 and mid["class_worth"]["by_stage"][0] != 0.0
+    on_plain = dict(source=str(croot / "plain"), source_model="model_avg_g8")
+    on_blind = dict(source=str(croot / "blind"), source_model="model_avg_g8")
+    for v, base in (("experts_start", on_plain), ("rand_start", on_plain), ("shared_start", on_plain),
+                    ("blind_experts_all", on_blind), ("blind_rand_all", on_blind), ("blind_shared_all", on_blind)):
+        r = content.main(**dict(small, variant=v, out=str(croot / v), reader=1, avg="g8", score_last=0, **base))
+        assert r["as_source"]["equals_stored"] is True, v
+        assert r["exact"]["others_max_abs"] == 0.0, (v, r["exact"])
+        assert "class_read" in r["averaged"]["g8"]["score"], v
+
+    froot = tmp_path / "closed"
+    for v in ("class_heads", "class_stage_heads"):
+        r = closed_forms.main(**dict(small, variant=v, out=str(froot / v), batches=4, reader=1, **on_blind))
+        assert r["as_source"]["equals_stored"] is True and r["exact"]["others_max_abs"] == 0.0, (v, r["exact"])
+        assert r["solve"]["all"]["mse_after"] <= r["solve"]["all"]["mse_before"] + 1e-9, v
+        assert "class_read" in r["score"], v
+    hs = closed_forms.main(**dict(small, variant="head_solved", out=str(froot / "head_avg"), batches=4, **on_plain))
+    assert hs["as_source"]["equals_stored"] is True
+    assert hs["workspace"]["value"] == ":4096:8" and isinstance(hs["nondeterministic"], list)
+    assert not any("attention" in m.lower() for m in hs["nondeterministic"]), hs["nondeterministic"]
+    r = content.main(**dict(small, variant="plain", out=str(croot / "det_warn"), det="warn", score=0, sheet=0))
+    assert any("attention" in m.lower() for m in r["nondeterministic"]), r["nondeterministic"]

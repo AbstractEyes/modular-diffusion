@@ -32,7 +32,7 @@ from torch import Tensor
 from .build import content_hash, read_build
 from .compat import num
 from .linker import StaleUnit, link, stale_list
-from .model import Model
+from .model import Model, draw_symbols, symbol_gated
 from .windows import window_weight
 
 STAGED_FORMAT = "modular-diffusion/staged/1"
@@ -131,12 +131,13 @@ class Staged(nn.Module):
         return self.clusters[0].anchor_velocity(zt, t, cls_idx)
 
     def components(self, zt: Tensor, t: Tensor, cls_idx: Tensor, only: Optional[Iterable[str]] = None,
-                   scale: Optional[Dict[str, Tensor]] = None, skip: Iterable[str] = ()):
+                   scale: Optional[Dict[str, Tensor]] = None, skip: Iterable[str] = (),
+                   symbols: Optional[Tensor] = None):
         """-> (parts {label: field [B, C, H, W]}, None, None, None).
 
         The anchor once (when the clusters add it and it is not skipped), then every other label summed over the
         clusters with the stage weight, each cluster run on its rows only and scattered to the full batch (zeros on the
-        rows it did not run). only, scale and skip are passed to every cluster."""
+        rows it did not run). only, scale, skip and the rows' symbols are passed to every cluster."""
         skip = set(skip)
         out: Dict[str, Tensor] = {}
         if self.adds_anchor and self.anchor.name not in skip:
@@ -148,7 +149,8 @@ class Staged(nn.Module):
                 continue
             inner = skip | ({c.anchor.name} if self.adds_anchor else set())
             sc = None if scale is None else {k: v[idx] for k, v in scale.items()}
-            parts, _, _, _ = c.components(zt[idx], t[idx], cls_idx[idx], only=only, scale=sc, skip=inner)
+            kw = {} if symbols is None else {"symbols": symbols[idx]}
+            parts, _, _, _ = c.components(zt[idx], t[idx], cls_idx[idx], only=only, scale=sc, skip=inner, **kw)
             ws = w[s][idx].view(-1, 1, 1, 1)
             for label, v in parts.items():
                 if label not in out:
@@ -156,8 +158,8 @@ class Staged(nn.Module):
                 out[label] = out[label].index_add(0, idx, ws.to(v.dtype) * v)
         return out, None, None, None
 
-    def velocity(self, zt: Tensor, t: Tensor, cls_idx: Tensor) -> Tensor:
-        parts, _, _, _ = self.components(zt, t, cls_idx)
+    def velocity(self, zt: Tensor, t: Tensor, cls_idx: Tensor, symbols: Optional[Tensor] = None) -> Tensor:
+        parts, _, _, _ = self.components(zt, t, cls_idx, symbols=symbols)
         if not parts:
             return torch.zeros_like(zt)
         return torch.stack(list(parts.values())).sum(dim=0)
@@ -171,7 +173,8 @@ class Staged(nn.Module):
         members = self.members
         if self.training and mdrop > 0 and len(members):
             scale = {m.name: (torch.rand(b, generator=gen, device=z1.device) >= mdrop).to(z1.dtype) for m in members}
-        parts, _, _, _ = self.components(zt, t, cls_idx, scale=scale)
+        symbols = draw_symbols(cls_idx, gen) if symbol_gated(self) else None
+        parts, _, _, _ = self.components(zt, t, cls_idx, scale=scale, symbols=symbols)
         v = torch.stack(list(parts.values())).sum(dim=0) if parts else torch.zeros_like(z1)
         return ((v - target) ** 2).mean()
 

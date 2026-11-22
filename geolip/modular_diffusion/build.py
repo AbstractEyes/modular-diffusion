@@ -153,7 +153,8 @@ def parent_hash(parents: Mapping[str, str]) -> str:
 # ------------------------------------------------------------------ the unit card
 BIRTH_STATES = ("random", "zero_head", "identity", "closed_form")
 BIRTH_STATE_OF = {"Anchor": "closed_form", "Stem": "random", "StageBody": "random", "GrowthBlock": "identity",
-                  "Body": "random", "Head": "zero_head", "BandMember": "zero_head", "ContentExpert": "zero_head"}
+                  "Body": "random", "Head": "zero_head", "BandMember": "zero_head", "ContentExpert": "zero_head",
+                  "DepthBlock": "identity"}
 MARK_KEYS = ("born_gap", "frozen_unchanged", "off_window_max", "off_band_share", "loss_over_levels")
 
 

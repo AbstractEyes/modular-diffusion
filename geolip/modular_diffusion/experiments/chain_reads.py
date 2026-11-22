@@ -44,6 +44,7 @@ import torch
 from .. import __version__
 from ..beds import PicturesBed
 from ..config import in_notebook, parse
+from ..determinism import mode as det_mode
 from ..read import T_GRID, by_stage, read
 from ..sample import sample_sheet, share_counts, stage_grid, uniform_grid
 from ..score import SCORE_SEED, make_judge, picture_score, reference_stats
@@ -58,7 +59,7 @@ PLAN_NAMES = ("uniform",) + tuple(PLANS)
 
 DEFAULTS = dict(variant="", data="", out="", device="cuda", base="", donor="", stage=-1, soft=-1.0, plan="", n=0,
                 heldout=2048, score=1, judge="inception", score_n=10000, score_steps=50, score_seed=SCORE_SEED, ref="",
-                seed_label="", threads=4, mem_fraction=0.25, sheet=0)
+                seed_label="", threads=4, mem_fraction=0.25, sheet=0, det="")
 
 
 def levels_outside(stage: int) -> List[float]:
@@ -150,6 +151,11 @@ def main(argv=(), **overrides) -> dict:
     """Read one assembly; writes the outputs into ``out`` and returns the result."""
     a = parse(DEFAULTS, argv, **overrides)
     _check(a)
+    with det_mode(a["det"]) as det:
+        return _run(a, det)
+
+
+def _run(a: dict, det) -> dict:
     variant = a["variant"]
     torch.set_num_threads(int(a["threads"]))
     device = a["device"]
@@ -197,8 +203,10 @@ def main(argv=(), **overrides) -> dict:
             log(f"SCORE not computed: {e!r}")
     if int(a["sheet"]):
         sample_sheet(model, bed, os.path.join(out, "samples.png"), device, grid=grid)
-    result.update({"seconds": time.time() - t_job, "args": {k: a[k] for k in sorted(a)}, "torch": torch.__version__,
-                   "device": str(device), "version": __version__})
+    # det= is recorded only when given, so a read without it writes the result of earlier versions
+    result.update({"seconds": time.time() - t_job, "args": {k: a[k] for k in sorted(a) if not (k == "det" and not a[k])},
+                   "torch": torch.__version__, "device": str(device), "version": __version__})
+    det.record(result)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(result, fh, indent=1)
         fh.write("\n")

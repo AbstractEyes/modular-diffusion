@@ -7,6 +7,10 @@
     (at t = 0.45); with classes, the error without the caption, by class and by class group. The anchor alone reads
     the held-out class; a per-class anchor is also read without it (``linear_physics_without_caption``).
 
+A model with symbol-gated units (``units.BandMember``) reads every held-out row with one fixed symbol (``read_symbols``,
+drawn from its own generator, so no other number of the read moves); the columns read without the class are read
+without a symbol too.
+
 Arithmetic (part of the result's definition): chunks of 256 items, each chunk weighted by its size over the level count,
 float64 band powers, and the means over levels taken with numpy over ten floats.
 """
@@ -23,6 +27,7 @@ from .units import NULL_CLASS
 T_GRID = (0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95)
 READ_BANDS = ("fine <4", "mid 4-8", "coarse 8+")
 READ_SEED = 123456789
+SYMBOL_SEED = 192837465              # the read's fixed symbols (models with symbol-gated units only)
 CHUNK = 256
 LEVEL_ITEMS = 1024
 NON_MEMBER_PARTS = ("anchor", "body", "stage_body")
@@ -49,6 +54,13 @@ def attention_read(member, h, ctx, e, grid):
             "in_3x3_block": float((att * (dist <= 1)).sum(-1).mean())}
 
 
+def read_symbols(model, n: int, device):
+    """The read's fixed symbols of the held-out rows (``model.fixed_symbols`` seeded SYMBOL_SEED), or None for a model
+    without symbol-gated units (nothing is drawn then)."""
+    from .model import fixed_symbols, symbol_gated
+    return fixed_symbols(n, SYMBOL_SEED, device) if symbol_gated(model) else None
+
+
 @torch.no_grad()
 def read(model, bed, heldout: int, device) -> dict:
     model.eval()
@@ -57,6 +69,11 @@ def read(model, bed, heldout: int, device) -> dict:
     gen = torch.Generator(device=device).manual_seed(READ_SEED)
     z0 = torch.randn(z1.shape, generator=gen, device=device)
     t_u = torch.rand(n_held, generator=gen, device=device)
+    sym = read_symbols(model, n_held, device)
+
+    def kw(sl):                                      # the rows' symbols, only for a model with symbol-gated units
+        return {} if sym is None else {"symbols": sym[sl]}
+
     masks, _ = band_masks(model.grid, 3)
     masks = [m.to(device) for m in masks]
     chunk = CHUNK
@@ -68,7 +85,7 @@ def read(model, bed, heldout: int, device) -> dict:
     for i in range(0, n_held, chunk):
         sl = slice(i, i + chunk)
         tt = t_u[sl].view(-1, 1, 1, 1)
-        v = model.velocity((1 - tt) * z0[sl] + tt * z1[sl], t_u[sl], cls[sl])
+        v = model.velocity((1 - tt) * z0[sl] + tt * z1[sl], t_u[sl], cls[sl], **kw(sl))
         per.append(((v - (z1[sl] - z0[sl])) ** 2).mean(dim=(1, 2, 3)).double())
     per = torch.cat(per)
     out["heldout_loss"] = float(per.mean())
@@ -91,7 +108,7 @@ def read(model, bed, heldout: int, device) -> dict:
             tt = torch.full((b,), t, device=device)
             zt = (1 - t) * z0[sl] + t * z1[sl]
             target = z1[sl] - z0[sl]
-            parts, h, ctx, e = model.components(zt, tt, cls[sl])
+            parts, h, ctx, e = model.components(zt, tt, cls[sl], **kw(sl))
             full = torch.stack(list(parts.values())).sum(dim=0) if parts else torch.zeros_like(zt)
             w = b / n_lv
 
@@ -110,13 +127,17 @@ def read(model, bed, heldout: int, device) -> dict:
                 add("off:" + k, band_power(model, full - v - target))
                 add("out:" + k, band_power(model, v))
             if stage_names:                                    # the stage units: read by skipping them
-                parts2, _, _, _ = model.components(zt, tt, cls[sl], skip=stage_names)
+                parts2, _, _, _ = model.components(zt, tt, cls[sl], skip=stage_names, **kw(sl))
                 full2 = torch.stack(list(parts2.values())).sum(dim=0) if parts2 else torch.zeros_like(zt)
                 add("off:stage_body", band_power(model, full2 - target))
                 add("out:stage_body", band_power(model, full - full2))
             if i == 0 and abs(t - 0.45) < 1e-9 and h is not None:       # a staged model returns no trunk state
                 for m in model.members:
-                    if bool((m.gate(tt, cls[sl]) > 0).any()):
+                    if len(m.blocks) == 0:                     # a part with no block attends nowhere
+                        continue
+                    g =(m.gate(tt, cls[sl], kw(sl).get("symbols")) if getattr(m, "symbol_gate", False)
+                         else m.gate(tt, cls[sl]))
+                    if bool((g > 0).any()):
                         att[m.name] = attention_read(m, h, ctx, e, model.grid)
             if bed.n_classes:
                 animals = (cls[sl] >= 2) & (cls[sl] <= 7)

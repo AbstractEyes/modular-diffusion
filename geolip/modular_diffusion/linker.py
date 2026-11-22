@@ -44,10 +44,11 @@ from .build import (BIRTH_STATE_OF, BUILD_FILE, CARD_SUFFIX, MARK_KEYS, WEIGHTS_
 from .model import Model
 from .units import born, make
 
-TRUNK = ("Stem", "StageBody", "GrowthBlock", "Body")
-STAGE = ("StageBody", "GrowthBlock", "Body")
+TRUNK = ("Stem", "StageBody", "GrowthBlock", "Body", "DepthBlock")
+STAGE = ("StageBody", "GrowthBlock", "Body", "DepthBlock")       # trunk units after the stem: each other's parents
 OUTPUT_UNITS = ("Head", "BandMember", "ContentExpert")
-_POS = {"Anchor": 0, "Stem": 1, "StageBody": 2, "GrowthBlock": 2, "Body": 2, "Head": 3, "BandMember": 3, "ContentExpert": 3}
+_POS = {"Anchor": 0, "Stem": 1, "StageBody": 2, "GrowthBlock": 2, "Body": 2, "DepthBlock": 2, "Head": 3, "BandMember": 3,
+        "ContentExpert": 3}
 
 
 class StaleUnit(Exception):
@@ -76,6 +77,8 @@ def _band_overlap(a: UnitEntry, b: UnitEntry) -> bool:
 
 
 def _class_overlap(a: UnitEntry, b: UnitEntry) -> bool:
+    if a.spec.get("gate", "class") != b.spec.get("gate", "class"):
+        return True                                       # a symbol and a class gate can be on for the same row
     x, y = a.address.get("classes"), b.address.get("classes")
     return x is None or y is None or bool(set(int(c) for c in x) & set(int(c) for c in y))
 
@@ -245,8 +248,11 @@ def _velocity(model, probe) -> Tensor:
     """The velocity on the probe with the parts added one at a time, in the model's own order. A part that is exactly
     zero then changes no digit on any device; a stacked sum may pair the other parts differently when one more part is
     present, which moves the last digit on some devices although the added part is silent."""
+    from .model import symbol_gated
     with torch.no_grad():
-        parts, _, _, _ = model.components(*probe)
+        # a model with symbol-gated units reads the probe's classes as the rows' symbols too, so those units are on
+        kw = {"symbols": probe[2]} if symbol_gated(model) else {}
+        parts, _, _, _ = model.components(*probe, **kw)
         v = torch.zeros_like(probe[0])
         for p in parts.values():
             v = v + p

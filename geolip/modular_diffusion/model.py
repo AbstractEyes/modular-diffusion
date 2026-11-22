@@ -1,7 +1,7 @@
 """The model assembled from a build.
 
     h      = stem(tokens of z_t [+ the anchor's tokens], t, class), then the whole-range body (if any), then the stage
-             units of its window of t
+             units of its window of t, then the depth blocks (if any) one after another
     v_hat  = anchor(z_t, t [, class]) + head(h) + sum_m gate_m(t, class) x keep_band(m)[ member_m(h, t, class) ]
 
 A per-class anchor (spec "symbols") reads the row's class; the stem's anchor input is that answer. A stem with a class
@@ -28,10 +28,31 @@ from torch import Tensor
 
 from .build import Build
 from .spectral import band_masks, keep_band, patchify, unpatchify
-from .units import (Anchor, BandMember, Body, GrowthBlock, Head, StageBody, Stem, Unit, UNIT_TYPES, born, make)
+from .units import (Anchor, BandMember, Body, DepthBlock, GrowthBlock, Head, StageBody, Stem, Unit, UNIT_TYPES, born,
+                    make)
 from .windows import window_weight
 
 NULL_CLASS = 10
+SYMBOLS = 10                         # symbols are drawn uniformly from 0 .. SYMBOLS - 1; NULL_CLASS is "no symbol"
+
+
+def symbol_gated(model) -> bool:
+    """Whether a model (or a staged model) holds a symbol-gated unit (see ``units.BandMember``)."""
+    return any(getattr(m, "symbol_gate", False) for m in getattr(model, "members", []))
+
+
+def draw_symbols(cls_idx: Tensor, gen: torch.Generator) -> Tensor:
+    """One symbol per row, uniform over 0 .. SYMBOLS - 1, from ``gen``; a row whose class is the null class (its class
+    was dropped) gets the null index."""
+    s = torch.randint(0, SYMBOLS, (cls_idx.shape[0],), generator=gen, device=cls_idx.device)
+    return torch.where(cls_idx == NULL_CLASS, torch.full_like(s, NULL_CLASS), s)
+
+
+def fixed_symbols(n: int, seed: int, device="cpu") -> Tensor:
+    """n symbols drawn on the CPU from a generator seeded ``seed`` (so they do not depend on the device), moved to the
+    device: the fixed symbols of the read and of the sampled pictures."""
+    gen = torch.Generator().manual_seed(int(seed))
+    return torch.randint(0, SYMBOLS, (int(n),), generator=gen).to(device)
 
 
 class Model(nn.Module):
@@ -63,6 +84,7 @@ class Model(nn.Module):
         whole = [u for u in bodies if u.whole_range]
         windowed = [u for u in bodies if not u.whole_range]
         others = [u for u in by_type(StageBody) if not isinstance(u, Body)]
+        self.depth_blocks: List[DepthBlock] = by_type(DepthBlock)
         if len(whole) > 1:
             raise ValueError("a build holds at most one whole-range Body")
         if whole and (windowed or others):
@@ -184,11 +206,13 @@ class Model(nn.Module):
         return h_new
 
     def components(self, zt: Tensor, t: Tensor, cls_idx: Tensor, only: Optional[Iterable[str]] = None,
-                   scale: Optional[Dict[str, Tensor]] = None, skip: Iterable[str] = ()):
+                   scale: Optional[Dict[str, Tensor]] = None, skip: Iterable[str] = (),
+                   symbols: Optional[Tensor] = None):
         """-> (parts {label: field [B, C, H, W]}, h, ctx, e).
 
         only: member names to run (the others are left out); scale: {member name: [B] weights} (member dropout);
-        skip: unit names to leave out (stage units or members)."""
+        skip: unit names to leave out (stage units, depth blocks or members); symbols: [B] the rows' symbols for the
+        symbol-gated members (None: every symbol-gated member is off)."""
         skip = set(skip)
         out = {}
         anc = self.anchor
@@ -205,13 +229,17 @@ class Model(nn.Module):
         if self.body is not None and self.body.name not in skip:
             h = self.body(h, ctx, e, rot)
         h = self._stages(h, t, ctx, e, rot, skip)
+        for u in self.depth_blocks:
+            if u.name not in skip:
+                h = u(h, ctx, e, rot)
         if self.head is not None and self.head.name not in skip:
             out[self.head.part] = self.head_part(h)
         only = None if only is None else set(only)
         for m in self.members:
             if (only is not None and m.name not in only) or m.name in skip:
                 continue
-            y = self.member_part(m, h, ctx, e, t, cls_idx, None if scale is None else scale.get(m.name))
+            y = self.member_part(m, h, ctx, e, t, cls_idx, None if scale is None else scale.get(m.name),
+                                 symbols=symbols)
             if y is not None:
                 out[m.part] = y
         return out, h, ctx, e
@@ -221,10 +249,10 @@ class Model(nn.Module):
         return self.unpatchify(self.head(h).float())
 
     def member_part(self, m: BandMember, h: Tensor, ctx: Tensor, e: Tensor, t: Tensor, cls_idx: Tensor,
-                    scale: Optional[Tensor] = None) -> Optional[Tensor]:
+                    scale: Optional[Tensor] = None, symbols: Optional[Tensor] = None) -> Optional[Tensor]:
         """One member's field [B, C, H, W] from the trunk state (None when its gate is zero for every sample): the
         member runs on the gated rows only, its output is weighted by the gate, kept to its band, and zero elsewhere."""
-        g = m.gate(t, cls_idx)
+        g = m.gate(t, cls_idx, symbols) if m.symbol_gate else m.gate(t, cls_idx)
         if scale is not None:
             g = g * scale
         idx = torch.nonzero(g > 0, as_tuple=False).squeeze(1)
@@ -238,8 +266,8 @@ class Model(nn.Module):
         full[idx] = y
         return self.unpatchify(full)
 
-    def velocity(self, zt: Tensor, t: Tensor, cls_idx: Tensor) -> Tensor:
-        parts, _, _, _ = self.components(zt, t, cls_idx)
+    def velocity(self, zt: Tensor, t: Tensor, cls_idx: Tensor, symbols: Optional[Tensor] = None) -> Tensor:
+        parts, _, _, _ = self.components(zt, t, cls_idx, symbols=symbols)
         if not parts:
             return torch.zeros_like(zt)
         return torch.stack(list(parts.values())).sum(dim=0)
@@ -247,14 +275,15 @@ class Model(nn.Module):
     def loss(self, z1: Tensor, cls_idx: Tensor, gen: torch.Generator, cond_drop: float, mdrop: float = 0.0,
              t_sampling: str = "uniform", t_range: Sequence[float] = (0.0, 1.0), t_mix: float = 0.0) -> Tensor:
         """The flow-matching loss of one batch. Random draws from ``gen`` in this order: noise, t, the class drop (only
-        when cond_drop > 0), then one draw per member (only for member dropout in training). t_range, t_mix: see
-        ``draw``."""
+        when cond_drop > 0), then one draw per member (only for member dropout in training), then, only when the model
+        holds a symbol-gated member, one symbol per row (``draw_symbols``). t_range, t_mix: see ``draw``."""
         b = z1.shape[0]
         zt, t, cls_idx, target = self.draw(z1, cls_idx, gen, cond_drop, t_sampling, t_range, t_mix)
         scale = None
         if self.training and mdrop > 0 and len(self.members):
             scale = {m.name: (torch.rand(b, generator=gen, device=z1.device) >= mdrop).to(z1.dtype) for m in self.members}
-        parts, _, _, _ = self.components(zt, t, cls_idx, scale=scale)
+        symbols = draw_symbols(cls_idx, gen) if symbol_gated(self) else None
+        parts, _, _, _ = self.components(zt, t, cls_idx, scale=scale, symbols=symbols)
         v = torch.stack(list(parts.values())).sum(dim=0) if parts else torch.zeros_like(z1)
         return ((v - target) ** 2).mean()
 

@@ -20,9 +20,20 @@ added and read by the stem, Adam 1e-3, 100 warm-up steps, batch 128, class drop 
 | blind_experts_all   | a finished blind job + ten class experts on at every noise level        | the experts | 6,000 | [0, 1)    |
 | snap9               | a finished blind9 job + one expert for class 9, trained on class 9 only | the expert  | 1,500 | [0, 1)    |
 | anchors             | no training: a newborn blind_canchor model; the anchor is read          | -           | 0     | -         |
+| class_to_mid        | the stem reads the class only where t < 0.65                            | all         | 6,000 | [0, 1)    |
+| rand_start          | a finished plain job + ten parts gated by a random symbol (not the class), t < 0.25, soft 0.06 | the parts | 6,000 | [0, 0.31) |
+| shared_start        | a finished plain job + ONE part on for all ten classes, t < 0.25, soft 0.06 | the part | 6,000 | [0, 0.31) |
+| blind_rand_all      | a finished blind job + ten symbol-gated parts at every noise level      | the parts   | 6,000 | [0, 1)    |
+| blind_shared_all    | a finished blind job + one part over all ten classes at every level     | the part    | 6,000 | [0, 1)    |
+
+A symbol is a label drawn per row uniformly from 0 .. 9, independently of the class (``model.draw_symbols``; a row whose
+class was dropped has none): a symbol-gated part sees as many rows as a class expert and no class information, the
+control of the class experts.
 
 Arguments (key=value): those of the time split, plus source (a finished job folder of the same seed, for the expert
-variants and snap9) and reader (0 / 1: the class read on the scored samples; needs score=1 and ref=). ``scale``
+variants and snap9), source_model (the folder of the source job that is the frozen base, default model; for example
+model_avg_g8; when given, the source folder is read again first and recorded under "as_source") and reader (0 / 1: the
+class read on the scored samples; needs score=1 and ref=). ``scale``
 multiplies the step counts as in the time split. avg (a comma list of decays; every training variant, ignored by
 anchors): each average of the trained parameters (the experts' for the expert variants) is exported as
 model_avg<digits after the point>/, read and scored like the last weights, and reported under "averaged".
@@ -49,15 +60,17 @@ from .. import __version__
 from ..beds import PicturesBed
 from ..config import in_notebook, parse
 from ..data import npz_content_hash
+from ..determinism import mode as det_mode
 from ..forms import cluster_build, with_class_experts
 from ..linker import export_build, link
 from ..model import Model
-from ..read import CHUNK, LEVEL_ITEMS, READ_SEED, T_GRID, by_stage, read
+from ..read import CHUNK, LEVEL_ITEMS, READ_SEED, T_GRID, by_stage, read, read_symbols
 from ..sample import sample_sheet
 from ..score import (class_reader, make_judge, picture_score, reader_check, reference_classes, reference_stats)
 from ..train import fit_units
 from .time_split import (CUTS, JUDGES, SOFT, TRAIN_RANGES, _levels, _marks, _non_anchor, _part_row, _unique_numbers,
-                         export_averages, load_job, parse_averages, steps_of)
+                         averages_cell, export_averages, load_job, parse_averages, recorded_args, scored_keys,
+                         source_read, steps_of)
 
 EXPERIMENT = "content"
 TEN = tuple((c,) for c in range(10))
@@ -78,13 +91,25 @@ SPECS: Dict[str, Dict[str, Any]] = {
     "snap9": dict(steps=1500, source="blind9", experts=((9,),), window=(0.0, 1.0), soft=0.0, t_range=(0.0, 1.0),
                   only_classes=(9,)),
     "anchors": dict(steps=0, class_window=("0", "0"), anchor_symbols=10),
+    # the sixth pass: the class read to the middle; parts gated by a label that is not the class, and one shared part
+    "class_to_mid": dict(steps=6000, class_window=("0", "0.65")),
+    "rand_start": dict(steps=6000, source="plain", experts=TEN, gate="symbol", window=START, soft=START_SOFT,
+                       t_range=TRAIN_RANGES[0]),
+    "shared_start": dict(steps=6000, source="plain", experts=(tuple(range(10)),), window=START, soft=START_SOFT,
+                         t_range=TRAIN_RANGES[0]),
+    "blind_rand_all": dict(steps=6000, source="blind", experts=TEN, gate="symbol", window=(0.0, 1.0), soft=0.0,
+                           t_range=(0.0, 1.0)),
+    "blind_shared_all": dict(steps=6000, source="blind", experts=(tuple(range(10)),), window=(0.0, 1.0), soft=0.0,
+                             t_range=(0.0, 1.0)),
 }
 VARIANTS = tuple(SPECS)
 EXPERT_VARIANTS = tuple(v for v, s in SPECS.items() if "experts" in s)
+NEW_VARIANTS = ("class_to_mid", "rand_start", "shared_start", "blind_rand_all", "blind_shared_all")
 
 DEFAULTS = dict(variant="", seed=0, data="", out="", device="cuda", heldout=2048, batch=128, lr=1e-3, warmup=100,
                 log_every=500, threads=4, mem_fraction=0.25, scale=1.0, dim=128, score=0, judge="inception",
-                score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", reader=0, avg="")
+                score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", reader=0, avg="", score_last=1,
+                score_avg="", det="", source_model="")
 
 
 def _stage_means(by_level: Dict[str, float]) -> List[Optional[float]]:
@@ -120,13 +145,17 @@ def _sequential_sum(parts: dict, like: torch.Tensor) -> torch.Tensor:
 def exactness(model, bed, heldout: int, device, expert: str) -> Dict[str, Any]:
     """One expert left out against in, on the read's fixed noise (the first LEVEL_ITEMS held-out items at the ten
     levels): the largest absolute change of a row's error over the rows of the other classes (0.0 when the expert is
-    exactly silent there) and the mean change (out minus in) over its own class's rows."""
+    exactly silent there) and the mean change (out minus in) over its own class's rows. For a symbol-gated part the
+    rows are read with the read's fixed symbols and its own rows are those of its symbols."""
     model.eval()
     z1, cls = bed.heldout(heldout)
     gen = torch.Generator(device=device).manual_seed(READ_SEED)
     z0 = torch.randn(z1.shape, generator=gen, device=device)
     n_lv = min(z1.shape[0], LEVEL_ITEMS)
-    own_classes = torch.tensor(list(model.unit(expert).classes), device=cls.device, dtype=cls.dtype)
+    unit = model.unit(expert)
+    sym = read_symbols(model, z1.shape[0], device)
+    label = sym if getattr(unit, "symbol_gate", False) else cls
+    own_classes = torch.tensor(list(unit.classes), device=label.device, dtype=label.dtype)
     others_max, own_sum, own_n = 0.0, 0.0, 0
     for t in T_GRID:
         for i in range(0, n_lv, CHUNK):
@@ -135,12 +164,13 @@ def exactness(model, bed, heldout: int, device, expert: str) -> Dict[str, Any]:
             tt = torch.full((b,), t, device=z1.device)
             zt = (1 - t) * z0[sl] + t * z1[sl]
             target = z1[sl] - z0[sl]
-            p_in, _, _, _ = model.components(zt, tt, cls[sl])
-            p_out, _, _, _ = model.components(zt, tt, cls[sl], skip=[expert])
+            kw = {} if sym is None else {"symbols": sym[sl]}
+            p_in, _, _, _ = model.components(zt, tt, cls[sl], **kw)
+            p_out, _, _, _ = model.components(zt, tt, cls[sl], skip=[expert], **kw)
             e_in = ((_sequential_sum(p_in, zt) - target) ** 2).mean(dim=(1, 2, 3)).double()
             e_out = ((_sequential_sum(p_out, zt) - target) ** 2).mean(dim=(1, 2, 3)).double()
             diff = e_out - e_in
-            own = torch.isin(cls[sl], own_classes)
+            own = torch.isin(label[sl], own_classes)
             if bool((~own).any()):
                 others_max = max(others_max, float(diff[~own].abs().max()))
             own_sum += float(diff[own].sum())
@@ -148,10 +178,10 @@ def exactness(model, bed, heldout: int, device, expert: str) -> Dict[str, Any]:
     return {"expert": expert, "others_max_abs": others_max, "own_mean_change": own_sum / own_n if own_n else None}
 
 
-def _check_source(folder: str, need: str, seed: int) -> None:
+def _check_source(folder: str, need: str, seed: int, model_folder: str = "model") -> None:
     path = os.path.join(folder, "result.json")
-    if not os.path.isdir(os.path.join(folder, "model")):
-        raise ValueError(f"{folder} holds no model folder (a finished {need} job is needed)")
+    if not os.path.isdir(os.path.join(folder, model_folder)):
+        raise ValueError(f"{folder} holds no {model_folder} folder (a finished {need} job is needed)")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as fh:
             r = json.load(fh)
@@ -162,6 +192,11 @@ def _check_source(folder: str, need: str, seed: int) -> None:
 def main(argv=(), **overrides) -> dict:
     """Run one variant of one seed; writes the outputs into ``out`` and returns the result."""
     a = parse(DEFAULTS, argv, **overrides)
+    with det_mode(a["det"]) as det:
+        return _run(a, det)
+
+
+def _run(a: dict, det) -> dict:
     variant = a["variant"]
     if variant not in SPECS:
         raise ValueError(f"unknown variant {variant!r}; known: {list(VARIANTS)}")
@@ -170,15 +205,19 @@ def main(argv=(), **overrides) -> dict:
             raise ValueError(f"{k}= is required")
     spec = SPECS[variant]
     seed, dim, scale = int(a["seed"]), int(a["dim"]), float(a["scale"])
+    source_model = a["source_model"] or "model"
     if "source" in spec:
         if not a["source"]:
             raise ValueError(f"{variant} needs source=<the folder of a finished {spec['source']} job of the same seed>")
-        _check_source(a["source"], spec["source"], seed)
+        _check_source(a["source"], spec["source"], seed, source_model)
+    elif a["source_model"]:
+        raise ValueError(f"{variant} reads no source; source_model= applies to the variants with a source")
     if int(a["score"]) and a["judge"] not in JUDGES:
         raise ValueError(f"unknown judge {a['judge']!r}; known: {list(JUDGES)}")
     if int(a["reader"]) and not (int(a["score"]) and a["ref"]):
         raise ValueError("reader=1 needs score=1 and ref=<the reference file>")
     averages = [] if variant == "anchors" else parse_averages(a["avg"])        # anchors trains nothing to average
+    to_score = scored_keys(a, averages)
     torch.set_num_threads(int(a["threads"]))
     device = a["device"]
     if str(device).startswith("cuda"):
@@ -220,10 +259,13 @@ def main(argv=(), **overrides) -> dict:
     exact = None
     decays = tuple(d for _, _, d in averages)
     torch.manual_seed(seed)
+    as_source = None
     if "experts" in spec:
-        base = os.path.join(a["source"], "model")
+        base = os.path.join(a["source"], source_model)
+        if a["source_model"]:                      # recorded only when asked for, so earlier jobs write their result
+            as_source = source_read(a["source"], source_model, bed, int(a["heldout"]), device, log)
         model, names = with_class_experts(base, seed, [list(c) for c in spec["experts"]], spec["window"], spec["soft"],
-                                          depth=1, device=device)
+                                          depth=1, device=device, gate=spec.get("gate", "class"))
         log(f"PART model: {len(names)} expert(s) on {a['source']}; t in [{spec['t_range'][0]:g}, {spec['t_range'][1]:g}), "
             f"{n} steps")
         res = fit_units(model, train_bed, seed, steps=n, trainable=names, t_range=spec["t_range"], mdrop=0.0,
@@ -309,7 +351,7 @@ def main(argv=(), **overrides) -> dict:
             log(f"SCORE{tag} not computed: {e!r}")
             return {"error": repr(e)}
 
-    if int(a["score"]):
+    if int(a["score"]) and int(a["score_last"]):
         result["score"] = score_of(final)
     if averages:
         result["averaged"] = {}
@@ -318,16 +360,20 @@ def main(argv=(), **overrides) -> dict:
             log(f"READ the average {key} ({folder})")
             r = read(avg_model, bed, int(a["heldout"]), device)
             c = class_numbers(r)
+            scored = int(a["score"]) and key in to_score
             result["averaged"][key] = {"loss_over_levels": r["loss_over_levels"], "by_level": _levels(r),
                                        "by_stage": by_stage(r, CUTS), "by_class": c["by_class"],
                                        "class_worth": c["class_worth"],
-                                       "score": score_of(avg_model, f" (average {key})") if int(a["score"]) else None}
+                                       "score": score_of(avg_model, f" (average {key})") if scored else None}
             log(f"AVERAGE {key}: over ten levels {r['loss_over_levels']:.4f}")
+    if as_source is not None:
+        result["as_source"] = as_source
     if int(a["sheet"]):
         sample_sheet(final, bed, os.path.join(out, "samples.png"), device)
-    # avg= is recorded only when given
-    result.update({"args": {k: a[k] for k in sorted(a) if not (k == "avg" and not a[k])}, "torch": torch.__version__,
-                   "device": str(device), "version": __version__})
+    # avg= and the newer options are recorded only when given
+    result.update({"args": recorded_args(a), "torch": torch.__version__, "device": str(device),
+                   "version": __version__})
+    det.record(result)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(result, fh, indent=1)
         fh.write("\n")
@@ -355,8 +401,8 @@ def summarize(root: str) -> str:
     rows.sort(key=lambda r: (r["variant"], r["seed"]))
     with_avg = any(r.get("averaged") for r in rows)
     lines = ["| variant | seed | total | by stage | class's worth (start) | score | class read |"
-             + (" average (first decay) | average total | average score |" if with_avg else ""),
-             "|---|---|---|---|---|---|---|" + ("---|---|---|" if with_avg else "")]
+             + (" average (first decay) | average total | average score | averages (total / score) |" if with_avg else ""),
+             "|---|---|---|---|---|---|---|" + ("---|---|---|---|" if with_avg else "")]
     for r in rows:
         stages = " / ".join(_fmt(x) for x in r["by_stage"])
         worth = _fmt(((r.get("class_worth") or {}).get("by_stage") or [None])[0])
@@ -371,9 +417,9 @@ def summarize(root: str) -> str:
                 key = next(iter(av))
                 asc = av[key].get("score") or {}
                 line += (f" {key} | {_fmt(av[key]['loss_over_levels'])} | "
-                         f"{_fmt(asc['score'], 2) if asc.get('score') is not None else '-'} |")
+                         f"{_fmt(asc['score'], 2) if asc.get('score') is not None else '-'} | {averages_cell(av)} |")
             else:
-                line += " - | - | - |"
+                line += " - | - | - | - |"
         lines.append(line)
     return "\n".join(lines) + "\n"
 
