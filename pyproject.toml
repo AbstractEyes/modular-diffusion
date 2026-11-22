@@ -21,6 +21,8 @@ dependencies = [
 
 [project.optional-dependencies]
 hub = ["huggingface_hub>=0.30"]
+data = ["pyarrow>=15"]
+guard = ["psutil>=5.9"]
 judge = ["torchmetrics>=1.6", "torch-fidelity>=0.3", "torchvision>=0.19", "scipy>=1.11"]
 test = ["pytest>=8.0"]
 

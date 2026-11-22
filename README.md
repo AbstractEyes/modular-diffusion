@@ -38,6 +38,34 @@ target = image - noise                      the velocity the model predicts
 anchor gain at a frequency of image power S:   g = (t S - (1 - t)) / (t^2 S + (1 - t)^2)
 ```
 
+## The modules
+
+| module | what it holds |
+|---|---|
+| `config` | key=value arguments, read the same way from a command line and from Python keywords |
+| `blocks`, `rotary` | the transformer block, zero-born layers, the time embedding; axial rotary codes for one band of wavelengths |
+| `spectral` | token layout, band masks and the band filter, power spectra, the closed-form anchor |
+| `windows` | windows of the noise level, hard and crossfaded |
+| `units` | the unit types (anchor, stem, stage body, growth block, head, band member, content expert) and per-name birth |
+| `model` | the model assembled from a build: its parts, the velocity, the training loss |
+| `build` | the build file, the unit card, content hashes, unit files (safetensors + card JSON) |
+| `linker` | link a build folder (every file checked against its hash), snap units in and out, the stale list; convert a model or a flat weight file into a build folder |
+| `cache` | the feature cache: a frozen model's states over a training stream, so heads and members train without the stem |
+| `beds`, `data` | Gaussian fields and CIFAR-style pictures; CIFAR-10 from parquet to npz |
+| `train` | the recipe, the loop and the entry point (`python -m geolip.modular_diffusion.train key=value ...`) |
+| `read`, `sample` | the read at fixed noise levels (by band, by part, by class); Euler sampling and a sample sheet |
+| `report` | markdown tables from result files |
+| `jobs` | a roster runner: one job at a time, a stop file, DONE / FAILED markers, a start guard, a wall cap |
+| `hub` | upload a folder to the Hugging Face Hub with retries (token from `HF_TOKEN` only) |
+| `environment` | the installed versions against `requirements.txt` |
+| `compat` | the flat argument set and the single-file weight layout of the original research script |
+
+## Notebook
+
+| notebook | what it does | open |
+|---|---|---|
+| `colab/base.ipynb` | install at a tag, a 50-step smoke run, one 6,000-step base run on CIFAR-10 | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.1.0/colab/base.ipynb) |
+
 ## Install
 
 In a hosted notebook (keeps the notebook's own torch):

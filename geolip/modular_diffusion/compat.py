@@ -14,6 +14,7 @@ A flat weight file holds parameters only: the anchor's spectrum is not in it (it
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
@@ -206,3 +207,54 @@ def describe(a: Dict[str, Any]) -> str:
     s += f"_ssoft{a['stage_soft']:g}" if a["stage_soft"] > 0 else ""
     s += "_tln" if a["t_sampling"] == "logit_normal" else ""
     return s
+
+
+# ------------------------------------------------------------------ flat files to units
+def full_args(args: Dict[str, Any]) -> Dict[str, Any]:
+    """A stored argument set completed with the current defaults (older files lack the later keys)."""
+    from .train import DEFAULTS
+    return dict(DEFAULTS, **{k: v for k, v in args.items() if k in DEFAULTS})
+
+
+def units_from_legacy(pt_path: str, json_path: str = None, spectrum: Tensor = None):
+    """-> (model, result): the model a flat weight file describes, its units loaded and marked trainable as in that run
+    (its ``train`` argument; the members its ``init`` files did not hold are the new ones). ``json_path`` defaults to
+    ``<file>.json``; ``spectrum`` [C, H, W] fills the anchor (a flat file does not hold it)."""
+    from .model import Model
+    from .train import set_trainable
+    json_path = json_path or pt_path[:-3] + ".json"
+    with open(json_path, encoding="utf-8") as fh:
+        res = json.load(fh)
+    a = full_args(res["args"])
+    if spectrum is None:
+        raise ValueError("a flat weight file holds no spectrum: pass the data's spectrum")
+    build = build_from_args(a, tuple(spectrum.shape))
+    model = Model.born(build, int(res["seed"]), spectrum)
+    state = torch.load(pt_path, map_location="cpu")
+    info = load_legacy_state(model, state, res["members"])
+    if info["members_unused"] or len(info["members_loaded"]) != len(model.members):
+        raise ValueError(f"the flat file does not match its result's members: {info}")
+    loaded = res.get("loaded")
+    set_trainable(model, a["train"], loaded)
+    return model, res
+
+
+def recipe_from_result(res: Dict[str, Any]) -> Dict[str, Any]:
+    """The card recipe of a run from its result JSON."""
+    a = full_args(res["args"])
+    pictures = a["bed"] == "pictures"
+    return {"optimizer": "Adam", "betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0, "lr": a["lr"],
+            "warmup": a["warmup"], "batch": a["batch"], "steps": a["steps"], "t_sampling": a["t_sampling"],
+            "cond_drop": a["cond_drop"] if pictures else 0.0, "flip": pictures, "equalize": bool(a["equalize"]),
+            "mdrop": a["mdrop"], "step_seed": "1000003 * (seed + 1) + step", "torch": res.get("torch"),
+            "device": res.get("device")}
+
+
+def data_from_result(res: Dict[str, Any]) -> Dict[str, Any]:
+    """The card data block of a run from its result JSON (the file's SHA-256 is left to the caller)."""
+    a = full_args(res["args"])
+    src = a["data"] if a["bed"] == "pictures" else None
+    return {"bed": a["bed"] + ("tilt" if a["tilt"] else ""), "source": os.path.basename(src) if src else None,
+            "sha256": None, "mean": None, "std": None,
+            "heldout": (f"the first {a['heldout']} test pictures" if a["bed"] == "pictures"
+                        else f"{a['heldout']} fields of a fixed seed")}

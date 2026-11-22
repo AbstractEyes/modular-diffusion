@@ -177,25 +177,37 @@ class Model(nn.Module):
         h, ctx, e, rot = self.stem(x, t, cls_idx)
         h = self._stages(h, t, ctx, e, rot, skip)
         if self.head is not None and self.head.name not in skip:
-            out[self.head.part] = self.unpatchify(self.head(h).float())
+            out[self.head.part] = self.head_part(h)
         only = None if only is None else set(only)
         for m in self.members:
             if (only is not None and m.name not in only) or m.name in skip:
                 continue
-            g = m.gate(t, cls_idx)
-            if scale is not None and m.name in scale:
-                g = g * scale[m.name]
-            idx = torch.nonzero(g > 0, as_tuple=False).squeeze(1)
-            if idx.numel() == 0:
-                continue
-            y, _ = m(h[idx], ctx[idx], e[idx])
-            y = y.float() * g[idx].view(-1, 1, 1)
-            if m.keep:
-                y = self.keep_band(y, self.band_index(m))
-            full = y.new_zeros(zt.shape[0], y.shape[1], y.shape[2])
-            full[idx] = y
-            out[m.part] = self.unpatchify(full)
+            y = self.member_part(m, h, ctx, e, t, cls_idx, None if scale is None else scale.get(m.name))
+            if y is not None:
+                out[m.part] = y
         return out, h, ctx, e
+
+    def head_part(self, h: Tensor) -> Tensor:
+        """The head's field from the trunk state h."""
+        return self.unpatchify(self.head(h).float())
+
+    def member_part(self, m: BandMember, h: Tensor, ctx: Tensor, e: Tensor, t: Tensor, cls_idx: Tensor,
+                    scale: Optional[Tensor] = None) -> Optional[Tensor]:
+        """One member's field [B, C, H, W] from the trunk state (None when its gate is zero for every sample): the
+        member runs on the gated rows only, its output is weighted by the gate, kept to its band, and zero elsewhere."""
+        g = m.gate(t, cls_idx)
+        if scale is not None:
+            g = g * scale
+        idx = torch.nonzero(g > 0, as_tuple=False).squeeze(1)
+        if idx.numel() == 0:
+            return None
+        y, _ = m(h[idx], ctx[idx], e[idx])
+        y = y.float() * g[idx].view(-1, 1, 1)
+        if m.keep:
+            y = self.keep_band(y, self.band_index(m))
+        full = y.new_zeros(h.shape[0], y.shape[1], y.shape[2])
+        full[idx] = y
+        return self.unpatchify(full)
 
     def velocity(self, zt: Tensor, t: Tensor, cls_idx: Tensor) -> Tensor:
         parts, _, _, _ = self.components(zt, t, cls_idx)
@@ -207,6 +219,19 @@ class Model(nn.Module):
              t_sampling: str = "uniform") -> Tensor:
         """The flow-matching loss of one batch. Random draws from ``gen`` in this order: noise, t, the class drop (only
         when cond_drop > 0), then one draw per member (only for member dropout in training)."""
+        b = z1.shape[0]
+        zt, t, cls_idx, target = self.draw(z1, cls_idx, gen, cond_drop, t_sampling)
+        scale = None
+        if self.training and mdrop > 0 and len(self.members):
+            scale = {m.name: (torch.rand(b, generator=gen, device=z1.device) >= mdrop).to(z1.dtype) for m in self.members}
+        parts, _, _, _ = self.components(zt, t, cls_idx, scale=scale)
+        v = torch.stack(list(parts.values())).sum(dim=0) if parts else torch.zeros_like(z1)
+        return ((v - target) ** 2).mean()
+
+    @staticmethod
+    def draw(z1: Tensor, cls_idx: Tensor, gen: torch.Generator, cond_drop: float, t_sampling: str = "uniform"):
+        """The noisy input of one batch -> (z_t, t, class after the drop, target). Draws from ``gen``: noise, t, then the
+        class drop (only when cond_drop > 0)."""
         if t_sampling not in ("uniform", "logit_normal"):
             raise ValueError("t_sampling must be uniform or logit_normal")
         b = z1.shape[0]
@@ -218,13 +243,8 @@ class Model(nn.Module):
         if cond_drop > 0:
             drop = torch.rand(b, generator=gen, device=z1.device) < cond_drop
             cls_idx = torch.where(drop, torch.full_like(cls_idx, NULL_CLASS), cls_idx)
-        scale = None
-        if self.training and mdrop > 0 and len(self.members):
-            scale = {m.name: (torch.rand(b, generator=gen, device=z1.device) >= mdrop).to(z1.dtype) for m in self.members}
         tt = t.view(b, 1, 1, 1)
-        parts, _, _, _ = self.components((1 - tt) * z0 + tt * z1, t, cls_idx, scale=scale)
-        v = torch.stack(list(parts.values())).sum(dim=0) if parts else torch.zeros_like(z1)
-        return ((v - (z1 - z0)) ** 2).mean()
+        return (1 - tt) * z0 + tt * z1, t, cls_idx, z1 - z0
 
     def trained_numbers(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
