@@ -25,6 +25,19 @@ added and read by the stem, Adam 1e-3, 100 warm-up steps, batch 128, class drop 
 | shared_start        | a finished plain job + ONE part on for all ten classes, t < 0.25, soft 0.06 | the part | 6,000 | [0, 0.31) |
 | blind_rand_all      | a finished blind job + ten symbol-gated parts at every noise level      | the parts   | 6,000 | [0, 1)    |
 | blind_shared_all    | a finished blind job + one part over all ten classes at every level     | the part    | 6,000 | [0, 1)    |
+| blind_experts10_id  | blind_experts_all with identity-born blocks (``born: identity``) and silent heads | the experts | 6,000 | [0, 1) |
+| blind_experts10_solved | the same, solve-born: before training the heads are the ten class heads solved on the frozen body | the experts | 6,000 | [0, 1) |
+| blind_experts10_id_1500, blind_experts10_solved_1500 | the same two                           | the experts | 1,500 | [0, 1)    |
+| blind_experts30_id  | a finished blind job + thirty identity-born experts, one per class and stage (the cuts 0.25 / 0.65, half-width 0.06; expert_s<stage>_c<class>) | the experts | 6,000 | [0, 1) |
+| blind_experts30_solved | the same thirty, solve-born (the thirty-head solve)                  | the experts | 6,000 | [0, 1)    |
+| snap9_solved        | a finished blind9 job + one solve-born expert for class 9 (the solve on class 9's pictures), trained on class 9 only | the expert | 1,500 | [0, 1) |
+
+A solve-born part is identity-born (its block passes the trunk's states through unchanged at birth) and, before training,
+its head is solved together with the other parts' by ``closed.part_equations`` / ``solve_parts`` / ``install_parts``
+(``batches`` batches of the training stream, ridge ``ridge`` of the mean diagonal): at birth the model is, to the last
+digit, the model of the same class heads with no block solved on the same base, seed and batches (the closed-forms
+variants class_heads and class_stage_heads). Such a job records "solve" (the provenance of every solved head) and
+"at_birth" (the read of the model before training: loss over the levels, by level, by stage).
 
 A symbol is a label drawn per row uniformly from 0 .. 9, independently of the class (``model.draw_symbols``; a row whose
 class was dropped has none): a symbol-gated part sees as many rows as a class expert and no class information, the
@@ -33,7 +46,8 @@ control of the class experts.
 Arguments (key=value): those of the time split, plus source (a finished job folder of the same seed, for the expert
 variants and snap9), source_model (the folder of the source job that is the frozen base, default model; for example
 model_avg_g8; when given, the source folder is read again first and recorded under "as_source") and reader (0 / 1: the
-class read on the scored samples; needs score=1 and ref=). ``scale``
+class read on the scored samples; needs score=1 and ref=), batches (200) and ridge (1e-6) (the solve of the solve-born
+variants; recorded only when changed). ``scale``
 multiplies the step counts as in the time split. avg (a comma list of decays; every training variant, ignored by
 anchors): each average of the trained parameters (the experts' for the expert variants) is exported as
 model_avg<digits after the point>/, read and scored like the last weights, and reported under "averaged".
@@ -61,7 +75,8 @@ from ..beds import PicturesBed
 from ..config import in_notebook, parse
 from ..data import npz_content_hash
 from ..determinism import mode as det_mode
-from ..forms import cluster_build, with_class_experts
+from ..closed import install_parts, part_equations, solve_parts
+from ..forms import cluster_build, with_class_experts, with_parts
 from ..linker import export_build, link
 from ..model import Model
 from ..read import CHUNK, LEVEL_ITEMS, READ_SEED, T_GRID, by_stage, read, read_symbols
@@ -102,14 +117,45 @@ SPECS: Dict[str, Dict[str, Any]] = {
     "blind_shared_all": dict(steps=6000, source="blind", experts=(tuple(range(10)),), window=(0.0, 1.0), soft=0.0,
                              t_range=(0.0, 1.0)),
 }
-VARIANTS = tuple(SPECS)
+VARIANTS = tuple(SPECS)                 # the variants of earlier versions
 EXPERT_VARIANTS = tuple(v for v, s in SPECS.items() if "experts" in s)
 NEW_VARIANTS = ("class_to_mid", "rand_start", "shared_start", "blind_rand_all", "blind_shared_all")
+
+# the seventh pass: how a content expert is born (identity-born, or solve-born: its head the class head solved on the
+# frozen body before training), experts per class and stage, and a class snapped in by a solve
+EVERY = dict(window=(0.0, 1.0), soft=0.0, t_range=(0.0, 1.0))
+PASS7_SPECS: Dict[str, Dict[str, Any]] = {
+    "blind_experts10_id": dict(steps=6000, source="blind", experts=TEN, born="identity", **EVERY),
+    "blind_experts10_solved": dict(steps=6000, source="blind", experts=TEN, birth="solve", **EVERY),
+    "blind_experts10_id_1500": dict(steps=1500, source="blind", experts=TEN, born="identity", **EVERY),
+    "blind_experts10_solved_1500": dict(steps=1500, source="blind", experts=TEN, birth="solve", **EVERY),
+    "blind_experts30_id": dict(steps=6000, source="blind", experts=TEN, by_stage=True, born="identity", **EVERY),
+    "blind_experts30_solved": dict(steps=6000, source="blind", experts=TEN, by_stage=True, birth="solve", **EVERY),
+    "snap9_solved": dict(steps=1500, source="blind9", experts=((9,),), only_classes=(9,), birth="solve", **EVERY),
+}
+PASS7_VARIANTS = tuple(PASS7_SPECS)
+ALL_SPECS: Dict[str, Dict[str, Any]] = dict(SPECS, **PASS7_SPECS)
+ALL_VARIANTS = tuple(ALL_SPECS)
+PASS7_ARGS = {"batches": 200, "ridge": 1e-6}     # the solve of the solve-born variants; recorded only when changed
 
 DEFAULTS = dict(variant="", seed=0, data="", out="", device="cuda", heldout=2048, batch=128, lr=1e-3, warmup=100,
                 log_every=500, threads=4, mem_fraction=0.25, scale=1.0, dim=128, score=0, judge="inception",
                 score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", reader=0, avg="", score_last=1,
-                score_avg="", det="", source_model="")
+                score_avg="", det="", source_model="", batches=200, ridge=1e-6)
+
+
+def expert_groups(spec: Dict[str, Any]) -> List[dict]:
+    """The parts an expert variant adds, as ``forms.with_parts`` groups: one class expert (one block) per class list
+    over the spec's window, or, with "by_stage", one per class list and registered stage (the time split's cuts and
+    crossfade; named expert_s<stage>_c<class>). Identity-born for "born": "identity" and for the solve-born variants."""
+    classes = [list(c) for c in spec["experts"]]
+    born = "identity" if spec.get("born") == "identity" or spec.get("birth") == "solve" else None
+    extra = {} if born is None else {"born": born}
+    if spec.get("by_stage"):
+        return [dict(classes=classes, window=(CUTS[s], CUTS[s + 1]), soft=SOFT, depth=1, prefix=f"expert_s{s}", **extra)
+                for s in range(len(CUTS) - 1)]
+    return [dict(classes=classes, window=spec["window"], soft=spec["soft"], depth=1, prefix="expert",
+                 gate=spec.get("gate", "class"), **extra)]
 
 
 def _stage_means(by_level: Dict[str, float]) -> List[Optional[float]]:
@@ -198,12 +244,12 @@ def main(argv=(), **overrides) -> dict:
 
 def _run(a: dict, det) -> dict:
     variant = a["variant"]
-    if variant not in SPECS:
-        raise ValueError(f"unknown variant {variant!r}; known: {list(VARIANTS)}")
+    if variant not in ALL_SPECS:
+        raise ValueError(f"unknown variant {variant!r}; known: {list(ALL_VARIANTS)}")
     for k in ("data", "out"):
         if not a[k]:
             raise ValueError(f"{k}= is required")
-    spec = SPECS[variant]
+    spec = ALL_SPECS[variant]
     seed, dim, scale = int(a["seed"]), int(a["dim"]), float(a["scale"])
     source_model = a["source_model"] or "model"
     if "source" in spec:
@@ -260,12 +306,31 @@ def _run(a: dict, det) -> dict:
     decays = tuple(d for _, _, d in averages)
     torch.manual_seed(seed)
     as_source = None
+    solve, at_birth = None, None
     if "experts" in spec:
         base = os.path.join(a["source"], source_model)
         if a["source_model"]:                      # recorded only when asked for, so earlier jobs write their result
             as_source = source_read(a["source"], source_model, bed, int(a["heldout"]), device, log)
-        model, names = with_class_experts(base, seed, [list(c) for c in spec["experts"]], spec["window"], spec["soft"],
-                                          depth=1, device=device, gate=spec.get("gate", "class"))
+        if variant in PASS7_SPECS:
+            model, names = with_parts(base, seed, expert_groups(spec), device=device)
+        else:
+            model, names = with_class_experts(base, seed, [list(c) for c in spec["experts"]], spec["window"],
+                                              spec["soft"], depth=1, device=device, gate=spec.get("gate", "class"))
+        if spec.get("birth") == "solve":
+            # solve-born: the identity-born parts' heads solved together on the frozen body, then read once
+            t0 = time.time()
+            eq = part_equations(model, train_bed, seed, int(a["batches"]), names, batch=int(a["batch"]), cond_drop=0.1,
+                                t_range=spec["t_range"])
+            solution = solve_parts(eq, float(a["ridge"]))
+            solve = install_parts(model, solution, eq)
+            solve["all"]["seconds"] = time.time() - t0
+            log(f"SOLVE {len(names)} part head(s) in {len(eq['groups'])} group(s) on {int(a['batches'])} batches: mse "
+                f"over the equations' rows {solve['all']['mse_before']:.5f} -> {solve['all']['mse_after']:.5f}"
+                + (f"; never on: {solution['unsolved']}" if solution["unsolved"] else ""))
+            birth = read(model, bed, int(a["heldout"]), device)
+            at_birth = {"loss_over_levels": birth["loss_over_levels"], "by_level": _levels(birth),
+                        "by_stage": by_stage(birth, CUTS)}
+            log(f"AT BIRTH (solved heads): over ten levels {birth['loss_over_levels']:.4f}")
         log(f"PART model: {len(names)} expert(s) on {a['source']}; t in [{spec['t_range'][0]:g}, {spec['t_range'][1]:g}), "
             f"{n} steps")
         res = fit_units(model, train_bed, seed, steps=n, trainable=names, t_range=spec["t_range"], mdrop=0.0,
@@ -322,6 +387,9 @@ def _run(a: dict, det) -> dict:
         log(f"EXACT {exact['expert']} left out: other classes' rows change at most {exact['others_max_abs']!r}; "
             f"its own rows by {exact['own_mean_change']}")
     result["exact"] = exact
+    if solve is not None:                          # the solve-born variants only
+        result["solve"] = solve
+        result["at_birth"] = at_birth
     judged: Dict[str, Any] = {}
 
     def score_of(m, tag: str = "") -> dict:
@@ -371,8 +439,8 @@ def _run(a: dict, det) -> dict:
     if int(a["sheet"]):
         sample_sheet(final, bed, os.path.join(out, "samples.png"), device)
     # avg= and the newer options are recorded only when given
-    result.update({"args": recorded_args(a), "torch": torch.__version__, "device": str(device),
-                   "version": __version__})
+    args = {k: v for k, v in recorded_args(a).items() if not (k in PASS7_ARGS and v == PASS7_ARGS[k])}
+    result.update({"args": args, "torch": torch.__version__, "device": str(device), "version": __version__})
     det.record(result)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(result, fh, indent=1)
@@ -400,9 +468,11 @@ def summarize(root: str) -> str:
                 rows.append(r)
     rows.sort(key=lambda r: (r["variant"], r["seed"]))
     with_avg = any(r.get("averaged") for r in rows)
+    with_birth = any(r.get("at_birth") for r in rows)          # a solve-born job: its read before training
     lines = ["| variant | seed | total | by stage | class's worth (start) | score | class read |"
-             + (" average (first decay) | average total | average score | averages (total / score) |" if with_avg else ""),
-             "|---|---|---|---|---|---|---|" + ("---|---|---|---|" if with_avg else "")]
+             + (" average (first decay) | average total | average score | averages (total / score) |" if with_avg else "")
+             + (" at birth (solved) |" if with_birth else ""),
+             "|---|---|---|---|---|---|---|" + ("---|---|---|---|" if with_avg else "") + ("---|" if with_birth else "")]
     for r in rows:
         stages = " / ".join(_fmt(x) for x in r["by_stage"])
         worth = _fmt(((r.get("class_worth") or {}).get("by_stage") or [None])[0])
@@ -420,6 +490,8 @@ def summarize(root: str) -> str:
                          f"{_fmt(asc['score'], 2) if asc.get('score') is not None else '-'} | {averages_cell(av)} |")
             else:
                 line += " - | - | - | - |"
+        if with_birth:
+            line += f" {_fmt((r.get('at_birth') or {}).get('loss_over_levels'))} |"
         lines.append(line)
     return "\n".join(lines) + "\n"
 

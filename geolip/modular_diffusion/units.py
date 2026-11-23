@@ -32,7 +32,8 @@ from torch import Tensor
 from .blocks import Block, TimeEmbedding, ZeroHead, zero_linear
 from .rotary import AxialBandCode
 from .spectral import anchor_velocity, class_anchor_velocity
-from .windows import window_weight
+from . import frame
+from .windows import window_weight  # noqa: F401  (kept importable from here, as in earlier versions)
 
 NULL_CLASS = 10                      # the class index that means "no caption"
 
@@ -290,7 +291,12 @@ class BandMember(Unit):
     The class list (address "classes") gates the unit by the row's class, or, with spec "gate": "symbol", by the row's
     symbol: a label drawn at random per row (``model.draw_symbols``), not the class. A symbol-gated unit is off for a
     row whose symbol is the null index and for every row when no symbols are given. A depth of 0 is a unit with no
-    block: its head reads the trunk state directly."""
+    block: its head reads the trunk state directly.
+
+    Spec "born": "identity": after its blocks are drawn, each block's three residual output layers are set to zero
+    (``Block.zero_outputs``), so the block chain passes its input through unchanged at birth and the unit is, at birth,
+    a part with no block reading the same states (the random draws are those of a unit without the key). Without the
+    key nothing changes."""
     unit_type = "BandMember"
 
     def __init__(self, name, address, spec, geometry):
@@ -299,6 +305,9 @@ class BandMember(Unit):
         gate_kind = self.spec.get("gate", "class")
         if gate_kind not in ("class", "symbol"):
             raise ValueError(f"a unit's gate is class or symbol, not {gate_kind!r}")
+        birth = self.spec.get("born")
+        if birth not in (None, "identity"):
+            raise ValueError(f"a unit's birth is identity (or not given), not {birth!r}")
         classes = address.get("classes")
         if gate_kind == "symbol" and classes is None:
             raise ValueError("a symbol-gated unit needs its list of symbols (address classes)")
@@ -312,6 +321,13 @@ class BandMember(Unit):
         self.head = ZeroHead(d, geometry["token_dim"])
         lo, hi = spec["code"]
         self.code = AxialBandCode(d // heads, geometry["grid"], float(lo), float(hi))
+        if birth == "identity":                  # no random draw: the numbers above are those of a unit without the key
+            for blk in self.blocks:
+                blk.zero_outputs()
+
+    @property
+    def identity_born(self) -> bool:
+        return self.spec.get("born") == "identity"
 
     @property
     def part(self) -> str:
@@ -327,16 +343,8 @@ class BandMember(Unit):
 
     def gate(self, t: Tensor, cls_idx: Tensor, symbols: Optional[Tensor] = None) -> Tensor:
         """[B]: the window weight times the class mask (of the row's symbol for a symbol-gated unit; zero for every
-        row when ``symbols`` is None)."""
-        w = window_weight(t, self.lo, self.hi, self.soft)
-        if self.classes is not None:
-            if self.symbol_gate:
-                if symbols is None:
-                    return torch.zeros_like(w)
-                w = w * self.cls_mask[symbols]
-            else:
-                w = w * self.cls_mask[cls_idx]
-        return w
+        row when ``symbols`` is None): the projective gate of the unit's address (``frame.factor``)."""
+        return frame.factor(frame.owner_of(self), t, cls_idx, symbols)
 
     def forward(self, h: Tensor, ctx: Tensor, e: Tensor):
         """-> (token output [B, N, P], the state after the blocks)."""

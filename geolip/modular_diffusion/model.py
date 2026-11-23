@@ -30,7 +30,8 @@ from .build import Build
 from .spectral import band_masks, keep_band, patchify, unpatchify
 from .units import (Anchor, BandMember, Body, DepthBlock, GrowthBlock, Head, StageBody, Stem, Unit, UNIT_TYPES, born,
                     make)
-from .windows import window_weight
+from . import frame
+from .windows import window_weight  # noqa: F401  (kept importable from here, as in earlier versions)
 
 NULL_CLASS = 10
 SYMBOLS = 10                         # symbols are drawn uniformly from 0 .. SYMBOLS - 1; NULL_CLASS is "no symbol"
@@ -189,7 +190,7 @@ class Model(nn.Module):
             growth = isinstance(live[0], GrowthBlock)
             mixed = h if growth else torch.zeros_like(h)
             for u in live:
-                w = window_weight(t, u.lo, u.hi, u.soft)
+                w = frame.stage_factor(frame.owner_of(u), t)          # the window weight of the unit's address
                 idx = torch.nonzero(w > 0, as_tuple=False).squeeze(1)
                 if idx.numel():
                     hi_ = h[idx]
@@ -200,7 +201,7 @@ class Model(nn.Module):
             return mixed
         h_new = h.clone()
         for u in live:
-            idx = torch.nonzero((t >= u.lo) & (t < u.hi), as_tuple=False).squeeze(1)
+            idx = torch.nonzero(frame.stage_rows(frame.owner_of(u), t), as_tuple=False).squeeze(1)
             if idx.numel():
                 h_new[idx] = u(h[idx], ctx[idx], e[idx], rot)
         return h_new

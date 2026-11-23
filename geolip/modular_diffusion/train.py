@@ -262,6 +262,31 @@ def set_trainable_units(model, names: Union[str, Iterable[str]]) -> None:
                 p.requires_grad_(True)
 
 
+def set_trainable_params(model, params: Dict[str, Sequence[str]]) -> None:
+    """Set more parameters trainable, by name prefix inside a unit: {unit name: [prefix, ...]} (for example
+    {"stem": ["blocks.3."]}); every parameter of a named unit (in every cluster of a staged model) whose name relative
+    to the unit starts with one of its prefixes trains, the others keep their setting. An unknown unit, or a prefix that
+    matches no parameter, raises KeyError."""
+    units = _all_units(model)
+    known = {u.name for u in units}
+    for name, prefixes in params.items():
+        if name not in known:
+            raise KeyError(f"no unit named {name!r} in the model")
+        prefixes = [str(p) for p in prefixes]
+        hit = {p: False for p in prefixes}
+        for u in units:
+            if u.name != name:
+                continue
+            for pn, p in u.named_parameters():
+                for pre in prefixes:
+                    if pn.startswith(pre):
+                        p.requires_grad_(True)
+                        hit[pre] = True
+        missing = [p for p, ok in hit.items() if not ok]
+        if missing:
+            raise KeyError(f"the unit {name!r} holds no parameter whose name starts with {missing}")
+
+
 def recipe(lr: float, warmup: int, batch: int, steps: int, t_sampling: str, t_range: Sequence[float], cond_drop: float,
            flip: bool, equalize_members: bool, mdrop: float, device, t_mix: float = 0.0) -> Dict[str, Any]:
     """The card recipe of a run of ``run_loop``."""
@@ -280,7 +305,8 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
               expect_anchor_at_birth: bool = False, averages: Sequence[Union[float, str]] = (),
               start_step: int = 0, optimizer_state: Optional[Dict[str, Any]] = None, keep_state: bool = False,
               average_start: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
-              average_step: Optional[int] = None) -> dict:
+              average_step: Optional[int] = None,
+              trainable_params: Optional[Dict[str, Sequence[str]]] = None) -> dict:
     """Train the named units of a model (a Model or a Staged) with the recipe and read it.
 
     averages: decays d and named averages. For each, a float32 copy of every trainable parameter (on its device, no
@@ -301,12 +327,19 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
     also holds "optimizer_state" {"step": start_step + steps, "m", "v": {name: tensor}, "t": {name: int}, "lr",
     "betas", "eps"} (tensors: keep it out of json files; ``write_state`` writes it).
 
+    Part of a unit: ``trainable_params`` {unit name: [name prefixes inside the unit]} sets those parameters trainable
+    as well (``set_trainable_params``; for example {"stem": ["blocks.3."]} trains the stem's last block of four besides
+    the named units); every other parameter stays frozen and is checked bit for bit. The result then also holds
+    "trainable_params" (absent otherwise).
+
     Sets the trainable units; with ``expect_anchor_at_birth`` checks that the velocity equals the anchor's (or zero
     without an anchor) exactly on a 2-row probe; runs the loop; checks that the frozen parameters did not change; reads.
     cond_drop applies only when the bed has classes. Returns the read with {seed, steps, t_range, t_sampling, trainable,
     trained_numbers, all_numbers, train_seconds, peak_memory_mib, curve, frozen_unchanged, recipe, torch, device}."""
     model.to(device)
     set_trainable_units(model, trainable)
+    if trainable_params:
+        set_trainable_params(model, trainable_params)
     t_range = (float(t_range[0]), float(t_range[1]))
     frozen_before = {id(p): p.detach().clone() for p in model.parameters() if not p.requires_grad}
     if expect_anchor_at_birth:
@@ -409,6 +442,8 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
         res["start_step"] = int(start_step)
         res["recipe"]["start_step"] = int(start_step)
         res["recipe"]["optimizer_state"] = "continued" if optimizer_state is not None else "new"
+    if trainable_params:                                  # recorded only when given
+        res["trainable_params"] = {k: [str(p) for p in v] for k, v in trainable_params.items()}
     if averaged is not None:
         res["averaged"] = averaged                        # tensors: never written into a json file
     if keep_state:

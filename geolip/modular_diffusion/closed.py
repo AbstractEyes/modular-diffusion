@@ -159,11 +159,23 @@ def _part_groups(units) -> List[List[int]]:
     return sorted(groups.values(), key=lambda g: g[0])
 
 
+def blocks_at_identity(unit) -> bool:
+    """Whether every block of a part is still the identity: the three residual output layers of each block exactly
+    zero (weights and biases), as an identity-born part is at birth. True for a part with no block."""
+    for blk in getattr(unit, "blocks", []):
+        for lin in (blk.attn.out, blk.cross.out, blk.mlp[2]):
+            if bool(lin.weight.detach().ne(0).any()) or bool(lin.bias.detach().ne(0).any()):
+                return False
+    return True
+
+
 @torch.no_grad()
 def part_equations(model, bed, seed: int, batches: int, names: Sequence[str], batch: int = 128, cond_drop: float = 0.1,
                    t_range: Sequence[float] = (0.0, 1.0)) -> Dict[str, Any]:
     """The normal equations of the named parts TOGETHER, for parts with no block (depth 0: each reads the trunk's last
-    states through its own norm, y_j = W_j f + b_j with f = norm(h)), over steps 0 .. batches - 1 of the trainer's
+    states through its own norm, y_j = W_j f + b_j with f = norm(h)) or whose blocks are still the identity (an
+    identity-born part before training, ``blocks_at_identity``: its blocks pass the trunk's states through unchanged, so
+    its head reads exactly what a part with no block reads), over steps 0 .. batches - 1 of the trainer's
     stream (as ``head_equations``; a model with symbol-gated units also draws the rows' symbols after the batch's other
     draws, as in training).
 
@@ -179,8 +191,9 @@ def part_equations(model, bed, seed: int, batches: int, names: Sequence[str], ba
     names = list(names)
     units = [model.unit(n) for n in names]
     for u in units:
-        if not hasattr(u, "head") or len(getattr(u, "blocks", [])) != 0 or u.keep:
-            raise ValueError(f"{u.name}: a joint solve takes parts with no block and no band filter (depth 0)")
+        if not hasattr(u, "head") or u.keep or (len(getattr(u, "blocks", [])) != 0 and not blocks_at_identity(u)):
+            raise ValueError(f"{u.name}: a joint solve takes parts with no block (depth 0), or whose blocks are still the "
+                             f"identity, and no band filter")
     model.eval()
     device = _device_of(model)
     d = int(units[0].head.proj.in_features)

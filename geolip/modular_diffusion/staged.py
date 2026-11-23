@@ -33,7 +33,8 @@ from .build import content_hash, read_build
 from .compat import num
 from .linker import StaleUnit, link, stale_list
 from .model import Model, draw_symbols, symbol_gated
-from .windows import window_weight
+from . import frame
+from .windows import window_weight  # noqa: F401  (kept importable from here, as in earlier versions)
 
 STAGED_FORMAT = "modular-diffusion/staged/1"
 STAGED_FILE = "staged.json"
@@ -124,8 +125,8 @@ class Staged(nn.Module):
 
     # ------------------------------------------------------------------ the blend
     def weights(self, t: Tensor) -> Tensor:
-        """[S, B]: the stage weights at t."""
-        return torch.stack([window_weight(t, lo, hi, self.soft) for lo, hi in self.windows()])
+        """[S, B]: the stage weights at t (the stage factors of the stages' addresses, ``frame.stage_weights``)."""
+        return frame.stage_weights(frame.stage_owners(self), t)
 
     def anchor_velocity(self, zt: Tensor, t: Tensor, cls_idx: Optional[Tensor] = None) -> Tensor:
         return self.clusters[0].anchor_velocity(zt, t, cls_idx)

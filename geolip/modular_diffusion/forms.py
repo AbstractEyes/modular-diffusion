@@ -12,6 +12,8 @@ windowed bodies (tails) are mixed by the stage weights before one head.
     add_class_experts(build, [[0], [1]], gate="symbol")      parts gated by a random symbol (expert_s0, expert_s1)
     add_class_experts(build, [[0]], depth=0)                 a part with no block: a class head on the trunk's states
     with_parts(folder, seed, [dict(classes=..., ...), ...])  several groups of newborn parts at once
+    add_class_experts(build, [[0]], born="identity")         a part whose block is the identity at birth
+    add_band_members(build, ("all",))                        one member over every band, no filter (member_all)
 
 Every unit keeps a fixed name (anchor, stem, body, head), so the units of different clusters are interchangeable.
 ``cluster_build(stem_depth=k)`` gives exactly the unit entries and geometry of the flat arguments ``arch=plain
@@ -90,16 +92,19 @@ def symbol_name(symbols: Sequence[int], prefix: str = "expert") -> str:
 
 
 def add_class_experts(build: Build, classes: Sequence[Sequence[int]], window=(0.0, 1.0), soft: float = 0.0,
-                      depth: int = 1, prefix: str = "expert", gate: str = "class") -> List[str]:
+                      depth: int = 1, prefix: str = "expert", gate: str = "class", born: Optional[str] = None) -> List[str]:
     """Append one ContentExpert per class set to ``build`` (in place) and return their names. Each: site "out", band
     "all", the window and the crossfade half-width, the class list; spec depth, the whole position code, keep False;
     its random stream is its own name.
 
     depth 0: a part with no block, the head's own reading of the trunk's last states (a norm and one zero-born linear
     layer to the token values). gate "symbol": each list is a list of symbols, not classes (spec "gate": "symbol";
-    named <prefix>_s<symbols>); gate "class" writes the entry of earlier versions (no "gate" key)."""
+    named <prefix>_s<symbols>); gate "class" writes the entry of earlier versions (no "gate" key). born "identity": the
+    parts' blocks are born as the identity (spec "born": "identity", ``units.BandMember``); None writes no key."""
     if gate not in ("class", "symbol"):
         raise ValueError(f"gate is class or symbol, not {gate!r}")
+    if born not in (None, "identity"):
+        raise ValueError(f"born is identity or None, not {born!r}")
     names = []
     lo, hi = window
     for cs in classes:
@@ -110,6 +115,8 @@ def add_class_experts(build: Build, classes: Sequence[Sequence[int]], window=(0.
         spec = {"depth": int(depth), "code": list(WHOLE), "keep": False}
         if gate == "symbol":
             spec["gate"] = "symbol"
+        if born is not None:
+            spec["born"] = born
         build.units.append(UnitEntry(n, "ContentExpert",
                                      {"site": "out", "band": "all", "window": [_edge(lo), _edge(hi)], "soft": _edge(soft),
                                       "classes": cs}, spec))
@@ -122,10 +129,19 @@ def add_band_members(build: Build, bands: Sequence[int] = (0, 1, 2), depth: int 
                      soft: float = 0.0, keep: bool = True, prefix: str = "member") -> List[str]:
     """Append one zero-born BandMember per band (named member_b0, ...) to ``build`` (in place); returns their names.
     Each: site "out", the band, the window and half-width, no class set; spec depth, the whole position code, keep. A
-    band-kept member needs a geometry of 3 bands."""
+    band-kept member needs a geometry of 3 bands. The band "all" is one member over every band with no filter (named
+    member_all, keep False)."""
     names = []
     lo, hi = window
     for b in bands:
+        if b == "all":
+            n = f"{prefix}_all"
+            build.units.append(UnitEntry(n, "BandMember",
+                                         {"site": "out", "band": "all", "window": [_edge(lo), _edge(hi)],
+                                          "soft": _edge(soft), "classes": None},
+                                         {"depth": int(depth), "code": list(WHOLE), "keep": False}))
+            names.append(n)
+            continue
         n = f"{prefix}_b{int(b)}"
         build.units.append(UnitEntry(n, "BandMember",
                                      {"site": "out", "band": int(b), "window": [_edge(lo), _edge(hi)], "soft": _edge(soft),
@@ -150,7 +166,7 @@ def with_class_experts(folder: str, seed: int, classes: Sequence[Sequence[int]],
 
 def with_parts(folder: str, seed: int, groups: Sequence[Dict[str, Any]], device="cpu"):
     """A finished build folder with several groups of newborn parts -> (model, part names): each group is the keyword
-    arguments of ``add_class_experts`` (classes, window, soft, depth, prefix, gate), appended in order. As
+    arguments of ``add_class_experts`` (classes, window, soft, depth, prefix, gate, born), appended in order. As
     ``with_class_experts`` otherwise (the newborn parts change no digit of the source's output)."""
     from .linker import born_gap, link
     from .model import Model

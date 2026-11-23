@@ -7,7 +7,10 @@ width 32, a few steps per part, under a gigabyte of card memory.
 The third function runs its jobs with det=on (``determinism``): by default the attention kernel's backward pass is not
 deterministic on a card, so two runs of one job can differ in the last digits; with the switch on they must be equal.
 The matrix library's fixed workspace has to be in the environment before anything touches the card, so it is set here,
-before torch is imported."""
+before torch is imported.
+
+The fourth function (the address frame, identity-born and solve-born parts, the thaw pass, members on an averaged body)
+also runs on the CPU with MD_TEST_DEVICE=cpu, which checks its logic where no card is free; only a card checks a card."""
 import os
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -18,7 +21,8 @@ import torch  # noqa: E402
 from geolip.modular_diffusion.experiments import chain_reads, closed_forms, content, time_split  # noqa: E402
 from geolip.modular_diffusion.staged import link_staged  # noqa: E402
 
-pytestmark = pytest.mark.skipif(os.environ.get("MD_TEST_CUDA") != "1" or not torch.cuda.is_available(),
+DEV = os.environ.get("MD_TEST_DEVICE", "cuda")          # cpu: the fourth function's logic without a card
+pytestmark = pytest.mark.skipif(os.environ.get("MD_TEST_CUDA") != "1" or (DEV == "cuda" and not torch.cuda.is_available()),
                                 reason="MD_TEST_CUDA=1 and a visible card are needed")
 
 SMALL = dict(seed=0, device="cuda", scale=0.002, dim=32, heldout=64, batch=16, log_every=1, warmup=1, score=1,
@@ -192,3 +196,110 @@ def test_stages_symbols_and_class_heads_on_the_card(synthetic_npz, tmp_path):
     assert not any("attention" in m.lower() for m in hs["nondeterministic"]), hs["nondeterministic"]
     r = content.main(**dict(small, variant="plain", out=str(croot / "det_warn"), det="warn", score=0, sheet=0))
     assert any("attention" in m.lower() for m in r["nondeterministic"]), r["nondeterministic"]
+
+
+def test_frame_births_thaw_and_members_on_the_card(synthetic_npz, tmp_path):
+    """Every job with det=on. The address frame gives the stored gates on the device, bit for bit, and a job through
+    it repeats; identity-born and solve-born experts (ten, and thirty by class and stage): a solve-born model at birth
+    IS the model of the solved class heads; a class snapped in by a solve; the thaw pass at every level on a tails
+    build and on a grown one; band members and one unfiltered member on an averaged body; the reference run with a
+    scored tail average."""
+    from geolip.modular_diffusion import frame
+    from geolip.modular_diffusion.experiments import stages
+    from geolip.modular_diffusion.windows import window_weight
+    small = dict(SMALL, device=DEV, data=synthetic_npz, ref=str(tmp_path / "reference.npz"), det="on")
+
+    # the frame on the device: the gates as the units computed them before, and exact silence in the amplitude forms
+    gen = torch.Generator().manual_seed(0)
+    t = torch.cat([torch.rand(500, generator=gen), torch.tensor([0.0, 0.19, 0.25, 0.31, 0.59, 0.65, 0.71, 1.0])]).to(DEV)
+    cls = torch.randint(0, 11, (t.shape[0],), generator=gen).to(DEV)
+    owners = [frame.owner(lo, hi, 0.06, [c]) for lo, hi in ((0.0, 0.25), (0.25, 0.65), (0.65, 1.0)) for c in range(10)]
+    w = frame.projective(owners, t, cls)
+    for i, o in enumerate(owners):
+        ref = window_weight(t, o.lo, o.hi, o.soft)
+        ref = ref * o.class_mask(ref.device)[cls]
+        assert torch.equal(w[:, i], ref), i
+    for c in range(10):                                   # a class's three stage parts hand over: their gates sum to one
+        rows = cls == c
+        total = sum(w[rows, s * 10 + c] for s in range(3))
+        assert float((total - 1).abs().max()) < 1e-6
+    assert float(w[cls == 10].abs().max()) == 0.0         # the null class is on no part's address
+    for form in ("plain", "discounted"):
+        a = frame.aleph(owners, t, cls, U=5.0, form=form)
+        assert a.device.type == t.device.type and bool(((w == 0) == (a == 0)).all()), form
+
+    croot = tmp_path / "content"
+    base = {}
+    for v in ("plain", "blind", "blind9"):
+        base[v] = content.main(**dict(small, variant=v, out=str(croot / v), reader=1, avg="g8"))
+    on = lambda v: dict(source=str(croot / v), source_model="model_avg_g8")
+    part = dict(small, reader=1, avg="g8", score_last=0)
+    # a stored kind of job through the frame repeats to the last digit
+    one = content.main(**dict(part, variant="blind_experts_all", out=str(croot / "all_1"), **on("blind")))
+    two = content.main(**dict(part, variant="blind_experts_all", out=str(croot / "all_2"), **on("blind")))
+    assert one["loss_over_levels"] == two["loss_over_levels"]
+    assert one["averaged"]["g8"]["loss_over_levels"] == two["averaged"]["g8"]["loss_over_levels"]
+
+    froot = tmp_path / "closed"
+    heads = {v: closed_forms.main(**dict(small, variant=v, out=str(froot / v), batches=4, reader=1, **on("blind")))
+             for v in ("class_heads", "class_stage_heads")}
+    e = {}
+    for v in ("blind_experts10_id", "blind_experts10_solved", "blind_experts10_id_1500", "blind_experts10_solved_1500",
+              "blind_experts30_id", "blind_experts30_solved"):
+        e[v] = content.main(**dict(part, variant=v, out=str(croot / v), batches=4, **on("blind")))
+        assert e[v]["device"] == DEV and e[v]["as_source"]["equals_stored"] is True, v
+        assert e[v]["exact"]["others_max_abs"] == 0.0, (v, e[v]["exact"])
+        assert "class_read" in e[v]["averaged"]["g8"]["score"], v
+        assert ("at_birth" in e[v]) == ("solved" in v), v
+    assert len(e["blind_experts30_id"]["parts"][0]["trainable"]) == 30
+    # born by a solve: before any training the model is the model of the solved heads
+    assert e["blind_experts10_solved"]["at_birth"]["loss_over_levels"] == heads["class_heads"]["loss_over_levels"]
+    assert e["blind_experts30_solved"]["at_birth"]["loss_over_levels"] == heads["class_stage_heads"]["loss_over_levels"]
+    assert "at_birth" not in e["blind_experts10_id"] and "solve" in e["blind_experts10_solved"]
+
+    # a class the body never saw: a head by a solve on that class's pictures, and a solve-born expert trained on them
+    h9 = closed_forms.main(**dict(small, variant="class_heads", out=str(froot / "h9"), batches=4, reader=1, classes="9",
+                                  only_classes="9", **on("blind9")))
+    h9s = closed_forms.main(**dict(small, variant="class_stage_heads", out=str(froot / "h9s"), batches=4, reader=1,
+                                   classes="9", only_classes="9", **on("blind9")))
+    s9 = content.main(**dict(part, variant="snap9_solved", out=str(croot / "snap9_solved"), batches=4, **on("blind9")))
+    old9 = content.main(**dict(part, variant="snap9", out=str(croot / "snap9_avg"), **on("blind9")))
+    for name, r in (("h9", h9), ("h9s", h9s), ("snap9_solved", s9), ("snap9", old9)):
+        assert r["as_source"]["equals_stored"] is True and r["exact"]["others_max_abs"] == 0.0, (name, r["exact"])
+    assert s9["at_birth"]["loss_over_levels"] == h9["loss_over_levels"]
+
+    # the thaw pass: from a tails build at every level, and from a grown build
+    sroot = tmp_path / "stages"
+    time_split.main(**dict(small, variant="plain_d4", out=str(sroot / "d4"), avg="g8", score=0, sheet=0))
+    stem = dict(stem_from=str(sroot / "d4"), stem_model="model_avg_g8")
+    stages.main(**dict(small, variant="tails", out=str(sroot / "tails"), total=6000, cuts="", score=0, sheet=0, **stem))
+    stages.main(**dict(small, variant="grow", out=str(sroot / "grow"), blocks=2, steps_each=2000, score=0, sheet=0, **stem))
+    th = {}
+    for level in ("tail", "1", "2", "all"):
+        th[level] = stages.main(**dict(small, variant="thaw", out=str(sroot / f"thaw_{level}"), base=str(sroot / "tails"),
+                                       thaw=level, total=2000, reader=1, score_last=0))
+    th["grown"] = stages.main(**dict(small, variant="thaw", out=str(sroot / "thaw_grown"), base=str(sroot / "grow"),
+                                     thaw="all", total=2000, reader=1, score_last=0))
+    for level, r in th.items():
+        assert r["device"] == DEV and r["as_source"]["equals_stored"] is True, level
+        assert all(p["frozen_unchanged"] for p in r["parts"]), level
+        assert set(r["averaged"]) == {"g8", "tail100"} and r["score"] is None, level
+        assert "class_read" in r["averaged"]["tail100"]["score"] and r["averaged"]["g8"]["score"] is None, level
+        assert r["thaw"]["stream_seed"] != r["seed"] and r["parts"][0]["seconds_per_step"] > 0, level
+        if DEV == "cuda":
+            assert r["parts"][0]["peak_memory_mib"] > 0, level
+    trained = [th[k]["numbers"]["trained"] for k in ("tail", "1", "2", "all")]
+    assert trained == sorted(trained) and len(set(trained)) == 4, trained
+    assert th["all"]["numbers"]["trained"] == th["all"]["numbers"]["all"]
+
+    # band members and one unfiltered member on an averaged body; the reference run with a scored tail average
+    m3 = closed_forms.main(**dict(small, variant="members_avg", out=str(froot / "members_avg"), reader=1, score_last=0,
+                                  **on("plain")))
+    m1 = closed_forms.main(**dict(small, variant="member_all_avg", out=str(froot / "member_all_avg"), reader=1,
+                                  score_last=0, **on("plain")))
+    for name, r in (("members_avg", m3), ("member_all_avg", m1)):
+        assert r["as_source"]["equals_stored"] is True and "class_read" in r["averaged"]["g8"]["score"], name
+    assert abs(m3["averaged"]["g8"]["independence_ratio_over_levels"] - 1) < 1e-5
+    ref = stages.main(**dict(small, variant="source", out=str(sroot / "ref_long"), total=6500, avg="g8,tail100", reader=1,
+                             score_last=0, score_avg="tail100"))
+    assert "class_read" in ref["averaged"]["tail100"]["score"] and ref["averaged"]["g8"]["score"] is None

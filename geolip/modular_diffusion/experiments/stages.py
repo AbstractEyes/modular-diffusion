@@ -20,13 +20,19 @@ least 2; the rounding of the time split's step counts, so the cuts 0.25 / 0.65 g
 | tails   | the anchor and the stem of ``stem_from`` / ``stem_model``, frozen and shared; per stage a newborn body of 3 blocks and a newborn head (the time split's tails_alone build), trained alone on its stage's range with a new optimizer; each tail keeps its own averages (default g8; default total 6,000) | body and head of each stage |
 | grow    | the anchor and the stem of ``stem_from`` / ``stem_model``, frozen, and a newborn head; then ``blocks`` times: one block born silent between the last block and the head (a ``units.DepthBlock``; the birth gap must be exactly 0.0), the new block and the head trained ``steps_each`` steps over the whole range with a new optimizer, the warm-up again and a stream of its own (growth step i draws its batches with the seed ``seed + 100003 i``, so no batch is seen by two blocks) and their own g8 average, whose values are then installed as their weights (the block frozen from here on; the head goes on from its averaged values) | per growth step: the new block and the head |
 
+| thaw    | a finished tails or grow job's build (``base``; ``base_model``, default its g8 folder avg_g8 for tails, model for grow), read again first, trained on over the whole range for ``total`` steps (default 2,000) with a NEW optimizer (Adam, the recipe's rate, the warm-up from step 0) and a stream of its own (the seed ``seed + 100003 x 7``, steps from 0), averages ``avg`` (default g8,tail100); the tail average is the scored reading (``score_avg`` widens it) | thaw=tail: the units the base job trained; 1 / 2: those and the stem's last one / two blocks; all: every trained number |
+
 Every result reads the model on the registered stages (the time split's cuts 0.25 / 0.65 in ``by_stage``), whatever
 the model's cuts.
 
 Arguments (key=value): those of the time split, plus cuts, soft (negative: the default rule), total (0: the variant's
 default), source, source_model, stem_from, stem_model, fresh, blocks (3), steps_each (2,000; times ``scale``), avg (a
 comma list of decays and names; empty: the variant's default; ``none``: no average), score_last, score_avg, reader
-(the class read on the scored samples; needs score=1 and ref=) and det.
+(the class read on the scored samples; needs score=1 and ref=), det, and for thaw base, base_model and thaw (tail, 1,
+2 or all). A thaw job keeps its base's cuts and crossfade, writes the folders of its base's kind (stage_0 .. with
+staged.json and avg_<name>/ for a tails base; model/ and model_avg_<name>/ for a grow base) and records "thaw" (the
+level, the base, the stream seed, the trainable units and parameter prefixes); its part row holds the seconds per step
+and the peak memory.
 
 Output in ``out``: log.txt (its last line 'done'), result.json, samples.png (with sheet: the scored model) and the
 models: source writes model/, one model_avg_<name>/ per average (model_avg<digits>/ for a decay) and state/; copies and
@@ -60,27 +66,31 @@ from ..model import Model
 from ..read import by_stage, read
 from ..sample import sample_sheet
 from ..score import class_reader, make_judge, picture_score, reader_check, reference_classes, reference_stats
-from ..staged import write_staged
-from ..train import average_spec, fit_units, read_state, write_state
+from ..staged import STAGED_FILE, link_staged, read_staged, write_staged
+from ..train import average_spec, fit_units, read_state, use_average, write_state
 from ..units import born
 from .content import class_numbers
 from .time_split import (CUTS, JUDGES, _levels, _marks, _non_anchor, _part_row, _unique_numbers, average_recipe,
                          export_averages, load_job, parse_averages, recorded_args, scored_keys, source_read, steps_of)
 
 EXPERIMENT = "stages"
-VARIANTS = ("source", "copies", "tails", "grow")
-DEFAULT_TOTAL = {"source": 4000, "copies": 2000, "tails": 6000, "grow": 0}
-DEFAULT_AVG = {"source": "g8", "copies": "g8,tail100", "tails": "g8", "grow": "g8"}
+VARIANTS = ("source", "copies", "tails", "grow")             # the variants of earlier versions
+ALL_VARIANTS = VARIANTS + ("thaw",)
+DEFAULT_TOTAL = {"source": 4000, "copies": 2000, "tails": 6000, "grow": 0, "thaw": 2000}
+DEFAULT_AVG = {"source": "g8", "copies": "g8,tail100", "tails": "g8", "grow": "g8", "thaw": "g8,tail100"}
 SOFT_CAP = 0.06
 TAIL_DEPTH = 3
 GROW_STREAM = 100003                 # growth step i trains on the stream of seed + GROW_STREAM x i (step 0: the job's seed)
-STAGE_ARGS = {"cuts": "", "soft": -1.0, "total": 0, "fresh": 0, "blocks": 3, "steps_each": 2000}
+THAW_STREAM = 7                      # a thaw pass trains on the stream of seed + GROW_STREAM x 7 (no build's batches)
+THAW_LEVELS = ("tail", "1", "2", "all")
+STAGE_ARGS = {"cuts": "", "soft": -1.0, "total": 0, "fresh": 0, "blocks": 3, "steps_each": 2000, "base": "",
+              "base_model": "", "thaw": ""}
 
 DEFAULTS = dict(variant="", seed=0, data="", out="", device="cuda", heldout=2048, batch=128, lr=1e-3, warmup=100,
                 log_every=500, threads=4, mem_fraction=0.25, scale=1.0, dim=128, score=0, judge="inception",
                 score_n=10000, score_steps=50, ref="", sheet=1, source="", source_model="", stem_from="", stem_model="",
                 cuts="", soft=-1.0, total=0, fresh=0, blocks=3, steps_each=2000, avg="", score_last=1, score_avg="",
-                reader=0, det="")
+                reader=0, det="", base="", base_model="", thaw="")
 
 
 def parse_cuts(text: str) -> List[float]:
@@ -134,6 +144,37 @@ def _born_like(stem_folder: str, bed, seed: int, body_depth: int, dim: int) -> M
     return model
 
 
+def _thaw_base(job: str, base_model: str = "") -> Dict[str, Any]:
+    """The base of a thaw pass: a finished tails or grow job -> {"variant", "folder" (base_model, default avg_g8 for
+    tails and model for grow), "kind" (clusters or model), "trained" (the units the base job trained, in order), "cuts",
+    "soft", "clusters" (the cluster folders of a staged base)}. ValueError when the folder is not such a job."""
+    path = os.path.join(job, "result.json")
+    if not os.path.exists(path):
+        raise ValueError(f"{job} holds no result.json (a finished tails or grow job is needed)")
+    with open(path, encoding="utf-8") as fh:
+        r = json.load(fh)
+    if r.get("experiment") != EXPERIMENT or r.get("variant") not in ("tails", "grow"):
+        raise ValueError(f"{job} is the job {r.get('experiment')!r} / {r.get('variant')!r}, not a stages tails or grow job")
+    folder = base_model or ("avg_g8" if r["variant"] == "tails" else "model")
+    full = os.path.join(job, folder)
+    staged = os.path.exists(os.path.join(full, STAGED_FILE))
+    if not staged and not os.path.exists(os.path.join(full, "build.json")):
+        raise ValueError(f"{full} holds neither a staged file nor a build")
+    trained: List[str] = []
+    for p in r["parts"]:
+        tr = p["trainable"]
+        for x in ([tr] if isinstance(tr, str) else tr):
+            if x not in trained:
+                trained.append(x)
+    info: Dict[str, Any] = {"variant": r["variant"], "folder": folder, "kind": "clusters" if staged else "model",
+                            "trained": trained, "cuts": [float(c) for c in r["cuts"]], "soft": float(r["soft"]),
+                            "clusters": []}
+    if staged:
+        d = read_staged(full)
+        info.update(cuts=[float(c) for c in d["cuts"]], soft=float(d["soft"]), clusters=list(d["clusters"]))
+    return info
+
+
 def main(argv=(), **overrides) -> dict:
     """Run one variant of one seed; writes the outputs into ``out`` and returns the result."""
     a = parse(DEFAULTS, argv, **overrides)
@@ -143,11 +184,23 @@ def main(argv=(), **overrides) -> dict:
 
 def _run(a: dict, det) -> dict:
     variant = a["variant"]
-    if variant not in VARIANTS:
-        raise ValueError(f"unknown variant {variant!r}; known: {list(VARIANTS)}")
+    if variant not in ALL_VARIANTS:
+        raise ValueError(f"unknown variant {variant!r}; known: {list(ALL_VARIANTS)}")
     for k in ("data", "out"):
         if not a[k]:
             raise ValueError(f"{k}= is required")
+    if variant == "thaw":
+        if not a["base"]:
+            raise ValueError("thaw needs base=<the folder of a finished tails or grow job>")
+        if a["thaw"] not in THAW_LEVELS:
+            raise ValueError(f"thaw= is one of {list(THAW_LEVELS)}, not {a['thaw']!r}")
+        if a["cuts"] or float(a["soft"]) >= 0:
+            raise ValueError("a thaw pass keeps its base's cuts and crossfade; cuts= and soft= do not apply")
+        thaw_info = _thaw_base(a["base"], a["base_model"])        # refused before anything is written
+    elif a["base"] or a["base_model"] or a["thaw"]:
+        raise ValueError("base=, base_model= and thaw= apply to the thaw variant")
+    else:
+        thaw_info = None
     if variant == "copies" and not a["source"]:
         raise ValueError("copies needs source=<the folder of a finished source job of the same seed>")
     if variant in ("tails", "grow") and not a["stem_from"]:
@@ -161,10 +214,14 @@ def _run(a: dict, det) -> dict:
     if variant == "grow" and (len(averages) != 1 or average_spec(averages[0][2])[1] != "g"):
         raise ValueError("grow installs one g average: avg= names exactly one g<number> (default g8)")
     to_score = scored_keys(a, averages)
+    if variant == "thaw" and not str(a["score_avg"]).strip():     # the judged reading of a thaw pass: its tail average
+        to_score = {k for k in to_score if k == "tail100"} or to_score
     cuts = parse_cuts(a["cuts"])
     if variant in ("source", "grow") and len(cuts) > 2:
         raise ValueError(f"{variant} trains one model over the whole range; cuts= applies to copies and tails")
     soft = float(a["soft"]) if float(a["soft"]) >= 0 else default_soft(cuts)
+    if thaw_info is not None:                                     # the base's own stages
+        cuts, soft = list(thaw_info["cuts"]), float(thaw_info["soft"])
     total = int(a["total"]) or DEFAULT_TOTAL[variant]
     torch.set_num_threads(int(a["threads"]))
     device = a["device"]
@@ -186,6 +243,8 @@ def _run(a: dict, det) -> dict:
     ranges = train_ranges(cuts, soft)
     if variant == "source":
         steps_plan = [("model", steps_of(total, scale))]
+    elif variant == "thaw":
+        steps_plan = [("thaw", steps_of(total, scale))]
     elif variant == "grow":
         steps_plan = [(f"block_{i}", steps_of(int(a["steps_each"]), scale)) for i in range(int(a["blocks"]))]
     else:
@@ -225,6 +284,7 @@ def _run(a: dict, det) -> dict:
     steps_block: Optional[List[dict]] = None
     as_source = None
     staged_averages: List[tuple] = []
+    thaw_block: Optional[dict] = None
     torch.manual_seed(seed)
     if variant == "source":
         name, n = steps_plan[0]
@@ -309,6 +369,67 @@ def _run(a: dict, det) -> dict:
             write_staged(os.path.join(out, "avg_" + key), folders, cuts, soft, info=dict(info, average=key))
         final, kind = load_job(out, device=device, kind="clusters")
         avg_folders = [(k, "avg_" + k) for k, _, _ in averages]
+    elif variant == "thaw":
+        name, n = steps_plan[0]
+        base_dir = os.path.join(a["base"], thaw_info["folder"])
+        as_source = source_read(a["base"], thaw_info["folder"], bed, heldout, device, log)
+        clustered = thaw_info["kind"] == "clusters"
+        model = link_staged(base_dir, device=device) if clustered else link(base_dir, device=device)
+        level = a["thaw"]
+        params = None
+        if level == "all":
+            trainable: Any = "all"
+        else:
+            trainable = list(thaw_info["trained"])
+            if level in ("1", "2"):
+                stem = (model.clusters[0] if clustered else model).unit("stem")
+                depth, k = len(stem.blocks), int(level)
+                if k > depth:
+                    raise ValueError(f"thaw={level} asks for more blocks than the stem's {depth}")
+                params = {"stem": [f"blocks.{i}." for i in range(depth - k, depth)]}
+        stream_seed = seed + GROW_STREAM * THAW_STREAM
+        log(f"PART {name}: the {thaw_info['variant']} build {base_dir}, thaw {level} (trainable {trainable}"
+            + (f", and {params}" if params else "") + f"); t in [0, 1), {n} steps; a new optimizer; the stream of "
+            f"seed {stream_seed}")
+        res = fit_units(model, bed, stream_seed, steps=n, trainable=trainable, trainable_params=params,
+                        t_range=(0.0, 1.0), expect_anchor_at_birth=False, averages=entries, **common)
+        units_all = [u for c in (model.clusters if clustered else [model]) for u in c.units]
+        if trainable == "all":
+            tr = sorted({u.name for u in units_all if u.unit_type != "Anchor"})
+        else:
+            tr = list(trainable) + (["stem"] if params else [])
+        row = part_row(name, list(thaw_info["clusters"]) if clustered else "model", res)
+        row["seconds_per_step"] = res["train_seconds"] / max(1, n)
+        row["stream_seed"] = stream_seed
+        parts.append(row)
+        progress(name, n)
+        avg_marks = {"loss_over_levels": None, "frozen_unchanged": res["frozen_unchanged"]}
+        if clustered:
+            folders = list(thaw_info["clusters"])
+            for c, rel in zip(model.clusters, folders):
+                export(c, rel, res, tr, base=os.path.join(base_dir, rel))
+            info = {"experiment": EXPERIMENT, "variant": variant, "seed": seed, "thaw": level}
+            write_staged(out, folders, cuts, soft, info=info)
+            for key, _, d in averages:
+                rec = average_recipe(res["recipe"], d)
+                with use_average(model, res["averaged"][d]):
+                    for c, rel in zip(model.clusters, folders):
+                        export_build(c, os.path.join(out, "avg_" + key, rel), seed=seed, base=os.path.join(base_dir, rel),
+                                     trained=tr, recipe=rec, data=data_block, marks=avg_marks)
+                write_staged(os.path.join(out, "avg_" + key), folders, cuts, soft, info=dict(info, average=key))
+            final, kind = load_job(out, device=device, kind="clusters")
+            avg_folders = [(k, "avg_" + k) for k, _, _ in averages]
+        else:
+            export(model, "model", res, tr, base=base_dir)
+            if averages:
+                export_averages(model, res, averages, out, lambda m, f, rec: export_build(
+                    m, os.path.join(out, f), seed=seed, base=base_dir, trained=tr, recipe=rec, data=data_block,
+                    marks=avg_marks))
+            final, kind = load_job(out, device=device, kind="model")
+            avg_folders = [(k, f) for k, f, _ in averages]
+        thaw_block = {"level": level, "base": a["base"], "base_model": thaw_info["folder"],
+                      "base_variant": thaw_info["variant"], "stream_seed": stream_seed, "trainable": trainable,
+                      "trainable_params": params, "trained_units": tr}
     else:                                                                  # grow
         stem_model = a["stem_model"] or "model"
         base = os.path.join(a["stem_from"], stem_model)
@@ -379,6 +500,8 @@ def _run(a: dict, det) -> dict:
         "as_source": as_source}
     if steps_block is not None:
         result["steps"] = steps_block
+    if thaw_block is not None:
+        result["thaw"] = thaw_block
     judged: Dict[str, Any] = {}
 
     def score_of(m, tag: str = "") -> dict:

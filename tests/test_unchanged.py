@@ -83,3 +83,66 @@ def test_T0_the_recorded_numbers_are_unchanged(which):
     now = json.loads(json.dumps(run_job(which, npz, root)))
     if which != "c_source":
         assert now == before[which], which
+
+
+# The seventh pass: thirteen more small jobs recorded from the library before that pass (MD_BEFORE7_JSON, run under
+# MD_T07_ROOT). A job's sources come first (the order of P7_ORDER); every job's numbers are recorded, sources included.
+P7_ORDER = ["a", "b", "c_source", "c", "d_rand", "d_shared", "e_source", "e", "f_source", "f1", "f3", "g", "h"]
+P7_FOLDERS = {k: "p7_" + k for k in P7_ORDER}
+P7_NEEDS = {"c": ["c_source"], "d_rand": ["b"], "d_shared": ["b"], "e": ["e_source"], "f1": ["f_source"],
+            "f3": ["f_source"], "g": ["c_source"]}
+
+
+def run_job7(which: str, npz: str, root: str) -> dict:
+    """One job of the seventh pass's record into root/p7_<which> -> its numbers."""
+    from geolip.modular_diffusion.experiments import closed_forms, content, stages, time_split
+    kw = dict(SMALL, data=npz, ref=os.path.join(root, "reference.npz"))
+    j = os.path.join(root, P7_FOLDERS[which])
+    src = lambda k: os.path.join(root, P7_FOLDERS[k])
+    if which == "a":
+        r = time_split.main(**dict(kw, variant="plain", out=j))
+    elif which == "b":
+        r = content.main(**dict(kw, variant="plain", out=j, avg="g8"))
+    elif which == "c_source":
+        r = content.main(**dict(kw, variant="blind", out=j, avg="g8"))
+    elif which == "c":
+        r = content.main(**dict(kw, variant="blind_experts_all", out=j, source=src("c_source"),
+                                source_model="model_avg_g8"))
+    elif which == "d_rand":
+        r = content.main(**dict(kw, variant="rand_start", out=j, source=src("b")))
+    elif which == "d_shared":
+        r = content.main(**dict(kw, variant="shared_start", out=j, source=src("b"), source_model="model_avg_g8"))
+    elif which == "e_source":
+        r = stages.main(**dict(kw, variant="source", out=j))
+    elif which == "e":
+        r = stages.main(**dict(kw, variant="copies", cuts="0.25,0.65", out=j, source=src("e_source")))
+    elif which == "f_source":
+        r = time_split.main(**dict(kw, variant="plain_d4", out=j, avg="g8"))
+    elif which == "f1":
+        r = stages.main(**dict(kw, variant="tails", out=j, stem_from=src("f_source"), stem_model="model_avg_g8"))
+    elif which == "f3":
+        r = stages.main(**dict(kw, variant="tails", cuts="0.25,0.65", out=j, stem_from=src("f_source"),
+                               stem_model="model_avg_g8"))
+    elif which == "g":
+        r = closed_forms.main(**dict(kw, variant="class_stage_heads", out=j, source=src("c_source"),
+                                     source_model="model_avg_g8", batches=20))
+    else:
+        r = time_split.main(**dict(kw, variant="tails_mixed", out=j, avg="g8"))
+    return _numbers(r, j)
+
+
+@pytest.mark.parametrize("which", P7_ORDER)
+def test_T0_the_numbers_recorded_before_the_seventh_pass_are_unchanged(which):
+    path = os.environ.get("MD_BEFORE7_JSON", "")
+    root = os.environ.get("MD_T07_ROOT", "")
+    npz = os.environ.get("MD_CIFAR_NPZ", "")
+    if not path or not root or not npz:
+        pytest.skip("MD_BEFORE7_JSON, MD_T07_ROOT or MD_CIFAR_NPZ is not set")
+    with open(path, encoding="utf-8") as fh:
+        before = json.load(fh)
+    os.makedirs(root, exist_ok=True)
+    for need in P7_NEEDS.get(which, []):
+        if not os.path.exists(os.path.join(root, P7_FOLDERS[need], "result.json")):
+            pytest.skip(f"run the job {need} first (it is the source of {which})")
+    now = json.loads(json.dumps(run_job7(which, npz, root)))
+    assert now == before[which], which

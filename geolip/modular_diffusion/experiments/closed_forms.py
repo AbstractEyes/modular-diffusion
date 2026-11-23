@@ -21,6 +21,16 @@ the frozen body's stored states.
 |                     | ``batches`` batches (``closed.part_equations``; the system is solved class by class)                 |
 | class_stage_heads   | source + thirty such heads: per class one per registered stage (the time split's cuts and crossfade), |
 |                     | the three of a class solved jointly                                                                  |
+| members_avg         | members_live on a finished job's ``source_model`` folder (for example its averaged weights): three    |
+|                     | band-kept members trained ``steps`` steps (6,000 when steps= is left at 1,500) through the live body |
+|                     | over the whole range, with the average(s) of ``avg`` (default g8; ``none``: no average)              |
+| member_all_avg      | the same with ONE member of the same structure over every band and no band filter (member_all)       |
+
+The class-head variants take ``classes`` (a comma list, for example 9: heads for those classes only; every other
+class's rows stay exactly the source's) and ``only_classes`` (the solve's stream draws only those classes' pictures).
+The member variants on an averaged body read each average as the last weights are read (with the independence ratio),
+score the last weights (``score_last``, default 1) and every average (``score_avg`` narrows it), with the class read
+when ``reader=1``, and report them under "averaged".
 
 members_live and members_cached at passes=1 use the same trainer settings (no member dropout, the trainer's default
 gradient equalization), so on one device they give the same curve and the same read.
@@ -28,7 +38,8 @@ gradient equalization), so on one device they give the same curve and the same r
 Arguments (key=value): those of the time split, plus batches (default 200), steps (default 1,500; times ``scale``, at
 least 2), ridge (1e-6), cache (a folder), passes (1), read (1), source_model (the folder of the source job used as the
 base, default model; when given, or for the class-head variants, the folder is read again first and recorded under
-"as_source"), reader (the class read on the scored pictures; needs score=1 and ref=), det. log_every defaults to 50.
+"as_source"), reader (the class read on the scored pictures; needs score=1 and ref=), det, classes, only_classes,
+avg, score_last, score_avg (the newer ones recorded only when given). log_every defaults to 50.
 The class-head variants also write by_class, class_worth and exact (one head left out: the largest change on the rows
 of the other classes, which must be 0.0, and the mean change on its own class's rows).
 
@@ -43,7 +54,7 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -63,27 +74,40 @@ from ..sample import sample_sheet
 from ..score import class_reader, make_judge, picture_score, reference_classes, reference_stats
 from ..train import fit_units, recipe
 from .content import class_numbers, exactness
-from .time_split import (CUTS, JUDGES, SOFT, TRAIN_RANGES, _levels, _marks, _part_row, _unique_numbers, load_job,
-                         recorded_args, source_read, steps_of, stored_key)
+from .time_split import (CUTS, JUDGES, SOFT, TRAIN_RANGES, _levels, _marks, _part_row, _unique_numbers, averages_cell,
+                         export_averages, load_job, parse_averages, recorded_args, scored_keys, source_read, steps_of,
+                         stored_key)
 
 EXPERIMENT = "closed_forms"
 VARIANTS = ("head_solved", "heads_staged_solved", "members_live", "cache_write", "members_cached")
 MEMBER_VARIANTS = ("members_live", "cache_write", "members_cached")
 CLASS_HEAD_VARIANTS = ("class_heads", "class_stage_heads")
-ALL_VARIANTS = VARIANTS + CLASS_HEAD_VARIANTS        # VARIANTS keeps the list of earlier versions
-NEW_DEFAULTS = {"reader": 0}
+AVG_MEMBER_VARIANTS = ("members_avg", "member_all_avg")
+ALL_VARIANTS = VARIANTS + CLASS_HEAD_VARIANTS + AVG_MEMBER_VARIANTS   # VARIANTS keeps the list of earlier versions
+NEW_DEFAULTS = {"reader": 0, "classes": "", "only_classes": ""}
+AVG_MEMBER_STEPS = 6000              # the member variants on an averaged body: their steps when steps= is left at 1,500
+AVG_MEMBER_AVG = "g8"                # and their average of record when avg= is empty
 
 DEFAULTS = dict(variant="", seed=0, data="", out="", device="cuda", heldout=2048, batch=128, lr=1e-3, warmup=100,
                 log_every=50, threads=4, mem_fraction=0.25, scale=1.0, dim=128, score=0, judge="inception",
                 score_n=10000, score_steps=50, ref="", sheet=1, source="", stem_from="", batches=200, steps=1500,
-                ridge=1e-6, cache="", passes=1, read=1, source_model="", reader=0, det="")
+                ridge=1e-6, cache="", passes=1, read=1, source_model="", reader=0, det="", classes="", only_classes="",
+                avg="", score_last=1, score_avg="")
 
 
-def class_head_groups(variant: str) -> List[dict]:
+def _class_list(text: str) -> Optional[List[int]]:
+    """``classes=`` text "9" or "3,9" -> [9] / [3, 9] (empty text: None)."""
+    items = [int(x) for x in str(text).split(",") if x.strip()]
+    if any(not 0 <= c < 10 for c in items):
+        raise ValueError(f"classes are 0 .. 9: {text!r}")
+    return items or None
+
+
+def class_head_groups(variant: str, classes: Optional[Sequence[int]] = None) -> List[dict]:
     """The parts a class-head variant adds (``forms.with_parts`` groups): class_heads, one depth-0 part per class over
     the whole range (class_head_c0 ..); class_stage_heads, one per class and registered stage (the time split's cuts
-    and crossfade; class_head_s0_c0 ..)."""
-    ten = [[c] for c in range(10)]
+    and crossfade; class_head_s0_c0 ..). ``classes``: only those classes' heads (default all ten)."""
+    ten = [[c] for c in range(10)] if classes is None else [[int(c)] for c in classes]
     if variant == "class_heads":
         return [dict(classes=ten, window=(0.0, 1.0), soft=0.0, depth=0, prefix="class_head")]
     return [dict(classes=ten, window=(CUTS[s], CUTS[s + 1]), soft=SOFT, depth=0, prefix=f"class_head_s{s}")
@@ -95,12 +119,21 @@ def members_model(source_model_folder: str, seed: int, bed) -> tuple:
     depth and width with 3 bands, the members appended (member_b0 .. member_b2), the stem and head adopted (hash
     checked) -> (model on the CPU, member names). The anchor (closed form, no trained numbers) is adopted as well, so
     its spectrum is the source's to the last digit whatever device measured the bed."""
+    return _members_on(source_model_folder, seed, bed, (0, 1, 2), True)
+
+
+def member_all_model(source_model_folder: str, seed: int, bed) -> tuple:
+    """As ``members_model`` with ONE member of the same structure over every band and no band filter (member_all)."""
+    return _members_on(source_model_folder, seed, bed, ("all",), False)
+
+
+def _members_on(source_model_folder: str, seed: int, bed, bands, keep: bool) -> tuple:
     src = read_build(source_model_folder)
     g = src.geometry
     depth = int(src.entry("stem").spec["depth"])
     build = cluster_build(bed.field_shape, stem_depth=depth, dim=int(g["dim"]), heads=int(g["heads"]), grid=int(g["grid"]),
                           anchor_in=int(src.entry("stem").spec.get("anchor_in", 0)), bands=3)
-    names = add_band_members(build, (0, 1, 2), depth=1, window=(0.0, 1.0), soft=0.0, keep=True)
+    names = add_band_members(build, bands, depth=1, window=(0.0, 1.0), soft=0.0, keep=keep)
     model = Model.born(build, seed, bed.spectrum)
     adopt(model, source_model_folder, ["anchor", "stem", "head"])
     return model, names
@@ -145,12 +178,24 @@ def _run(a: dict, det) -> dict:
     seed, scale = int(a["seed"]), float(a["scale"])
     batches, ridge = int(a["batches"]), float(a["ridge"])
     n = steps_of(int(a["steps"]), scale)
+    averages: List[tuple] = []
+    if variant in AVG_MEMBER_VARIANTS:
+        n = steps_of(AVG_MEMBER_STEPS if int(a["steps"]) == DEFAULTS["steps"] else int(a["steps"]), scale)
+        avg_text = a["avg"] or AVG_MEMBER_AVG
+        averages = [] if avg_text == "none" else parse_averages(avg_text)
+    elif a["avg"]:
+        raise ValueError(f"avg= applies to the member variants on an averaged body {list(AVG_MEMBER_VARIANTS)}")
+    to_score = scored_keys(a, averages)
+    only_cls = _class_list(a["only_classes"])
+    pick = _class_list(a["classes"])
+    if (only_cls or pick) and variant not in CLASS_HEAD_VARIANTS:
+        raise ValueError(f"classes= and only_classes= apply to the class-head variants {list(CLASS_HEAD_VARIANTS)}")
     source_model = a["source_model"] or "model"
     base = os.path.join(a["source"], source_model)
     log(f"JOB {EXPERIMENT} {variant} seed {seed}: source {a['source']}" + (f" ({source_model})" if a["source_model"] else "")
         + "; "
-        + (f"{batches} batches" if variant not in MEMBER_VARIANTS else f"{n} steps") + f", on {device}; "
-        f"torch {torch.__version__}; out {out}")
+        + (f"{batches} batches" if variant not in MEMBER_VARIANTS + AVG_MEMBER_VARIANTS else f"{n} steps")
+        + f", on {device}; torch {torch.__version__}; out {out}")
     t_job = time.time()
     bed = PicturesBed(a["data"], device, grid=16)
     data_block = {"bed": "pictures", "source": os.path.basename(a["data"]), "content_hash": npz_content_hash(a["data"]),
@@ -170,10 +215,15 @@ def _run(a: dict, det) -> dict:
         result["as_source"] = source_read(a["source"], source_model, bed, heldout, device, log)
 
     if variant in CLASS_HEAD_VARIANTS:
-        model, names = with_parts(base, seed, class_head_groups(variant), device=device)
-        log(f"PART {len(names)} class head(s) with no block on {base}; solved on {batches} batches")
+        model, names = with_parts(base, seed, class_head_groups(variant, pick), device=device)
+        solve_bed = bed
+        if only_cls:                               # the stream draws only these classes' pictures
+            solve_bed = bed.restricted(only_classes=only_cls)
+            data_block["training_stream"] = {"only_classes": list(solve_bed.only_classes)}
+        log(f"PART {len(names)} class head(s) with no block on {base}; solved on {batches} batches"
+            + (f" of the classes {only_cls}" if only_cls else ""))
         t0 = time.time()
-        eq = part_equations(model, bed, seed, batches, names, batch=int(a["batch"]), cond_drop=0.1)
+        eq = part_equations(model, solve_bed, seed, batches, names, batch=int(a["batch"]), cond_drop=0.1)
         solution = solve_parts(eq, ridge)
         prov = install_parts(model, solution, eq)
         result["train_seconds"] = time.time() - t0
@@ -219,6 +269,25 @@ def _run(a: dict, det) -> dict:
             result["kind"] = "clusters"
             final, _ = load_job(out, device=device, kind="clusters")
         result["train_seconds"] = time.time() - t0
+    elif variant in AVG_MEMBER_VARIANTS:
+        make = members_model if variant == "members_avg" else member_all_model
+        model, names = make(base, seed, bed)
+        model.to(device)
+        log(f"PART members: {names} through the live frozen body of {base}; {n} steps"
+            + (f"; averages {[k for k, _, _ in averages]}" if averages else ""))
+        res = fit_units(model, bed, seed, steps=n, trainable=names, mdrop=0.0, equalize=True,
+                        expect_anchor_at_birth=False, averages=tuple(d for _, _, d in averages), **common)
+        export_build(model, os.path.join(out, "model"), seed=seed, trained=names, recipe=res["recipe"], data=data_block,
+                     marks=_marks(res))
+        if averages:
+            export_averages(model, res, averages, out, lambda m, f, rec: export_build(
+                m, os.path.join(out, f), seed=seed, trained=names, recipe=rec, data=data_block,
+                marks={"loss_over_levels": None, "frozen_unchanged": res["frozen_unchanged"]}))
+        result["parts"] = [_part_row("members", "model", res)]
+        result["curve"] = res["curve"]
+        result["train_seconds"] = res["train_seconds"]
+        result["seconds_per_step"] = res["train_seconds"] / max(1, n)
+        final, _ = load_job(out, device=device, kind="model")
     else:
         model, names = members_model(base, seed, bed)
         model.to(device)
@@ -292,24 +361,47 @@ def _run(a: dict, det) -> dict:
             names = [u.name for u in final.members]
             result["exact"] = exactness(final, bed, heldout, device, names[0])
             log(f"EXACT {names[0]} left out: other classes' rows change at most {result['exact']['others_max_abs']!r}")
-        if int(a["score"]):
+        judged: Dict[str, Any] = {}
+
+        def score_of(m, tag: str = "") -> dict:
+            # a failure of the judge (its weights, its memory) is recorded and the job still ends with its losses
             n_score = int(a["score_n"])
             try:
-                judge = make_judge(a["judge"], device)
-                rdr = None
-                if int(a["reader"]):
-                    ref_all = reference_classes(bed, judge, a["ref"] or None, batch=1000)
-                    ref = (ref_all["mu"], ref_all["cov"], ref_all["n"])
-                    rdr = class_reader(ref_all)
-                else:
-                    ref = reference_stats(bed, judge, a["ref"] or None, batch=1000)
-                result["score"] = picture_score(final, bed, judge, ref, n=n_score, steps=int(a["score_steps"]),
-                                                batch=min(1000, n_score), device=device, reader=rdr)
-                log(f"SCORE {result['score']['score']:.4f} on {n_score} pictures ({result['score']['judge']})"
-                    + (f"; class read {result['score']['class_read']['accuracy']:.4f}" if rdr is not None else ""))
+                if "judge" not in judged:
+                    judge = make_judge(a["judge"], device)
+                    rdr = None
+                    if int(a["reader"]):
+                        ref_all = reference_classes(bed, judge, a["ref"] or None, batch=1000)
+                        ref = (ref_all["mu"], ref_all["cov"], ref_all["n"])
+                        rdr = class_reader(ref_all)
+                    else:
+                        ref = reference_stats(bed, judge, a["ref"] or None, batch=1000)
+                    judged.update(judge=judge, ref=ref, reader=rdr)
+                rdr = judged["reader"]
+                sc = picture_score(m, bed, judged["judge"], judged["ref"], n=n_score, steps=int(a["score_steps"]),
+                                   batch=min(1000, n_score), device=device, reader=rdr)
+                log(f"SCORE{tag} {sc['score']:.4f} on {n_score} pictures ({sc['judge']})"
+                    + (f"; class read {sc['class_read']['accuracy']:.4f}" if rdr is not None else ""))
+                return sc
             except Exception as e:
-                result["score"] = {"error": repr(e)}
-                log(f"SCORE not computed: {e!r}")
+                log(f"SCORE{tag} not computed: {e!r}")
+                return {"error": repr(e)}
+
+        if int(a["score"]) and (variant not in AVG_MEMBER_VARIANTS or int(a["score_last"])):
+            result["score"] = score_of(final)
+        if variant in AVG_MEMBER_VARIANTS:
+            result["averaged"] = {}
+            for key, folder, _ in averages:
+                avg_model = link(os.path.join(out, folder), device=device)
+                log(f"READ the average {key} ({folder})")
+                r = read(avg_model, bed, heldout, device)
+                scored = int(a["score"]) and key in to_score
+                result["averaged"][key] = {
+                    "loss_over_levels": r["loss_over_levels"], "by_level": _levels(r), "by_stage": by_stage(r, CUTS),
+                    "independence_ratio_over_levels": r["independence_ratio_over_levels"],
+                    "score": score_of(avg_model, f" (average {key})") if scored else None}
+                log(f"AVERAGE {key}: over ten levels {r['loss_over_levels']:.4f}; independence "
+                    f"{r['independence_ratio_over_levels']}")
         if int(a["sheet"]):
             sample_sheet(final, bed, os.path.join(out, "samples.png"), device)
     # the newer options are recorded only when given, so a job without them writes the result of earlier versions
@@ -339,8 +431,10 @@ def summarize(root: str) -> str:
             if r.get("experiment") == EXPERIMENT:
                 rows.append(r)
     rows.sort(key=lambda r: (r["variant"], r["seed"]))
-    lines = ["| variant | seed | as trained | total | by stage | solved mse (after) | s / step | cache bytes | score |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    with_avg = any(r.get("averaged") for r in rows)          # the member variants on an averaged body
+    lines = ["| variant | seed | as trained | total | by stage | solved mse (after) | s / step | cache bytes | score |"
+             + (" averages (total / score) |" if with_avg else ""),
+             "|---|---|---|---|---|---|---|---|---|" + ("---|" if with_avg else "")]
     for r in rows:
         stages = " / ".join(_fmt(x) for x in r["by_stage"]) if r.get("by_stage") else "-"
         trained = _fmt((r.get("as_trained") or {}).get("loss_over_levels"))
@@ -353,7 +447,8 @@ def summarize(root: str) -> str:
         sc = r.get("score") or {}
         score = _fmt(sc["score"], 2) if sc.get("score") is not None else "-"
         lines.append(f"| {r['variant']} | {r['seed']} | {trained} | {_fmt(r.get('loss_over_levels'))} | {stages} | {mse} | "
-                     f"{_fmt(r.get('seconds_per_step'))} | {cache} | {score} |")
+                     f"{_fmt(r.get('seconds_per_step'))} | {cache} | {score} |"
+                     + (f" {averages_cell(r.get('averaged'))} |" if with_avg else ""))
     return "\n".join(lines) + "\n"
 
 
