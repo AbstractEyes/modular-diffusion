@@ -116,10 +116,19 @@ def _need(kind: str, want: str, role: str, folder: str) -> None:
         raise ValueError(f"{role}={folder} is a {kind} job; this variant needs a {want} job")
 
 
+def _check_cuts(model, kind: str, role: str, folder: str) -> None:
+    """A cluster job read here holds the experiment's stages: its cuts must be CUTS (ValueError otherwise)."""
+    if kind == "clusters" and [float(c) for c in model.cuts] != [float(c) for c in CUTS]:
+        raise ValueError(f"{role}={folder} holds the cuts {model.cuts}; the chain reads need {list(CUTS)}")
+
+
 def assemble(a: dict, device) -> tuple:
-    """The model a variant reads -> (model, grid or None, a line describing it)."""
+    """The model a variant reads -> (model, grid or None, a line describing it). A job folder may also be a folder
+    that itself holds a staged file (for example a stages job's averaged tree <job>/avg_tail100); a cluster job's cuts
+    must be the experiment's."""
     variant = a["variant"]
     base, base_kind = load_job(a["base"], device=device)
+    _check_cuts(base, base_kind, "base", a["base"])
     if variant == "steps":
         grid = plan_grid(a["plan"], int(a["n"]))
         return base, grid, f"the {base_kind} job as it is; plan {a['plan']}, {len(grid) - 1} steps"
@@ -127,6 +136,7 @@ def assemble(a: dict, device) -> tuple:
         _need(base_kind, "model", "base", a["base"])
         donor, donor_kind = load_job(a["donor"], device=device)
         _need(donor_kind, "clusters", "donor", a["donor"])
+        _check_cuts(donor, donor_kind, "donor", a["donor"])
         k = int(a["stage"])
         if len(donor.clusters) != len(CUTS) - 1:
             raise ValueError(f"the donor holds {len(donor.clusters)} clusters, not {len(CUTS) - 1}")
@@ -140,6 +150,7 @@ def assemble(a: dict, device) -> tuple:
         return Staged(list(base.clusters), base.cuts, w), None, f"the base's clusters with the half-width {w:g}"
     donor, donor_kind = load_job(a["donor"], device=device)
     _need(donor_kind, "clusters", "donor", a["donor"])
+    _check_cuts(donor, donor_kind, "donor", a["donor"])
     if len(donor.clusters) != len(base.clusters):
         raise ValueError(f"the donor holds {len(donor.clusters)} clusters, the base {len(base.clusters)}")
     k = int(a["stage"])

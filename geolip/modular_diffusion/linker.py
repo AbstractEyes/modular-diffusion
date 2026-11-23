@@ -133,8 +133,17 @@ def _at_birth(card: UnitCard, h: str) -> bool:
     return bool(card.birth.get("hash")) and card.birth.get("hash") == h
 
 
-def check(build: Build, cards: Dict[str, UnitCard], hashes: Dict[str, str]) -> Dict[str, List[str]]:
-    """Rule 3 and the marks -> {unit: [reasons]} (empty when the build links)."""
+def grafted_onto(card: UnitCard) -> Dict[str, str]:
+    """The units a grafted part was put onto, as {name: content hash} (its card's recipe "graft" "onto"; empty for a
+    unit that is no graft). Its recorded parents stay the units it was trained with."""
+    g = (card.recipe or {}).get("graft") or {}
+    return dict(g.get("onto") or {})
+
+
+def check(build: Build, cards: Dict[str, UnitCard], hashes: Dict[str, str], grafts: bool = False) -> Dict[str, List[str]]:
+    """Rule 3 and the marks -> {unit: [reasons]} (empty when the build links). With ``grafts`` an interacting pair is
+    also vouched when one card is a graft's and records the other's current hash as a unit it was put onto
+    (``grafted_onto``); off by default."""
     bad: Dict[str, List[str]] = {}
     names = set(build.names())
     for e in build.units:
@@ -145,6 +154,8 @@ def check(build: Build, cards: Dict[str, UnitCard], hashes: Dict[str, str]) -> D
         ca, cb = cards[a], cards[b]
         ok = (ca.parents.get(b) == hashes[b] or cb.parents.get(a) == hashes[a]
               or _at_birth(ca, hashes[a]) or _at_birth(cb, hashes[b]))
+        if not ok and grafts:
+            ok = grafted_onto(ca).get(b) == hashes[b] or grafted_onto(cb).get(a) == hashes[a]
         if not ok:
             for x, y in ((a, b), (b, a)):
                 bad.setdefault(x, []).append(f"interacts with {y!r} and neither card records the other's current hash")
@@ -175,9 +186,10 @@ def _weights_path(build: Build, e: UnitEntry) -> str:
 
 
 # ------------------------------------------------------------------ rule 4: link
-def link(build_path: Union[str, Build], device="cpu", strict: bool = True):
+def link(build_path: Union[str, Build], device="cpu", strict: bool = True, grafts: bool = False):
     """The model of a build folder. Every file is checked against its build entry and card (always); rule 3 and the
-    marks raise StaleUnit when ``strict``, and are reported in ``model.link_report`` either way."""
+    marks raise StaleUnit when ``strict``, and are reported in ``model.link_report`` either way. ``grafts``: a grafted
+    part (trained on another parent, put onto this one; ``check``) is vouched by its graft record; off by default."""
     b = _open(build_path)
     b.validate()
     units, cards, hashes = [], {}, {}
@@ -206,7 +218,7 @@ def link(build_path: Union[str, Build], device="cpu", strict: bool = True):
             raise StaleUnit(e.name, f"its tensors do not fit the geometry: {err}") from None
         units.append(unit)
         cards[e.name], hashes[e.name] = card, h
-    bad = check(b, cards, hashes)
+    bad = check(b, cards, hashes, grafts=True) if grafts else check(b, cards, hashes)
     if bad and strict:
         first = next(n for n in b.names() if n in bad)
         raise StaleUnit(first, "; ".join(bad[first]), [n for n in b.names() if n in bad])

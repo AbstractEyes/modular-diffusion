@@ -187,18 +187,31 @@ def _sequential_sum(parts: dict, like: torch.Tensor) -> torch.Tensor:
     return v
 
 
+def _unit_named(model, name: str):
+    """A unit of a model, or of the first cluster of a staged model that holds it (its copies in other clusters share
+    its address)."""
+    clusters = getattr(model, "clusters", None)
+    if clusters is None:
+        return model.unit(name)
+    for c in clusters:
+        if name in c.build.names():
+            return c.unit(name)
+    raise KeyError(f"no unit named {name!r} in the staged model")
+
+
 @torch.no_grad()
 def exactness(model, bed, heldout: int, device, expert: str) -> Dict[str, Any]:
     """One expert left out against in, on the read's fixed noise (the first LEVEL_ITEMS held-out items at the ten
     levels): the largest absolute change of a row's error over the rows of the other classes (0.0 when the expert is
     exactly silent there) and the mean change (out minus in) over its own class's rows. For a symbol-gated part the
-    rows are read with the read's fixed symbols and its own rows are those of its symbols."""
+    rows are read with the read's fixed symbols and its own rows are those of its symbols. A staged model (a tree)
+    leaves the expert out of every cluster."""
     model.eval()
     z1, cls = bed.heldout(heldout)
     gen = torch.Generator(device=device).manual_seed(READ_SEED)
     z0 = torch.randn(z1.shape, generator=gen, device=device)
     n_lv = min(z1.shape[0], LEVEL_ITEMS)
-    unit = model.unit(expert)
+    unit = _unit_named(model, expert)
     sym = read_symbols(model, z1.shape[0], device)
     label = sym if getattr(unit, "symbol_gate", False) else cls
     own_classes = torch.tensor(list(unit.classes), device=label.device, dtype=label.dtype)

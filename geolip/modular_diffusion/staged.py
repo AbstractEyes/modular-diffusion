@@ -70,12 +70,14 @@ class Staged(nn.Module):
                         and torch.equal(c.anchor.spectra.cpu(), first.anchor.spectra.cpu()))):
                     raise ValueError("the clusters' anchors hold different class statistics")
         self.adds_anchor = bool(all(adds))
-        seen: Dict[str, int] = {}
+        seen: Dict[str, Any] = {}
         for c in clusters:
             for m in c.members:
-                if m.name in seen and seen[m.name] != id(m):
+                # a member of one name in several clusters: one object, or each cluster's own copy of one part (the
+                # same type, address and spec, other weights; its outputs are blended by the stage weights by name)
+                if m.name in seen and seen[m.name] is not m and _entry_key(seen[m.name]) != _entry_key(m):
                     raise ValueError(f"two clusters hold different members named {m.name!r}")
-                seen[m.name] = id(m)
+                seen.setdefault(m.name, m)
         self.clusters = nn.ModuleList(clusters)
         self.cuts: List[float] = cuts
         self.soft = float(soft)
@@ -192,6 +194,11 @@ class Staged(nn.Module):
 
 
 # ------------------------------------------------------------------ sharing, files
+def _entry_key(unit) -> str:
+    """A unit's type, address and spec as one text (two copies of one part agree on it)."""
+    return json.dumps([unit.unit_type, unit.address, unit.spec], sort_keys=True)
+
+
 def _device_of(model) -> torch.device:
     return next((x.device for x in list(model.parameters()) + list(model.buffers())), torch.device("cpu"))
 
@@ -248,12 +255,16 @@ def read_staged(folder: str) -> dict:
     return d
 
 
-def link_staged(folder: str, device="cpu", strict: bool = True) -> Staged:
+def link_staged(folder: str, device="cpu", strict: bool = True, grafts: bool = False) -> Staged:
     """The staged model of a folder: every cluster through ``linker.link``; units with equal (type, name, content hash)
     across clusters become one object. With ``strict`` a unit listed as shared must have its recorded hash in every
-    cluster (StaleUnit otherwise)."""
+    cluster (StaleUnit otherwise). ``grafts``: passed to ``linker.link`` (grafted parts vouched by their graft record;
+    off by default)."""
     d = read_staged(folder)
-    linked = [link(os.path.join(folder, rel), device=device, strict=strict) for rel in d["clusters"]]
+    if grafts:
+        linked = [link(os.path.join(folder, rel), device=device, strict=strict, grafts=True) for rel in d["clusters"]]
+    else:
+        linked = [link(os.path.join(folder, rel), device=device, strict=strict) for rel in d["clusters"]]
     if strict:
         for name, h in d.get("shared", {}).items():
             for rel, m in zip(d["clusters"], linked):

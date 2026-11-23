@@ -10,7 +10,9 @@ The matrix library's fixed workspace has to be in the environment before anythin
 before torch is imported.
 
 The fourth function (the address frame, identity-born and solve-born parts, the thaw pass, members on an averaged body)
-also runs on the CPU with MD_TEST_DEVICE=cpu, which checks its logic where no card is free; only a card checks a card."""
+also runs on the CPU with MD_TEST_DEVICE=cpu, which checks its logic where no card is free; only a card checks a card.
+So does the fifth (parts in a tree of stage copies, a row of the class table as a part, grafts, chain reads on an
+averaged tree)."""
 import os
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -303,3 +305,56 @@ def test_frame_births_thaw_and_members_on_the_card(synthetic_npz, tmp_path):
     ref = stages.main(**dict(small, variant="source", out=str(sroot / "ref_long"), total=6500, avg="g8,tail100", reader=1,
                              score_last=0, score_avg="tail100"))
     assert "class_read" in ref["averaged"]["tail100"]["score"] and ref["averaged"]["g8"]["score"] is None
+
+
+def test_tree_parts_grafts_and_chain_reads_on_the_card(synthetic_npz, tmp_path):
+    """Every job with det=on. A blind source born with ten parts and copies of it; parts born at the fork of a plain
+    source; the five parts specs on a finished tree; a graft without training and one with; one stage's parts for every
+    stage; the chain read on an averaged tree; one job repeated gives the same numbers."""
+    from geolip.modular_diffusion.experiments import stages
+    small = dict(SMALL, device=DEV, data=synthetic_npz, ref=str(tmp_path / "reference.npz"), det="on", score=0,
+                 sheet=0)
+    j = lambda n: str(tmp_path / n)
+    sp = stages.main(**dict(small, variant="source", out=j("src_blind_parts"), class_window="blind",
+                            parts="experts10"))
+    assert sp["device"] == DEV and sp["birth_gap"] == 0.0 and sp["exact"]["others_max_abs"] == 0.0
+    cp = stages.main(**dict(small, variant="copies", cuts="0.25,0.65", out=j("cop_parts"), source=j("src_blind_parts")))
+    assert cp["exact"]["others_max_abs"] == 0.0 and "parts_off" in cp
+    stages.main(**dict(small, variant="source", out=j("src")))
+    fork = stages.main(**dict(small, variant="copies", cuts="0.25,0.65", out=j("fork"), source=j("src"),
+                              parts="shared1"))
+    assert all(p["birth_gap"] == 0.0 and p["optimizer_new"] for p in fork["parts"])
+    stages.main(**dict(small, variant="copies", cuts="0.25,0.65", out=j("cop"), source=j("src")))
+    stages.main(**dict(small, variant="copies", cuts="0.25,0.65", out=j("sib"), source=j("src"), stream=1))
+    stages.main(**dict(small, variant="copies", out=j("one"), source=j("src")))
+    res = {}
+    for spec in ("experts10", "shared1", "expert:9", "row:9", "row+expert:9"):
+        kw = dict(only_classes="9") if ":" in spec else {}
+        tag = spec.replace(":", "_").replace("+", "_")
+        res[spec] = stages.main(**dict(small, variant="parts", out=j("p_" + tag), base=j("cop"), parts=spec, **kw))
+        r = res[spec]
+        assert r["device"] == DEV and r["as_source"]["equals_stored"] is True, spec
+        assert r["parts_off"]["equals_base"] is True and r["exact"]["others_max_abs"] == 0.0, spec
+        if spec.startswith("row"):
+            assert r["row_birth_gap"] == 0.0 and all(p["rows_frozen_equal"] for p in r["parts"]), spec
+        else:
+            assert r["birth_gap"] == 0.0, spec
+    again = stages.main(**dict(small, variant="parts", out=j("p_row_9_again"), base=j("cop"), parts="row:9",
+                               only_classes="9"))
+    assert again["loss_over_levels"] == res["row:9"]["loss_over_levels"]
+    assert again["averaged"]["g8"]["loss_over_levels"] == res["row:9"]["averaged"]["g8"]["loss_over_levels"]
+    graft = dict(small, variant="parts", parts="row+expert:9", only_classes="9", init_from=j("p_row_expert_9"))
+    g0 = stages.main(**dict(graft, out=j("g0"), base=j("cop"), total=0))
+    assert g0["graft"]["parents_equal"] == [True, True, True]
+    assert g0["averaged"]["g8"]["loss_over_levels"] == res["row+expert:9"]["averaged"]["g8"]["loss_over_levels"]
+    g1 = stages.main(**dict(graft, out=j("g1"), base=j("sib"), total=300))
+    assert False in g1["graft"]["parents_equal"] and g1["exact"]["others_max_abs"] == 0.0
+    stages.main(**dict(small, variant="parts", out=j("row_one"), base=j("one"), parts="row:9", only_classes="9"))
+    gs = stages.main(**dict(small, variant="parts", out=j("g_stage0"), base=j("cop"), parts="row:9", only_classes="9",
+                            init_from=j("row_one"), init_stage=0, total=0))
+    assert gs["exact"]["others_max_abs"] == 0.0 and gs["graft"]["init_stage"] == 0
+    stages.main(**dict(small, variant="source", seed=1, out=j("src1")))
+    stages.main(**dict(small, variant="copies", seed=1, cuts="0.25,0.65", out=j("cop1"), source=j("src1")))
+    tw = chain_reads.main(variant="twin", base=j("cop") + "/avg_tail100", donor=j("cop1") + "/avg_tail100", stage=1,
+                          data=synthetic_npz, out=j("twin"), device=DEV, heldout=64, score=0, det="on")
+    assert isinstance(tw["loss_over_levels"], float)

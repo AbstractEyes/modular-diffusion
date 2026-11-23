@@ -198,10 +198,11 @@ def _unique_numbers(model) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
-def load_job(folder: str, device="cpu", kind: Optional[str] = None):
+def load_job(folder: str, device="cpu", kind: Optional[str] = None, grafts: bool = False):
     """A finished job folder of this experiment as a model -> (model, kind): its ``model/`` build folder linked strictly
     (kind "model"), or its ``staged.json`` with the cluster folders (kind "clusters", a ``Staged``). Without ``kind`` the
-    folder decides: a staged file means clusters."""
+    folder decides: a staged file means clusters. ``grafts``: grafted parts are vouched by their graft record
+    (``linker.check``; off by default)."""
     if kind is None:
         if os.path.exists(os.path.join(folder, STAGED_FILE)):
             kind = "clusters"
@@ -210,8 +211,12 @@ def load_job(folder: str, device="cpu", kind: Optional[str] = None):
         else:
             raise ValueError(f"{folder} holds neither a staged file nor a model folder")
     if kind == "clusters":
+        if grafts:
+            return link_staged(folder, device=device, grafts=True), kind
         return link_staged(folder, device=device), kind
     if kind == "model":
+        if grafts:
+            return link(os.path.join(folder, "model"), device=device, grafts=True), kind
         return link(os.path.join(folder, "model"), device=device), kind
     raise ValueError(f"unknown kind {kind!r}; known: model, clusters")
 

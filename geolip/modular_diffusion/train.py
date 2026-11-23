@@ -125,19 +125,25 @@ def adam_state(opt, model, step: int, lr: float) -> Dict[str, Any]:
     return out
 
 
-def load_adam_state(opt, model, state: Dict[str, Any]) -> None:
+def load_adam_state(opt, model, state: Dict[str, Any], partial: bool = False) -> List[str]:
     """Load a state of ``adam_state`` into a newly made Adam over the model's trainable parameters, by parameter name.
     Every name of the state must be a trainable parameter and every trainable parameter must be in the state (a
-    KeyError names the difference)."""
+    KeyError names the difference). With ``partial`` a trainable parameter that has no entry in the state is left
+    without optimizer state (Adam makes its moments at that parameter's first step); a name in the state that is not a
+    trainable parameter still raises. Returns the sorted names of the trainable parameters left without state."""
     named = dict(_trainable_named(model))
     have = set(state["m"])
-    if have != set(named):
+    only_state, only_trainable = have - set(named), set(named) - have
+    if only_state or (only_trainable and not partial):
         raise KeyError(f"the optimizer state and the trainable parameters differ: only in the state "
-                       f"{sorted(have - set(named))[:5]}, only trainable {sorted(set(named) - have)[:5]}")
+                       f"{sorted(only_state)[:5]}, only trainable {sorted(only_trainable)[:5]}")
     for n, p in named.items():
+        if n not in have:
+            continue
         opt.state[p] = {"step": torch.tensor(float(state["t"][n]), dtype=_scalar_dtype()),
                         "exp_avg": state["m"][n].detach().to(device=p.device, dtype=p.dtype).clone(),
                         "exp_avg_sq": state["v"][n].detach().to(device=p.device, dtype=p.dtype).clone()}
+    return sorted(only_trainable)
 
 
 def write_state(folder: str, state: Dict[str, Any], extra: Optional[Dict[str, Any]] = None) -> None:
@@ -180,7 +186,7 @@ def run_loop(model, bed, seed: int, steps: int, lr: float, warmup: int, batch: i
              t_sampling: str, t_range: Sequence[float], equalize_members, device, log: Callable[[str], None], log_every: int,
              at_step: Optional[Callable[[int], None]] = None, t_mix: float = 0.0, start_step: int = 0,
              optimizer_state: Optional[Dict[str, Any]] = None,
-             state_out: Optional[Dict[str, Any]] = None) -> Tuple[List[list], float]:
+             state_out: Optional[Dict[str, Any]] = None, optimizer_partial: bool = False) -> Tuple[List[list], float]:
     """The training loop of the recipe over the model's trainable parameters -> (curve [[step, loss], ...], seconds).
 
     t_range and t_mix: see ``Model.draw``. A step whose loss reaches no trained unit is skipped. ``at_step(steps done)`` is called after each step that trained.
@@ -190,7 +196,9 @@ def run_loop(model, bed, seed: int, steps: int, lr: float, warmup: int, batch: i
     takes the learning rate lr min(1, (s + 1) / max(1, warmup)) and the stream ``step_generator(seed, s)``. With
     ``optimizer_state`` (``adam_state``) the Adam over the trainable parameters is loaded from it by parameter name
     before the first step. The curve's step numbers and ``at_step`` stay local (0 .. steps - 1). With ``state_out`` (a
-    dict) the optimizer's state at the end is put into it. start_step=0 and no state is the loop of earlier versions."""
+    dict) the optimizer's state at the end is put into it. start_step=0 and no state is the loop of earlier versions.
+    ``optimizer_partial``: the state may lack trainable parameters (``load_adam_state(partial=True)``); those start
+    without moments at the continued run's learning rate (no new warm-up)."""
     params = [p for p in model.parameters() if p.requires_grad]
     curve: List[list] = []
     t0 = time.time()
@@ -199,7 +207,10 @@ def run_loop(model, bed, seed: int, steps: int, lr: float, warmup: int, batch: i
         return curve, time.time() - t0
     opt = torch.optim.Adam(params, lr=lr, betas=BETAS, eps=EPS, weight_decay=0.0)
     if optimizer_state is not None:
-        load_adam_state(opt, model, optimizer_state)
+        if optimizer_partial:
+            load_adam_state(opt, model, optimizer_state, partial=True)
+        else:
+            load_adam_state(opt, model, optimizer_state)
     model.train()
     for step in range(steps):
         s = start_step + step
@@ -287,6 +298,43 @@ def set_trainable_params(model, params: Dict[str, Sequence[str]]) -> None:
             raise KeyError(f"the unit {name!r} holds no parameter whose name starts with {missing}")
 
 
+def _row_parameters(model, spec: Dict[str, Dict[str, Sequence[int]]]) -> List[Dict[str, Any]]:
+    """The parameters of ``fit_units(trainable_rows=)``: one entry per distinct parameter object -> {"unit", "pname",
+    "name" (its name in the model), "param", "rows", "listed" (a bool mask over the first axis), "mask" (the 0/1
+    gradient mask), "before" (a copy of its values)}. An unknown unit or parameter, or a row out of range, raises."""
+    units = _all_units(model)
+    full = {id(p): n for n, p in model.named_parameters()}
+    out, seen = [], set()
+    for uname, params in spec.items():
+        hits = [u for u in units if u.name == uname]
+        if not hits:
+            raise KeyError(f"no unit named {uname!r} in the model")
+        for pname, ix in params.items():
+            ix = sorted({int(i) for i in ix})
+            for u in hits:
+                named = dict(u.named_parameters())
+                if pname not in named:
+                    raise KeyError(f"the unit {uname!r} holds no parameter named {pname!r}")
+                p = named[pname]
+                if id(p) in seen:
+                    continue
+                seen.add(id(p))
+                if not ix or ix[0] < 0 or ix[-1] >= p.shape[0]:
+                    raise ValueError(f"rows {ix} do not fit the first axis of {uname}.{pname} ({p.shape[0]})")
+                listed = torch.zeros(p.shape[0], dtype=torch.bool, device=p.device)
+                listed[ix] = True
+                mask = listed.to(p.dtype).view((-1,) + (1,) * (p.dim() - 1))
+                out.append({"unit": uname, "pname": pname, "name": full[id(p)], "param": p, "rows": ix,
+                            "listed": listed, "mask": mask, "before": p.detach().clone()})
+    return out
+
+
+def _row_mask_hook(mask: torch.Tensor):
+    def hook(grad):
+        return grad * mask.to(device=grad.device, dtype=grad.dtype)
+    return hook
+
+
 def recipe(lr: float, warmup: int, batch: int, steps: int, t_sampling: str, t_range: Sequence[float], cond_drop: float,
            flip: bool, equalize_members: bool, mdrop: float, device, t_mix: float = 0.0) -> Dict[str, Any]:
     """The card recipe of a run of ``run_loop``."""
@@ -306,7 +354,8 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
               start_step: int = 0, optimizer_state: Optional[Dict[str, Any]] = None, keep_state: bool = False,
               average_start: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
               average_step: Optional[int] = None,
-              trainable_params: Optional[Dict[str, Sequence[str]]] = None) -> dict:
+              trainable_params: Optional[Dict[str, Sequence[str]]] = None, optimizer_partial: bool = False,
+              trainable_rows: Optional[Dict[str, Dict[str, Sequence[int]]]] = None) -> dict:
     """Train the named units of a model (a Model or a Staged) with the recipe and read it.
 
     averages: decays d and named averages. For each, a float32 copy of every trainable parameter (on its device, no
@@ -332,6 +381,22 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
     the named units); every other parameter stays frozen and is checked bit for bit. The result then also holds
     "trainable_params" (absent otherwise).
 
+    A continued state that covers only some trainable parameters: ``optimizer_partial`` (``run_loop``); when the state
+    lacked any, the result records recipe "optimizer_state": "continued, partial" and "optimizer_new" (the sorted names
+    of the trainable parameters the state did not hold; with a state that holds them all nothing is recorded). A carried average that lacks a trainable parameter raises a KeyError, except
+    with ``optimizer_partial``: then that parameter's average starts from its value before the first step and its k
+    counts from that first step (k = 0, 1, ..., the arithmetic of an average that is not carried); the result records
+    "average_new" {average: [those names]}.
+
+    Rows of a table as the only trainable part of a parameter: ``trainable_rows`` {unit name: {parameter name inside
+    the unit: [row indices]}} (for example {"stem": {"cls.weight": [9]}}), applied after ``trainable`` and
+    ``trainable_params``: each named parameter (in every cluster of a staged model) trains, its gradient multiplied by
+    a 0/1 mask over its first axis (1 on the listed rows) by a hook removed when the fit ends. Refused (ValueError)
+    with an ``optimizer_state`` that holds an entry for such a parameter. After the loop the unlisted rows are put
+    back from a copy taken before it and checked bit for bit, in the weights and in every average the result carries.
+    The trained numbers count the listed rows only; the result records "trainable_rows" (as given),
+    "rows_frozen_equal" (True) and "rows_restored" (whether any unlisted value had moved before it was put back).
+
     Sets the trainable units; with ``expect_anchor_at_birth`` checks that the velocity equals the anchor's (or zero
     without an anchor) exactly on a 2-row probe; runs the loop; checks that the frozen parameters did not change; reads.
     cond_drop applies only when the bed has classes. Returns the read with {seed, steps, t_range, t_sampling, trainable,
@@ -340,6 +405,13 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
     set_trainable_units(model, trainable)
     if trainable_params:
         set_trainable_params(model, trainable_params)
+    rows = _row_parameters(model, trainable_rows) if trainable_rows else []
+    if rows and optimizer_state is not None:
+        held = [r["name"] for r in rows if r["name"] in optimizer_state["m"]]
+        if held:
+            raise ValueError(f"trainable_rows names parameters the optimizer state holds: {held}")
+    for r in rows:
+        r["param"].requires_grad_(True)
     t_range = (float(t_range[0]), float(t_range[1]))
     frozen_before = {id(p): p.detach().clone() for p in model.parameters() if not p.requires_grad}
     if expect_anchor_at_birth:
@@ -354,7 +426,12 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
         if gap != 0.0:
             raise AssertionError(f"the newborn model is not exactly its anchor (or zero): {gap}")
     n_par = model.trained_numbers()
+    for r in rows:                                    # a row-trained parameter counts its listed rows only
+        n_par += len(r["rows"]) * (r["param"].numel() // max(1, r["param"].shape[0])) - r["param"].numel()
     n_all = sum(p.numel() for p in model.parameters())
+    new_names: Optional[List[str]] = None
+    if optimizer_partial and optimizer_state is not None:
+        new_names = sorted(n for n, _ in _trainable_named(model) if n not in optimizer_state["m"])
     cond = cond_drop if bed.n_classes else 0.0
     is_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     if is_cuda:
@@ -372,6 +449,7 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
     at_step = None
     averaged = None
     tails: Dict[str, list] = {}
+    fresh: Dict[str, set] = {}                         # carried averages: the parameters that start here
     if specs:
         live = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
         averaged = {}
@@ -383,9 +461,12 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
                 if key in carried:
                     given = carried[key]
                     missing = [n for n, _ in live if n not in given]
-                    if missing:
+                    if missing and not optimizer_partial:
                         raise KeyError(f"the carried average {key!r} lacks the trainable parameters {missing[:5]}")
-                    averaged[key] = {n: given[n].detach().to(device=p.device, dtype=torch.float32).clone()
+                    if missing:
+                        fresh[key] = set(missing)
+                    averaged[key] = {n: (given[n].detach().to(device=p.device, dtype=torch.float32).clone()
+                                         if n in given else p.detach().clone().float())
                                      for n, p in live}
                 else:
                     averaged[key] = {n: p.detach().clone().float() for n, p in live}
@@ -412,14 +493,27 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
                     else:
                         kk = first_k + k if key in carried else k
                         dk = (1 + kk) / (kk + value + 2)
+                    new_here = fresh.get(key)
+                    if new_here:                              # parameters whose carried average starts at this fit
+                        dk_new = (1 + k) / (k + value + 2)
+                        for n, p in live:
+                            d = dk_new if n in new_here else dk
+                            state[n].copy_(d * state[n] + (1.0 - d) * p.detach().float())
+                        continue
                     for n, p in live:
                         state[n].copy_(dk * state[n] + (1.0 - dk) * p.detach().float())    # the rule as written
             updates[0] += 1
 
     state_out: Optional[Dict[str, Any]] = {} if keep_state else None
-    curve, seconds = run_loop(model, bed, seed, steps, lr, warmup, batch, cond, mdrop, t_sampling, t_range, equalize,
-                              device, log, log_every, at_step=at_step, t_mix=float(t_mix), start_step=int(start_step),
-                              optimizer_state=optimizer_state, state_out=state_out)
+    hooks = [r["param"].register_hook(_row_mask_hook(r["mask"])) for r in rows]
+    try:
+        curve, seconds = run_loop(model, bed, seed, steps, lr, warmup, batch, cond, mdrop, t_sampling, t_range,
+                                  equalize, device, log, log_every, at_step=at_step, t_mix=float(t_mix),
+                                  start_step=int(start_step), optimizer_state=optimizer_state, state_out=state_out,
+                                  optimizer_partial=optimizer_partial)
+    finally:
+        for h in hooks:
+            h.remove()
     if tails:
         with torch.no_grad():
             for key, (sums, count) in tails.items():
@@ -428,6 +522,20 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
                 else:
                     averaged[key] = {n: (s / count).float() for n, s in sums.items()}
         averaged = {key: averaged[key] for key, _, _ in specs}          # in the order given
+    rows_restored = False
+    for r in rows:                                   # the rows nobody trained: exactly their values before the fit
+        p, keep, before = r["param"], ~r["listed"], r["before"]
+        with torch.no_grad():
+            rows_restored = rows_restored or not torch.equal(p.detach()[keep], before[keep])
+            p[keep] = before[keep]
+            for state in (averaged or {}).values():
+                if r["name"] in state:
+                    state[r["name"]][keep] = before[keep].to(state[r["name"]].dtype)
+        if not torch.equal(p.detach()[keep], before[keep]):
+            raise AssertionError(f"the unlisted rows of {r['name']} differ from their values before the fit")
+        for state in (averaged or {}).values():
+            if r["name"] in state and not torch.equal(state[r["name"]][keep], before[keep].to(state[r["name"]].dtype)):
+                raise AssertionError(f"an average's unlisted rows of {r['name']} differ from their values before the fit")
     peak = torch.cuda.max_memory_allocated() / 2 ** 20 if is_cuda else None
     frozen_same = all(torch.equal(frozen_before[id(p)], p) for p in model.parameters() if id(p) in frozen_before)
     res = read(model, bed, heldout, device)
@@ -444,6 +552,15 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
         res["recipe"]["optimizer_state"] = "continued" if optimizer_state is not None else "new"
     if trainable_params:                                  # recorded only when given
         res["trainable_params"] = {k: [str(p) for p in v] for k, v in trainable_params.items()}
+    if new_names:                                         # recorded only when the state lacked trainable parameters
+        res["recipe"]["optimizer_state"] = "continued, partial"
+        res["optimizer_new"] = new_names
+    if fresh:
+        res["average_new"] = {str(k): sorted(v) for k, v in fresh.items()}
+    if rows:                                              # recorded only when given
+        res["trainable_rows"] = {u: {pn: [int(i) for i in ix] for pn, ix in d.items()} for u, d in trainable_rows.items()}
+        res["rows_frozen_equal"] = True
+        res["rows_restored"] = bool(rows_restored)
     if averaged is not None:
         res["averaged"] = averaged                        # tensors: never written into a json file
     if keep_state:
