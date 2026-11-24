@@ -15,6 +15,13 @@
 | exchange     | one band's part of an assembly (``parts=``) replaced by ``other`` (a band engine's job folder or    |
 |              | teacher): every band's read before and after, the largest change where that band is silent, and the |
 |              | change of the sampled final latents (``capture.reads.exchange``)                                     |
+| pictures     | the pictures of an assembly (``source=parts``: sampled from ``noise_seed`` ``group`` rows at a time,  |
+|              | then decoded) or the rows' own pictures (``source=rows``: their clean latents decoded) for the rows  |
+|              | of ``pic_data``; the judge's features of every picture, the text-to-picture score (``clip``), a      |
+|              | contact sheet; no probe is built                                                                     |
+| picture_compare | two ``pictures`` job folders (``a``, ``b``) compared: the Frechet distance of their features, the |
+|              | kernel distance (``capture.pictures.kid``), and the text-to-picture means and their row-by-row       |
+|              | difference; no teacher                                                                               |
 
 The teacher is a local diffusers folder: ``teacher=<folder>``, or found in the local hub cache by ``repo`` and
 ``revision`` (nothing is ever downloaded). ``tiny=1`` uses a tiny random teacher and random batches instead (16 x 16
@@ -38,13 +45,30 @@ whole-range share of the band's training law), steps, batch, lr, lam_out, lam_da
 removed once the job has finished), data (a folder of latent shards, read by ``capture.data.LatentBatches``), out,
 device, dtype (fp32 / bf16 / fp16: the teacher's numbers; an engine's are float32), autocast (auto / none / bf16 /
 fp16), save_every, log_every, average_decay, probe_n, probe_per_band, probe_seed, probe_data, probe_first, probe_rows,
-chunk, sample_steps, guidance, group, parts (for assembly and exchange: band=teacher or band=<a band engine's job
-folder>, comma separated, for example clean=runs/a,middle=teacher,noisy=teacher), other (for exchange), threads, det
-(empty, warn or on).
+chunk, sample_steps, guidance, group, parts (for assembly, exchange and pictures: one part a band, comma separated, for
+example clean=runs/a,middle=teacher,noisy=born:tiny; a part is ``teacher``, a band engine's job folder (its averaged
+engine), ``born:<shape>`` (the shape's engine with every number inherited from the teacher, untrained, reading the
+prompt) or ``born:<shape>:notext`` (the same without the prompt); ``<shape>`` is a name or the text form such as
+2222/nomid/3), other (for exchange: a part in the same forms), threads, det (empty, warn or on).
+
+For pictures: pic_data (a folder of latent shards; with tiny=1 it may be empty, and random rows are used), pic_first,
+pic_n (the rows pic_first .. pic_first + pic_n - 1 in FILE order: their token ids are the prompts, their clean latents
+the pictures the prompts describe), noise_seed (the sampler's start noise, group j from noise_seed + 100003 j), source
+(parts or rows), part_dtype (empty: the engines as stored, float32; fp16 or bf16: every loaded or born engine cast to
+it; the teacher keeps ``dtype``), judge (inception or fake: the feature judge of ``score.make_judge``), clip (empty: no
+text-to-picture score; fake; or a local CLIP folder or cached hub id), sheet_n (the pictures on the contact sheet; 0:
+none), decode_batch. The image decoder is always kept in float32. For picture_compare: a, b (two pictures job
+folders), paired (1: the two hold the same rows, or one's rows are a prefix of the other's
+and the common rows are compared, row by row; their group, noise_seed, sample_steps and guidance must then agree
+unless one job is source=rows; 0: two sets, compared whole), first_n (above 0: only the first first_n rows of both
+jobs are compared, inside the common prefix when paired; each job must hold that many), blocks (the kernel distance's
+blocks). The result also says whether the compared feature arrays are equal element by element (features_equal) and
+their largest absolute difference.
 
 Output in ``out``: log.txt (its last line 'done'), result.json, result.md (the reads as a table); band_engine also
 writes the job's checkpoint.pt and the engine files (``capture.train``), and resumes from a checkpoint found there (a
-finished job whose checkpoint was removed is read back, not trained again).
+finished job whose checkpoint was removed is read back, not trained again). pictures also writes pictures.npz
+(``features`` float32 [N, D], ``rows`` int64 [N], ``clip`` float32 [N] when asked) and sheet.jpg.
 """
 from __future__ import annotations
 
@@ -60,7 +84,9 @@ from ..config import in_notebook, parse
 from ..determinism import mode as det_mode
 
 EXPERIMENT = "capture"
-VARIANTS = ("band_engine", "born", "assembly", "exchange")
+VARIANTS = ("band_engine", "born", "assembly", "exchange", "pictures", "picture_compare")
+PICTURE_VARIANTS = ("pictures", "picture_compare")
+SOURCES = ("parts", "rows")
 PROBE_PROMPTS = ("a photograph of a red house by a lake", "a bowl of fruit on a wooden table",
                  "a portrait of an old man with a gray beard", "a city street at dusk with lit windows",
                  "a mountain road in the snow", "a cat sleeping on a blue sofa",
@@ -70,8 +96,12 @@ DEFAULTS = dict(variant="band_engine", teacher="", repo="runwayml/stable-diffusi
                 drop=0.1, text=1, seed=0, data="", out="", device="cpu", dtype="fp32", autocast="auto",
                 save_every=500, log_every=50, average_decay=0.9999, probe_n=4, probe_per_band=4, probe_seed=1234,
                 probe_data="", probe_first=0, probe_rows=0, chunk=16, init="inherit", read_every=0, keep_checkpoint=1,
-                sample_steps=50, guidance=7.5, group=16, parts="", other="", threads=4, det="")
+                sample_steps=50, guidance=7.5, group=16, parts="", other="", threads=4, det="",
+                pic_data="", pic_first=0, pic_n=0, noise_seed=2000, source="parts", part_dtype="", judge="inception",
+                clip="", sheet_n=16, decode_batch=8, a="", b="", paired=1, blocks=10, first_n=0)
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+PART_DTYPES = {"": None, "fp16": torch.float16, "bf16": torch.bfloat16}
+BORN = "born:"
 
 
 def main(argv=(), **overrides) -> dict:
@@ -88,6 +118,21 @@ def main(argv=(), **overrides) -> dict:
         raise ValueError(f"the {a['variant']} variant needs parts=")
     if a["variant"] == "exchange" and not a["other"]:
         raise ValueError("the exchange variant needs other= (a band engine's job folder or teacher)")
+    if a["part_dtype"] not in PART_DTYPES:
+        raise ValueError(f"part_dtype is empty, fp16 or bf16, not {a['part_dtype']!r}")
+    if a["variant"] == "pictures":
+        if a["source"] not in SOURCES:
+            raise ValueError(f"source is parts or rows, not {a['source']!r}")
+        if int(a["pic_n"]) < 1:
+            raise ValueError("the pictures variant needs pic_n >= 1 (the number of rows)")
+        if a["source"] == "parts" and not a["parts"]:
+            raise ValueError("the pictures variant with source=parts needs parts=")
+        if not a["pic_data"] and not a["tiny"]:
+            raise ValueError("the pictures variant needs pic_data= (a folder of latent shards) on the real teacher")
+        if int(a["sheet_n"]) < 0 or int(a["decode_batch"]) < 1:
+            raise ValueError("sheet_n is at least 0 and decode_batch at least 1")
+    if a["variant"] == "picture_compare" and not (a["a"] and a["b"]):
+        raise ValueError("the picture_compare variant needs a= and b= (two pictures job folders)")
     with det_mode(a["det"]) as det:
         return _run(a, det)
 
@@ -103,12 +148,19 @@ def random_source(seed: int, latent_shape, vocab: int = 1000) -> Callable:
     return source
 
 
-def _teacher(a: dict):
+def _teacher(a: dict, vae: bool = False):
+    """The teacher and where it came from; with ``vae`` it carries its image decoder, kept in float32 whatever
+    ``dtype`` is (cast after the teacher's own move, so nothing casts it back)."""
     from ..capture.teacher import find_snapshot, load_teacher, tiny_teacher
     if a["tiny"]:
-        return tiny_teacher(int(a["seed"])).to(a["device"], DTYPES[a["dtype"]]), "tiny random teacher"
-    path = a["teacher"] or find_snapshot(a["repo"], a["revision"] or None)
-    return load_teacher(path, device=a["device"], dtype=DTYPES[a["dtype"]]), path
+        teacher = tiny_teacher(int(a["seed"]), vae=vae).to(a["device"], DTYPES[a["dtype"]])
+        where = "tiny random teacher"
+    else:
+        where = a["teacher"] or find_snapshot(a["repo"], a["revision"] or None)
+        teacher = load_teacher(where, device=a["device"], dtype=DTYPES[a["dtype"]], vae=vae)
+    if vae:
+        teacher.vae.float()
+    return teacher, where
 
 
 def _latent_shape(teacher):
@@ -164,13 +216,38 @@ def _part_spec(text: str) -> Dict[str, str]:
     return spec
 
 
+def born_spec(where: str):
+    """(shape, text) of a part written ``born:<shape>`` (reads the prompt) or ``born:<shape>:notext``. ValueError
+    naming the three forms of a part when it does not parse."""
+    from ..capture.shapes import Shape
+    forms = ("a part is teacher, a band engine's job folder, born:<shape> or born:<shape>:notext (a shape name or "
+             f"<layers>/<mid|nomid>/<stages>), not {where!r}")
+    body = where[len(BORN):]
+    text = True
+    if body.endswith(":notext"):
+        body, text = body[:-len(":notext")], False
+    if not body or ":" in body:
+        raise ValueError(forms)
+    try:
+        shape = Shape.parse(body)
+    except ValueError as e:
+        raise ValueError(f"{forms} ({e})") from None
+    return shape, text
+
+
 def _load_part(teacher, where: str, loaded: Dict[str, object]):
-    """The teacher, or the averaged engine of a job folder (each folder loaded once: the same folder, the same part)."""
-    from ..capture.engine import load_engine
+    """The teacher; the averaged engine of a job folder; or a born engine (``born:<shape>`` or
+    ``born:<shape>:notext``: every number inherited from the teacher, untrained). Each is made once: the same text,
+    the same part."""
+    from ..capture.engine import build_engine, load_engine
     if where == "teacher":
         return teacher
     if where not in loaded:
-        loaded[where] = load_engine(teacher, where, average=True).eval()
+        if where.startswith(BORN):
+            shape, text = born_spec(where)
+            loaded[where] = build_engine(teacher, shape, text=text).eval()
+        else:
+            loaded[where] = load_engine(teacher, where, average=True).eval()
     return loaded[where]
 
 
@@ -197,6 +274,10 @@ def _run(a: dict, det) -> dict:
 
     torch.set_num_threads(int(a["threads"]))
     t0 = time.time()
+    if a["variant"] == "picture_compare":                # no teacher, no probe
+        return _run_compare(a, det, log, t0)
+    if a["variant"] == "pictures":                       # the teacher with its image decoder, no probe
+        return _run_pictures(a, det, log, t0)
     teacher, where = _teacher(a)
     log(f"CAPTURE {a['variant']}: teacher {where}; torch {torch.__version__}; package {__version__}")
     probe = _probe(a, teacher)
@@ -315,6 +396,200 @@ def _run(a: dict, det) -> dict:
     log(text.rstrip())
     log("done")
     return result
+
+
+PICTURES = "pictures.npz"
+
+
+def cast_engines(loaded: Dict[str, object], part_dtype: str) -> None:
+    """Every loaded or born engine of ``loaded`` cast in place to ``part_dtype`` (empty: left as stored). The teacher
+    is never in ``loaded``, so it keeps its own precision."""
+    dtype = PART_DTYPES[part_dtype]
+    if dtype is None:
+        return
+    for engine in loaded.values():
+        engine.to(dtype=dtype)
+
+
+def _picture_rows(a: dict, teacher):
+    """(clean latents float32 [N, C, h, w], ids long [N, 77], file rows int64 [N]) of the pictures variant."""
+    import numpy as np
+    from ..capture.data import rows_in_order
+    first, n = int(a["pic_first"]), int(a["pic_n"])
+    want = _latent_shape(teacher)
+    if a["pic_data"]:
+        x0, ids = rows_in_order(a["pic_data"], first, n)
+        if tuple(x0.shape[1:]) != want:
+            raise ValueError(f"the rows' latents are {tuple(x0.shape[1:])}; the teacher's are {want}")
+        return x0, ids, np.arange(first, first + n, dtype=np.int64)
+    # random rows (tiny=1 without pic_data): row i is batch i of one row of the random source, so a row's prompt and
+    # latents depend only on its number and a job of fewer rows holds a prefix of a job of more
+    source = random_source(int(a["seed"]), want)
+    drawn = [source(i, 1) for i in range(first, first + n)]
+    x0 = torch.cat([d[0] for d in drawn])
+    ids = torch.cat([d[1] for d in drawn])
+    return x0, ids, np.arange(first, first + n, dtype=np.int64)
+
+
+def _write_outputs(a: dict, result: dict, rows, columns, det, log) -> dict:
+    from ..capture import reads
+    out = a["out"]
+    det.record(result)
+    reads.write_json(result, os.path.join(out, "result.json"))
+    text = f"# capture: {a['variant']}\n\n" + reads.table(rows, columns)
+    with open(os.path.join(out, "result.md"), "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+    log(text.rstrip())
+    log("done")
+    return result
+
+
+def _head(a: dict, teacher: str) -> dict:
+    return {"experiment": EXPERIMENT, "variant": a["variant"], "teacher": teacher,
+            "args": {k: a[k] for k in sorted(a) if not (k == "det" and not a[k])}, "torch": torch.__version__,
+            "version": __version__}
+
+
+def _run_pictures(a: dict, det, log, t0: float) -> dict:
+    import numpy as np
+    from .. import score
+    from ..capture import pictures
+    from ..capture.assemble import Assembly
+    out = a["out"]
+    teacher, where = _teacher(a, vae=True)
+    log(f"CAPTURE pictures: teacher {where}; torch {torch.__version__}; package {__version__}")
+    x0, ids, file_rows = _picture_rows(a, teacher)
+    n = int(x0.shape[0])
+    result = _head(a, where)
+    result.update({"n": n, "source": a["source"], "parts": a["parts"] if a["source"] == "parts" else "",
+                   "part_dtype": a["part_dtype"]})
+    t1 = time.time()
+    if a["source"] == "parts":
+        loaded: Dict[str, object] = {}
+        parts = _parts(a, teacher, loaded)
+        cast_engines(loaded, a["part_dtype"])
+        states = teacher.text_states(ids)
+        z = pictures.sample_latents(Assembly(parts), states, teacher.empty_states(1), int(a["noise_seed"]),
+                                    group=int(a["group"]), steps=int(a["sample_steps"]),
+                                    guidance=float(a["guidance"]), latent_shape=_latent_shape(teacher),
+                                    alphas_cumprod=teacher.alphas_cumprod, log=log)
+        del parts, loaded
+    else:
+        z = x0
+    t2 = time.time()
+    pics = pictures.decode(teacher.vae, z, batch=int(a["decode_batch"]))
+    t3 = time.time()
+    log(f"decoded {n:,} pictures {tuple(pics.shape[1:])} in {t3 - t2:.1f} s")
+    judge = score.make_judge(a["judge"], a["device"])
+    feats = np.asarray(judge.features(pics), dtype=np.float32)
+    saved = {"features": feats, "rows": file_rows}
+    result.update({"judge": judge.name, "feature_dim": int(feats.shape[1])})
+    clip = pictures.make_clip_judge(a["clip"], a["device"])
+    if clip is not None:
+        s = clip.scores(pics, ids)
+        saved["clip"] = s.astype(np.float32)
+        result.update({"clip_judge": clip.name, "clip_mean": float(s.mean()),
+                       "clip_std": float(s.std(ddof=1)) if s.shape[0] > 1 else None})
+    t4 = time.time()
+    np.savez(os.path.join(out, PICTURES), **saved)
+    if int(a["sheet_n"]) > 0:
+        pictures.contact_sheet(pics[: int(a["sheet_n"])]).save(os.path.join(out, "sheet.jpg"), quality=90)
+    result.update({"seconds_sampling": t2 - t1, "seconds_decoding": t3 - t2, "seconds_judging": t4 - t3,
+                   "seconds": time.time() - t0})
+    keys = ("n", "source", "parts", "part_dtype", "judge", "feature_dim", "clip_judge", "clip_mean", "clip_std",
+            "seconds_sampling", "seconds_decoding", "seconds_judging", "seconds")
+    rows = [{"quantity": k, "value": result[k]} for k in keys if k in result]
+    return _write_outputs(a, result, rows, ["quantity", "value"], det, log)
+
+
+SAMPLING_ARGS = ("group", "noise_seed", "sample_steps", "guidance")
+
+
+def _read_pictures(folder: str) -> dict:
+    import json
+    import numpy as np
+    with np.load(os.path.join(folder, PICTURES), allow_pickle=False) as d:
+        out = {k: d[k] for k in d.files}
+    with open(os.path.join(folder, "result.json"), encoding="utf-8") as fh:
+        out["result"] = json.load(fh)
+    return out
+
+
+def _paired_rows(pa: dict, pb: dict) -> int:
+    """The number of rows two pictures jobs are compared on, row by row: their equal ``rows``, or the shorter one's
+    when its rows are a prefix of the other's. Sound because ``sample_latents`` starts group j from a seed that
+    depends only on j (and the noise seed): row i gets the same start noise whatever the job's row count, so long as
+    the group size, the noise seed, the steps and the guidance are the same, which is checked here (a ``source=rows``
+    job samples nothing and has none of them). ValueError on the first difference."""
+    import numpy as np
+    ra, rb = pa["rows"], pb["rows"]
+    n = min(ra.shape[0], rb.shape[0])
+    diff = np.nonzero(ra[:n] != rb[:n])[0]
+    if diff.size:
+        k = int(diff[0])
+        raise ValueError(f"paired: the rows differ first at position {k} (a row {int(ra[k])}, b row {int(rb[k])})")
+    sa, sb = pa["result"], pb["result"]
+    if sa.get("source", "parts") != "rows" and sb.get("source", "parts") != "rows":
+        for k in SAMPLING_ARGS:
+            va, vb = sa["args"].get(k), sb["args"].get(k)
+            if va != vb:
+                raise ValueError(f"paired: the two jobs were sampled with other {k} ({va!r} and {vb!r}); their rows "
+                                 f"do not start from the same noise (paired=0 compares them as two sets)")
+    return int(n)
+
+
+def _run_compare(a: dict, det, log, t0: float) -> dict:
+    import numpy as np
+    from .. import score
+    from ..capture import pictures
+    log(f"CAPTURE picture_compare: {a['a']} against {a['b']}; package {__version__}")
+    pa, pb = _read_pictures(a["a"]), _read_pictures(a["b"])
+    paired = bool(int(a["paired"]))
+    n_a, n_b = int(pa["features"].shape[0]), int(pb["features"].shape[0])
+    first_n = int(a["first_n"])
+    if first_n < 0:
+        raise ValueError("first_n is 0 (every row) or a positive number of rows")
+    if first_n and min(n_a, n_b) < first_n:
+        raise ValueError(f"first_n={first_n}: a holds {n_a} rows and b {n_b}; both must hold at least {first_n}")
+    prefix = False
+    cut = None
+    if paired:
+        cut = _paired_rows(pa, pb)                         # the common prefix first
+        prefix = n_a != n_b
+    if first_n:
+        cut = first_n                                      # then the first first_n rows inside it
+    if cut is not None:
+        for p in (pa, pb):
+            for k in ("features", "clip"):
+                if k in p:
+                    p[k] = p[k][:cut]
+    fa, fb = pa["features"].astype(np.float64), pb["features"].astype(np.float64)
+    ma, ca, _ = score.feature_stats(fa)
+    mb, cb, _ = score.feature_stats(fb)
+    same_shape = fa.shape == fb.shape
+    result = _head(a, "")
+    del result["teacher"]
+    result.update({"a": a["a"], "b": a["b"], "paired": paired, "n_a": n_a, "n_b": n_b, "prefix": prefix,
+                   "first_n": first_n, "n": int(fa.shape[0]) if (paired or first_n) else None,
+                   "rows_compared_a": int(fa.shape[0]), "rows_compared_b": int(fb.shape[0]),
+                   "features_equal": bool(same_shape and np.array_equal(pa["features"], pb["features"])),
+                   "max_abs_feature_difference": float(np.abs(fa - fb).max()) if same_shape and fa.size else None,
+                   "frechet": score.frechet_distance(ma, ca, mb, cb), "kid": pictures.kid(fa, fb, int(a["blocks"]))})
+    if "clip" in pa and "clip" in pb:
+        sa, sb = pa["clip"].astype(np.float64), pb["clip"].astype(np.float64)
+        result.update({"clip_a": float(sa.mean()), "clip_b": float(sb.mean())})
+        if paired:
+            d = sa - sb
+            result["clip_diff_mean"] = float(d.mean())
+            result["clip_diff_se"] = float(d.std(ddof=1) / np.sqrt(d.shape[0])) if d.shape[0] > 1 else None
+    result["seconds"] = time.time() - t0
+    rows = [{"quantity": k, "value": result[k]} for k in ("n", "n_a", "n_b", "prefix", "first_n", "features_equal",
+                                                           "max_abs_feature_difference", "frechet") if k in result]
+    rows += [{"quantity": "kid " + k, "value": result["kid"][k]} for k in ("full", "block_mean", "block_std",
+                                                                           "blocks", "block_rows")]
+    rows += [{"quantity": k, "value": result[k]} for k in ("clip_a", "clip_b", "clip_diff_mean", "clip_diff_se")
+             if k in result]
+    return _write_outputs(a, result, rows, ["quantity", "value"], det, log)
 
 
 def summarize(root: str) -> str:

@@ -13,6 +13,8 @@ asked only where its band is.
     train       one band engine trained alone, with an averaged copy and exact resume
     assemble    the assembly and a deterministic DDIM sampler with guidance
     reads       fixed probes and the reads: a band's read, the born read, the exchange test, the off-band control
+    pictures    an assembly's pictures (sampled group by group, decoded) and their scores: a kernel distance, a
+                text-to-picture judge, a contact sheet
 
 Conventions: steps t = 0 .. 999, larger is noisier; z_t = sqrt(a_t) x0 + sqrt(1 - a_t) eps; the teacher predicts eps.
 

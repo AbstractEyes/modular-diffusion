@@ -17,7 +17,8 @@ encoded.
     synthetic_batches(size, ...)           a source of random latents and ids, for tests
     rows_in_order(folder, first, n)        rows first .. first + n - 1 of a folder of shards in FILE order (shard 0's
                                            rows first), not shuffled: held-out probes and measurements
-    parquet_pictures(path, n, skip)        pictures and captions skip .. skip + n - 1 of one parquet file, in file order
+    parquet_pictures(path, n, skip, pick)  pictures and captions skip .. skip + n - 1 of one parquet file, in file order
+                                           (``pick``: which caption of a list of captions)
 
 The stream's order: pass e (e = 0, 1, ...) visits the shards in a random order drawn from ``seed`` and ``e``, and the
 rows of each shard in a random order drawn from ``seed``, ``e`` and the shard's position; a batch takes the next B rows
@@ -322,19 +323,21 @@ def encode_shards(images: Union[str, Iterable], captions: Sequence[str], out_fol
 # ------------------------------------------------------------------ pictures from a parquet file
 def parquet_pictures(path: str, n: int, image: str = "image", caption: str = "answer",
                      keep: Sequence[str] = ("id", "license", "file_name"),
-                     skip: int = 0) -> Tuple[list, List[str], List[dict]]:
+                     skip: int = 0, pick: int = 0) -> Tuple[list, List[str], List[dict]]:
     """Rows ``skip`` .. ``skip + n - 1`` of ONE parquet file, in file order (``n`` 0: every row after ``skip``):
     (pictures: RGB PIL images, captions: str, meta: one dict a row of the ``keep`` columns the file has). The file is
     read in batches of rows, never whole, and the skipped rows are never decoded. The image cell is a struct with
-    ``bytes`` (an encoded picture, decoded here from memory); the caption cell is a string or a list of strings (the
-    first is taken). ValueError when the file holds fewer than ``skip + n`` rows (or none after ``skip``), lacks the
-    image or caption column, or a row's picture or caption is empty (the error names the row's number in the file)."""
+    ``bytes`` (an encoded picture, decoded here from memory); the caption cell is a string or a list of strings (entry
+    ``pick`` is taken; 0 by default, the first). ValueError when the file holds fewer than ``skip + n`` rows (or none
+    after ``skip``), lacks the image or caption column, a row's picture or caption is empty, a row's list of captions
+    is shorter than ``pick + 1``, or a row's caption is a plain string and ``pick`` > 0 (the error names the row's
+    number in the file)."""
     import io
     import pyarrow.parquet as pq
     from PIL import Image
-    n, skip = int(n), int(skip)
-    if n < 0 or skip < 0:
-        raise ValueError("n >= 0 (0: every row after skip) and skip >= 0")
+    n, skip, pick = int(n), int(skip), int(pick)
+    if n < 0 or skip < 0 or pick < 0:
+        raise ValueError("n >= 0 (0: every row after skip), skip >= 0 and pick >= 0")
     pf = pq.ParquetFile(path)
     total = int(pf.metadata.num_rows)
     if n == 0:
@@ -372,7 +375,11 @@ def parquet_pictures(path: str, n: int, image: str = "image", caption: str = "an
                 pictures.append(img.convert("RGB"))
             text = cols[caption][i]
             if isinstance(text, (list, tuple)):
-                text = text[0] if text else None
+                if pick and len(text) < pick + 1:
+                    raise ValueError(f"row {row} of {path} holds {len(text)} captions; entry {pick} was asked for")
+                text = text[pick] if text else None
+            elif pick and text is not None:
+                raise ValueError(f"row {row} of {path} holds one caption (a plain string); entry {pick} was asked for")
             text = "" if text is None else str(text)
             if not text.strip():
                 raise ValueError(f"row {row} of {path} has an empty caption")

@@ -7,7 +7,8 @@ a local diffusers folder. Nothing here downloads: every load passes ``local_file
     eps = teacher.predict(z_t, t, states)
 
 ``tiny_teacher(seed)`` makes a teacher of the same kind with random numbers and no files (a tiny U-Net with the
-teacher's block types and layer counts, a tiny text encoder, a character tokenizer), for the tests.
+teacher's block types and layer counts, a tiny text encoder, a character tokenizer), for the tests; with ``vae=True`` it
+carries ``tiny_vae(seed)``, a tiny random image decoder (16 x 16 latents to 32 x 32 pictures).
 """
 from __future__ import annotations
 
@@ -30,6 +31,10 @@ TINY = dict(sample_size=16, in_channels=4, out_channels=4, down_block_types=SD15
             block_out_channels=(32, 64, 64, 64), layers_per_block=2, cross_attention_dim=32, attention_head_dim=4,
             norm_num_groups=8)
 TINY_VOCAB = 1000
+# The tiny test image decoder: 4 latent channels, two stages (one downsampling: 16 x 16 latents, 32 x 32 pictures).
+TINY_VAE = dict(in_channels=3, out_channels=3, down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
+                up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"), block_out_channels=(4, 4), layers_per_block=1,
+                latent_channels=4, norm_num_groups=2, sample_size=32)
 
 
 def _freeze(m: nn.Module) -> nn.Module:
@@ -140,12 +145,30 @@ def _perturb(unet: nn.Module, seed: int) -> None:
                 p.copy_(torch.randn(p.shape, generator=g) * 0.02)
 
 
-def tiny_teacher(seed: int = 0) -> Teacher:
+def tiny_vae(seed: int = 0):
+    """The tiny random image decoder of the tests (``TINY_VAE``): a diffusers ``AutoencoderKL`` with 4 latent channels
+    and one downsampling, so a 16 x 16 latent decodes to a 32 x 32 picture. Its numbers are drawn from the seed; frozen,
+    eval."""
+    from diffusers import AutoencoderKL
+    g = torch.Generator().manual_seed(int(seed) + 211)
+    vae = AutoencoderKL(**TINY_VAE)
+    with torch.no_grad():
+        for p in vae.parameters():
+            if p.dim() > 1:
+                fan_in = p[0].numel()
+                p.copy_(torch.randn(p.shape, generator=g) / fan_in ** 0.5)
+            else:
+                p.copy_(torch.randn(p.shape, generator=g) * 0.02 + (1.0 if bool((p == 1).all()) else 0.0))
+    return _freeze(vae)
+
+
+def tiny_teacher(seed: int = 0, vae: bool = False) -> Teacher:
     """A teacher with random numbers and no files: ``tiny_unet`` (every tensor nonzero), ``TinyTextEncoder``, a
-    character tokenizer. CPU, float32."""
+    character tokenizer; with ``vae`` also ``tiny_vae(seed)`` as its image decoder. CPU, float32."""
     unet = tiny_unet(seed)
     _perturb(unet, seed)
-    return Teacher(unet, TinyTextEncoder(TINY["cross_attention_dim"], seed=seed), CharTokenizer())
+    return Teacher(unet, TinyTextEncoder(TINY["cross_attention_dim"], seed=seed), CharTokenizer(),
+                   tiny_vae(seed) if vae else None)
 
 
 def _hub_cache(cache_dir: Optional[str]) -> str:
