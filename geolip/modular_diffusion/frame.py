@@ -286,3 +286,295 @@ def request_weights(requests: Sequence[Sequence[int]], owners: Sequence[Sequence
     """The overlap form (``overlap_weights``) over the owners' arguments for a set of requests
     (``request_arguments``) -> (weights [n], base)."""
     return overlap_weights(request_arguments(requests, owners, U))
+
+
+# ------------------------------------------------------------------ the address frame on image tokens
+# A picture of a 3 x 3 grid of cells is cut into a 12 x 12 grid of tokens (patch 4; a cell is 4 x 4 tokens), row-major
+# like ``spectral.patchify``. Every token carries four PLACE digits: its column j = ix div 4 and row k = iy div 4 (base
+# 3) and its place inside the cell, ix mod 4 and iy mod 4 (base 5, four values used). A REQUEST asks for one thing in
+# one cell: six digits of base 3, (column, row, family, member, color high, color low), the thing being 3 family +
+# member and the color 3 high + low; at most one request a cell.
+#
+# A digit of base b = 2P + 1 sits on one of b orthonormal anchors (``digit_code``):
+#
+#     u_b(a) = [1/sqrt(b), sqrt(2/b) cos(2 pi p a / b), sqrt(2/b) sin(2 pi p a / b) for p = 1..P],   a = 0..b-1
+#
+# THE GATE (declared; nothing is compared, nothing learned). Part i owns a set T_i of things (and every band); the base
+# (index n, the last) owns "no thing":
+#
+#     w_i(token)    = sum over requests r of <u_3(j), u_3(j_r)> <u_3(k), u_3(k_r)> [thing_r in T_i]
+#     w_base(token) = 1 - sum over requests r of <u_3(j), u_3(j_r)> <u_3(k), u_3(k_r)>
+#
+# one product a request, summed over requests (never a product of per-digit sums, which would light every cell whose
+# column is some request's column and whose row is some request's row). Each inner product is 1 or 0, so every token has
+# exactly one owner at weight 1: the part owning the thing of its cell's request, or the base when its cell has none.
+# ``token_weights`` computes the gate by integers or by the code kernels in float64 (the thing bracket then also by its
+# kernel, sum over the owned things tau of <u_3(f_r), u_3(f_tau)> <u_3(m_r), u_3(m_tau)>); the two agree to rounding.
+TOKEN_GRID = 12
+GRID_CELLS = 3
+REQUEST_DIGITS = 6
+
+
+def digit_code(base: int) -> Tensor:
+    """[base, base] float64: row a is the code u_b(a) of anchor a (the plain dimension first, then the P rotary pairs,
+    cos before sin). The rows are orthonormal. An even base raises."""
+    b = int(base)
+    if b < 1 or b % 2 == 0:
+        raise ValueError(f"a digit's base is odd (2P + 1), not {base}")
+    p_count = (b - 1) // 2
+    a = torch.arange(b, dtype=torch.float64)
+    cols = [torch.full((b,), 1.0 / math.sqrt(b), dtype=torch.float64)]
+    for p in range(1, p_count + 1):
+        ang = 2.0 * math.pi * p * a / b
+        cols.append(math.sqrt(2.0 / b) * torch.cos(ang))
+        cols.append(math.sqrt(2.0 / b) * torch.sin(ang))
+    return torch.stack(cols, dim=1)
+
+
+def _odd_at_least(n: int) -> int:
+    return n if n % 2 == 1 else n + 1
+
+
+class TokenFrame:
+    """The place digits of every token of a grid x grid token picture cut into cells x cells cells (row-major token
+    order: token = iy * grid + ix). Attributes, each [T] long: ``column``, ``row`` (0..cells-1), ``inner_x``,
+    ``inner_y`` (0..side-1, side = grid / cells) and ``cell`` (= cells * row + column)."""
+
+    def __init__(self, grid: int = TOKEN_GRID, cells: int = GRID_CELLS):
+        grid, cells = int(grid), int(cells)
+        if grid % cells:
+            raise ValueError("the token grid must split into whole cells")
+        if cells % 2 == 0:
+            raise ValueError("the cell digit's base is odd")
+        self.grid, self.cells = grid, cells
+        self.side = grid // cells
+        self.inner_base = _odd_at_least(self.side)
+        self.n_tokens = grid * grid
+        idx = torch.arange(self.n_tokens)
+        ix, iy = idx % grid, idx // grid
+        self.column = ix // self.side
+        self.row = iy // self.side
+        self.inner_x = ix % self.side
+        self.inner_y = iy % self.side
+        self.cell = self.row * cells + self.column
+
+    def place_code(self) -> Tensor:
+        """[T, 2 cells + 2 inner_base] float32 (16 for the default frame): [u_3(column), u_3(row), u_5(inner x),
+        u_5(inner y)]."""
+        uc = digit_code(self.cells)
+        ui = digit_code(self.inner_base)
+        return torch.cat([uc[self.column], uc[self.row], ui[self.inner_x], ui[self.inner_y]], dim=1).float()
+
+    def cell_place(self) -> Tensor:
+        """[n_cells, T] long: 1 where the token lies in the cell, by integers (column and row equal)."""
+        c = torch.arange(self.cells * self.cells)
+        return ((self.column[None] == (c % self.cells)[:, None]) & (self.row[None] == (c // self.cells)[:, None])).long()
+
+
+_DEFAULT_FRAME: Optional[TokenFrame] = None
+
+
+def _frame(frame: Optional[TokenFrame]) -> TokenFrame:
+    global _DEFAULT_FRAME
+    if frame is not None:
+        return frame
+    if _DEFAULT_FRAME is None:
+        _DEFAULT_FRAME = TokenFrame()
+    return _DEFAULT_FRAME
+
+
+def request_of(cell: int, thing: int, color: int, cells: int = GRID_CELLS) -> Tuple[int, ...]:
+    """The six digits (column, row, family, member, color high, color low) of a request for ``thing`` in ``color`` at
+    ``cell`` (= cells * row + column)."""
+    cell, thing, color = int(cell), int(thing), int(color)
+    if not 0 <= cell < cells * cells or not 0 <= thing < 9 or not 0 <= color < 9:
+        raise ValueError(f"a request is a cell 0..{cells * cells - 1}, a thing 0..8 and a color 0..8")
+    return (cell % cells, cell // cells, thing // 3, thing % 3, color // 3, color % 3)
+
+
+def request_cell(request: Sequence[int], cells: int = GRID_CELLS) -> int:
+    return int(request[1]) * cells + int(request[0])
+
+
+def request_thing(request: Sequence[int]) -> int:
+    return 3 * int(request[2]) + int(request[3])
+
+
+def request_color(request: Sequence[int]) -> int:
+    return 3 * int(request[4]) + int(request[5])
+
+
+def layout_requests(cells_row: Tensor, colors_row: Tensor) -> List[Tuple[int, ...]]:
+    """One layout row (cells [9], colors [9]; -1 for none) -> its list of requests, in cell order."""
+    cr = [int(v) for v in torch.as_tensor(cells_row).reshape(-1).tolist()]
+    co = [int(v) for v in torch.as_tensor(colors_row).reshape(-1).tolist()]
+    if len(cr) != GRID_CELLS * GRID_CELLS or len(co) != len(cr):
+        raise ValueError("a layout row is cells [9] and colors [9]")
+    out = []
+    for c, (t, k) in enumerate(zip(cr, co)):
+        if (t < 0) != (k < 0):
+            raise ValueError(f"cell {c} holds a thing without a color or a color without a thing")
+        if t >= 0:
+            out.append(request_of(c, t, k))
+    return out
+
+
+def requests_layout(requests: Sequence[Sequence[int]]) -> Tuple[Tensor, Tensor]:
+    """A list of requests -> one layout row (cells [9], colors [9] long). Two requests in one cell raise (a layout
+    cannot hold them)."""
+    cells = torch.full((GRID_CELLS * GRID_CELLS,), -1, dtype=torch.long)
+    colors = torch.full_like(cells, -1)
+    for r in requests:
+        if len(r) != REQUEST_DIGITS or any(not 0 <= int(d) < 3 for d in r):
+            raise ValueError(f"a request is six digits of base 3, not {tuple(r)}")
+        c = request_cell(r)
+        if int(cells[c]) >= 0:
+            raise ValueError(f"two requests in cell {c}: places partition the picture")
+        cells[c] = request_thing(r)
+        colors[c] = request_color(r)
+    return cells, colors
+
+
+def request_code(request: Sequence[int]) -> Tensor:
+    """[18] float32: the codes u_3 of the request's six digits, joined in digit order."""
+    if len(request) != REQUEST_DIGITS:
+        raise ValueError("a request has six digits")
+    u = digit_code(3)
+    return torch.cat([u[int(d)] for d in request]).float()
+
+
+def content_code(thing: int, color: int) -> Tensor:
+    """[12] float32: the codes of the last four digits of a request (family, member, color high, color low)."""
+    return request_code(request_of(0, thing, color))[6:]
+
+
+def layout_codes(cells: Tensor, colors: Tensor) -> Tuple[Tensor, Tensor]:
+    """A batch of layouts -> (codes [B, 9, 18] float32: the request code of each cell's request, zeros where a cell has
+    none; mask [B, 9] bool: the cells with a request)."""
+    cells = torch.as_tensor(cells, dtype=torch.long)
+    colors = torch.as_tensor(colors, dtype=torch.long)
+    u = digit_code(3).float().to(cells.device)
+    mask = cells >= 0
+    t, k = cells.clamp_min(0), colors.clamp_min(0)
+    c = torch.arange(GRID_CELLS * GRID_CELLS, device=cells.device).expand_as(cells)
+    digits = [c % GRID_CELLS, c // GRID_CELLS, t // 3, t % 3, k // 3, k % 3]
+    codes = torch.cat([u[d] for d in digits], dim=-1)
+    return codes * mask[..., None].float(), mask
+
+
+def _owner_table(owners: Sequence[Sequence[int]]) -> List[int]:
+    """The part index owning each thing 0..8 (-1 for none). A thing owned by two parts raises."""
+    table = [-1] * 9
+    for i, things in enumerate(owners):
+        for t in things:
+            t = int(t)
+            if not 0 <= t < 9:
+                raise ValueError(f"a part owns things 0..8, not {t}")
+            if table[t] >= 0:
+                raise ValueError(f"thing {t} is owned by parts {table[t]} and {i}: every token has one owner")
+            table[t] = i
+    return table
+
+
+def _thing_name(t: int) -> str:
+    from .scenes import THINGS
+    return THINGS[t] if 0 <= t < len(THINGS) else str(t)
+
+
+def _check_owned(cells: Tensor, table: List[int]) -> None:
+    asked = sorted({int(v) for v in cells[cells >= 0].reshape(-1).tolist()})
+    for t in asked:
+        if table[t] < 0:
+            raise ValueError(f"a request asks for the {_thing_name(t)} (thing {t}) and no part owns it")
+
+
+def token_owner(cells: Tensor, owners: Sequence[Sequence[int]], frame: Optional[TokenFrame] = None) -> Tensor:
+    """[B, T] long: the one owner of every token, by integers: the part owning the thing of the token's cell's request,
+    or n = len(owners) (the base) when the cell has no request. A requested thing no part owns raises, naming it."""
+    fr = _frame(frame)
+    cells = torch.as_tensor(cells, dtype=torch.long)
+    table = _owner_table(owners)
+    _check_owned(cells, table)
+    tbl = torch.tensor(table + [len(owners)], dtype=torch.long, device=cells.device)
+    cell_owner = torch.where(cells >= 0, tbl[cells.clamp_min(0)], torch.full_like(cells, len(owners)))
+    return cell_owner[:, fr.cell.to(cells.device)]
+
+
+def token_weights(cells: Tensor, owners: Sequence[Sequence[int]], method: str = "integer",
+                  frame: Optional[TokenFrame] = None) -> Tensor:
+    """[B, T, n + 1] float64: the gate of every part (column n = the base) at every token. ``method`` "integer": the
+    brackets as integer equalities; "kernel": every bracket as the inner product of two digit codes in float64. One
+    product a request, summed over the requests in cell order."""
+    if method not in ("integer", "kernel"):
+        raise ValueError(f"method is integer or kernel, not {method!r}")
+    fr = _frame(frame)
+    cells = torch.as_tensor(cells, dtype=torch.long)
+    table = _owner_table(owners)
+    _check_owned(cells, table)
+    n = len(owners)
+    dev = cells.device
+    n_cells = fr.cells * fr.cells
+    req = cells >= 0                                                     # [B, 9]
+    if method == "integer":
+        place = fr.cell_place().to(dev)                                  # [9, T] long
+        tbl = torch.tensor(table, dtype=torch.long, device=dev)
+        member = (tbl[cells.clamp_min(0)][..., None] == torch.arange(n, device=dev)) & req[..., None]   # [B, 9, n]
+        member = member.long()
+        reql = req.long()
+        w = torch.zeros(cells.shape[0], fr.n_tokens, n, dtype=torch.long, device=dev)
+        hit = torch.zeros(cells.shape[0], fr.n_tokens, dtype=torch.long, device=dev)
+        for c in range(n_cells):                                         # one product a request, summed
+            w = w + member[:, c, None, :] * place[c][None, :, None]
+            hit = hit + reql[:, c, None] * place[c][None, :]
+        return torch.cat([w, (1 - hit)[..., None]], dim=-1).double()
+    u = digit_code(fr.cells).to(dev)
+    gram = u @ u.T                                                       # [3, 3]: <u(a), u(b)>
+    c = torch.arange(n_cells, device=dev)
+    col_c, row_c = c % fr.cells, c // fr.cells
+    kp = gram[fr.column.to(dev)][:, col_c].T * gram[fr.row.to(dev)][:, row_c].T     # [9, T]
+    u3 = digit_code(3).to(dev)
+    g3 = u3 @ u3.T
+    things = torch.arange(9, device=dev)
+    fam, mem = things // 3, things % 3
+    kt = g3[fam][:, fam] * g3[mem][:, mem]                               # [9, 9]: the thing kernel
+    own = torch.zeros(9, n, dtype=torch.float64, device=dev)
+    for i, ts in enumerate(owners):
+        own[[int(t) for t in ts], i] = 1.0
+    mk = kt @ own                                                        # [9, n]: sum over owned things of the kernel
+    reqd = req.double()
+    mrow = mk[cells.clamp_min(0)] * reqd[..., None]                      # [B, 9, n]
+    w = torch.zeros(cells.shape[0], fr.n_tokens, n, dtype=torch.float64, device=dev)
+    hit = torch.zeros(cells.shape[0], fr.n_tokens, dtype=torch.float64, device=dev)
+    for ci in range(n_cells):
+        w = w + mrow[:, ci, None, :] * kp[ci][None, :, None]
+        hit = hit + reqd[:, ci, None] * kp[ci][None, :]
+    return torch.cat([w, (1.0 - hit)[..., None]], dim=-1)
+
+
+def visible_keys(cells: Tensor, serving: Tensor, hidden: Optional[Tensor] = None,
+                 frame: Optional[TokenFrame] = None) -> Tensor:
+    """[B, T] bool: the tokens a part may read. ``serving`` [B] long: the cell whose request a thing part serves (that
+    cell and every cell without a request are visible), or -1 for the base (every cell without a request). ``hidden``
+    [B, 9] bool marks cells hidden in training: they count as owned by another request (invisible). The served cell
+    must hold a request and must not be hidden."""
+    fr = _frame(frame)
+    cells = torch.as_tensor(cells, dtype=torch.long)
+    serving = torch.as_tensor(serving, dtype=torch.long, device=cells.device).reshape(-1)
+    if serving.shape[0] != cells.shape[0]:
+        raise ValueError("serving holds one cell (or -1) a row")
+    free = cells < 0
+    if hidden is not None:
+        hidden = torch.as_tensor(hidden, dtype=torch.bool, device=cells.device)
+        free = free & ~hidden
+    vis = free.clone()
+    rows = torch.nonzero(serving >= 0, as_tuple=True)[0]
+    if rows.numel():
+        sc = serving[rows]
+        if bool((sc >= cells.shape[1]).any()):
+            raise ValueError("a served cell is 0..8 or -1")
+        if bool((cells[rows, sc] < 0).any()):
+            raise ValueError("a thing part serves a cell that holds a request; this one holds none")
+        if hidden is not None and bool(hidden[rows, sc].any()):
+            raise ValueError("the served cell cannot be hidden")
+        vis[rows, sc] = True
+    return vis[:, fr.cell.to(cells.device)]

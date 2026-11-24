@@ -59,3 +59,46 @@ class AxialBandCode(nn.Module):
 
     def rotary(self) -> Rotary:
         return table_rotary(self.cos, self.sin)
+
+
+# ------------------------------------------------------------------ the anchored address rotary
+# A head of 64 numbers = 32 rotate-half pairs, split by job: pairs 0-9 turn with the token's row and pairs 10-19 with
+# its column on the relative band (the axial ladder's geometric wavelengths from lo to hi tokens, 10 a axis), pairs
+# 20-23 do not turn (content), pairs 24-27 turn by 2 pi d / 3 with the column digit d of the token's address and pairs
+# 28-31 with its row digit (base 3: the kernel cos(2 pi (d - d') / 3) is 1 for the same digit and -1/2 for another).
+ANCHORED_PAIRS = {"row": (0, 10), "column": (10, 20), "content": (20, 24), "anchor_column": (24, 28),
+                  "anchor_row": (28, 32)}
+ANCHORED_HEAD_DIM = 64
+ANCHOR_BASE = 3
+
+
+def anchored_angles(rows: Tensor, cols: Tensor, digit_col: Tensor, digit_row: Tensor, lo: float = WHOLE[0],
+                    hi: float = WHOLE[1]) -> Tensor:
+    """[B, N, 32] float32: the angle of each pair for tokens at (row, column) on the relative band (floats) with the
+    address digits (digit_col, digit_row); every input [B, N]."""
+    per = ANCHORED_PAIRS["row"][1] - ANCHORED_PAIRS["row"][0]
+    lam = float(lo) * (float(hi) / float(lo)) ** (torch.arange(per, dtype=torch.float64) / per)
+    rates = (2 * math.pi / lam).to(rows.device)
+    r, c = rows.double(), cols.double()
+    rel = torch.cat([r[..., None] * rates, c[..., None] * rates], dim=-1)                  # [B, N, 20]
+    zero = torch.zeros(rel.shape[:-1] + (4,), dtype=torch.float64, device=rows.device)
+    a_col = (2 * math.pi / ANCHOR_BASE) * digit_col.double()[..., None].expand(*digit_col.shape, 4)
+    a_row = (2 * math.pi / ANCHOR_BASE) * digit_row.double()[..., None].expand(*digit_row.shape, 4)
+    return torch.cat([rel, zero, a_col, a_row], dim=-1).float()
+
+
+def anchored_rotary(rows: Tensor, cols: Tensor, digit_col: Tensor, digit_row: Tensor, lo: float = WHOLE[0],
+                    hi: float = WHOLE[1]) -> Rotary:
+    """The rotary (q, k) -> (q, k) on [B, heads, N, 64] of ``anchored_angles`` (the rotate-half pairing: pair i joins
+    the numbers i and i + 32, as ``AxialBandCode`` pairs them)."""
+    ang = anchored_angles(rows, cols, digit_col, digit_row, lo, hi)
+    ang = torch.cat([ang, ang], dim=-1)[:, None]                                         # [B, 1, N, 64]
+    cos, sin = ang.cos(), ang.sin()
+
+    def _rot(q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
+        if q.shape[-1] != ANCHORED_HEAD_DIM:
+            raise ValueError(f"the anchored rotary needs a head of {ANCHORED_HEAD_DIM} numbers, not {q.shape[-1]}")
+        c, s = cos.to(q.dtype), sin.to(q.dtype)
+        return q * c + rotate_half(q) * s, k * c + rotate_half(k) * s
+
+    return _rot

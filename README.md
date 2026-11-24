@@ -73,6 +73,7 @@ anchor gain at a frequency of image power S:   g = (t S - (1 - t)) / (t^2 S + (1
 | `hub` | upload a folder to the Hugging Face Hub with retries (token from `HF_TOKEN` only) |
 | `environment` | the installed versions against `requirements.txt` |
 | `layout`, `experiments.layout_write` | written picture layouts: prompts with known answers, the box, cell and chain forms with their strict readers, the address of a thing instance on a 3 x 3 grid, the scores and the controls; the experiment that asks a writer (a fake, the text parser, or a chat model with an optional LoRA merged in) and scores it (see below) |
+| `scenes`, `scene_reads`, `scene_judge`, `collective`, `experiments.toy_collective` | synthetic scenes of a 3 x 3 grid with known layouts; the reads of a made scene; the cell judge; engines that read the address frame (two read forms), their trainer and the collective's joins; the experiment (see below) |
 | `compat` | the flat argument set and the single-file weight layout of the original research script |
 
 ## Capture: band engines from an existing U-Net
@@ -143,6 +144,30 @@ d = mean(x_a - x_b), se_d = sd(x_a - x_b) / sqrt(n), a tie when |d| < 2 se_d
 `writer=parser` and `form=chain_records` need the `thought-image-seeds` and `qwen-symbolic-thinking` packages);
 `variant=write_compare a=<cell> b=<cell>` compares two cells prompt by prompt.
 
+## The address frame on image tokens and the toy collective
+
+`scenes` draws synthetic scenes with exactly known layouts: a 48 x 48 canvas cut into a 3 x 3 grid of 16-pixel cells,
+each holding one of nine things (three families of three) in one of nine colors, or nothing, on a flat gray ground
+(bed F) or on one tint a scene with a smooth texture across the cells (bed C). `frame` (its last section) gives every
+image token (patch 4: a 12 x 12 grid) its place digits (column, row, place inside the cell) and every request (one
+thing in one cell) six digits of base 3, each digit coded on orthonormal rotary anchors; the gate is declared:
+
+```
+w_i(token)    = sum over requests r of <u(j), u(j_r)> <u(k), u(k_r)> [thing_r in T_i]
+w_base(token) = 1 - sum over requests r of <u(j), u(j_r)> <u(k), u(k_r)>
+```
+
+one product a request, summed over requests, so every token has exactly one owner. `collective` builds small engines
+(width 128, 2 heads, 3 blocks, a zero-born head) that read the frame in one of two forms: the address codes added to
+the token embeddings with the request in the cross-attention context (`read=embedding`), or the request as a token of
+the sequence placed by an anchored rotary whose pairs turn with the token's row and column, stay still, or turn by the
+cell's column and row digits (`read=rotary`). A part trained alone on one-thing scenes sees only its own cell and the
+cells no other request owns (a key mask in the block's self-attention) and is trained on its own cell's tokens; the
+collective serves a picture by selection, token by token (`gate`), or by the published sum of answers over an empty or
+an unconditional background. `scene_reads` scores a made scene cell by cell with a small judge (`scene_judge`), and
+reads its tint coherence, its seams and its stray ink. `python -m geolip.modular_diffusion.run toy_collective
+variant=<parts | judge | timing | compose | controls | exact | leak | wrong> ...` trains the parts and reads the rows.
+
 ## Notebooks
 
 | notebook | what it does | open |
@@ -159,6 +184,7 @@ d = mean(x_a - x_b), se_d = sd(x_a - x_b) / sqrt(n), a tie when |d| < 2 se_d
 | `colab/three_band.ipynb` | the three-band assembly: the middle and the noisy bands' engines of Stable Diffusion 1.5, inherited and reading the prompt, on the shapes `tiny` and `2222/nomid/3`, two seeds each, and one `tiny` engine trained on the whole noise range at the same total steps; the distance reads of the first capture (each engine beside the model, the three-band assembly with the first capture's clean engines, exchanges, each engine served in the other band); then every assembly judged by its pictures on 1,000 held-out prompts: Inception features, the kernel and Frechet distances against the model's own pictures and the real ones, the CLIP text-to-picture score, the model against itself from another start noise as the floor; a smoke run of every job kind with its exactness checks, the real judges checked on 16 pictures, a timing; the license copy and notice first, then each job folder; the machine kept until everything finished is shipped | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.10.0/colab/three_band.ipynb) |
 | `colab/three_band_part2.ipynb` | the three-band assembly, part 2: whether inheriting the model's weights is what makes the bands that read the prompt work: the shape `tiny` from random weights, taught by the model's answers and reading the prompt, on the middle and the noisy band, two seeds each, by part 1's recipe and data; each engine beside the model in the sampler, each band's first engine judged by its pictures on 500 held-out prompts against the model's pictures and the real ones; the model's own pictures brought back from part 1's results; a smoke run of every job kind, the real judges checked on 16 pictures, a timing; each job folder shipped as it finishes; the machine kept until everything finished is shipped | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.11.0/colab/three_band_part2.ipynb) |
 | `colab/layout_write.ipynb` | who writes the addresses of a picture and how often they are wrong: the text parser alone, Qwen3.5-2B and its LoRA fine-tune (merged) writing layouts for 600 prompts with known answers and 100 real COCO captions, as boxes, as grid cells and in the fine-tune's own text-only forms (the short form and the whole row with its question lines), with and without six worked examples (13 cells); a smoke run of every cell with the scorer's controls and a projection; each cell shipped as it finishes; the prompt-by-prompt comparisons; the machine kept until everything finished is shipped; the first cell removes a torchao older than 0.16 when the runtime ships one (PEFT cannot build a LoRA beside it) | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.11.1/colab/layout_write.ipynb) |
+| `colab/toy_collective.ipynb` | small engines that each learned one thing alone, served by place and thing addresses on the image tokens of synthetic scenes: the judge of each bed trained first with its ceiling; a smoke run of every job kind; the seconds a step with 1, 2 and 4 trainings at once (the runner count is the best throughput); then the parts of both read forms, two seeds, the whole models, and every row (the collective, the whole-picture parts by the gate and by the published sums, the whole models, real scenes) judged on 500 request lists a size, with the controls, the exactness reads, the leak, the wrong-address read, the dose and an address never trained; several runners over one roster; each job folder shipped as it finishes; the machine kept until everything finished is shipped | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.12.0/colab/toy_collective.ipynb) |
 
 ## Install
 

@@ -13,7 +13,8 @@ by least squares; units trained on stored states), stages (K-stage models that c
 needs the ``capture`` extra), band_needs (what each noise band of that U-Net needs, measured with no training: the
 born reads of block removals and the prompt's weight per band; needs the ``capture`` extra) and layout_write (how often
 a writer, a language model or a parser, writes the right addresses of a picture from a text prompt; a model writer
-needs the ``layout`` extra).
+needs the ``layout`` extra) and toy_collective (small engines that each learned one thing alone, served by place and
+thing addresses on the image tokens of synthetic scenes).
 
 ``det=on`` (any experiment): the matrix library's fixed workspace (``determinism``) is put into the process environment
 here, before the experiment module is imported and before anything touches a card.
@@ -28,7 +29,7 @@ from .config import in_notebook
 
 EXPERIMENTS_PACKAGE = "geolip.modular_diffusion.experiments"
 EXPERIMENTS = ("time_split", "chain_reads", "content", "closed_forms", "stages", "load", "capture", "band_needs",
-               "layout_write")
+               "layout_write", "toy_collective")
 
 
 def _det_value(argv: Iterable[str], overrides: dict) -> str:

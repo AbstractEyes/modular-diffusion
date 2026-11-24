@@ -102,7 +102,12 @@ NEW_FILES = ["geolip/modular_diffusion/staged.py", "geolip/modular_diffusion/for
              "tests/test_capture_runs.py", "geolip/modular_diffusion/hub.py",
              "geolip/modular_diffusion/capture/pictures.py", "tests/test_capture_pictures.py",
              "geolip/modular_diffusion/layout.py", "geolip/modular_diffusion/experiments/layout_write.py",
-             "tests/test_layout.py", "tests/test_layout_write.py"]
+             "tests/test_layout.py", "tests/test_layout_write.py",
+             "geolip/modular_diffusion/scenes.py", "geolip/modular_diffusion/scene_reads.py", "tests/test_scenes.py",
+             "tests/test_token_frame.py", "tests/test_scene_reads.py",
+             "geolip/modular_diffusion/collective.py", "geolip/modular_diffusion/scene_judge.py",
+             "geolip/modular_diffusion/experiments/toy_collective.py", "tests/test_collective.py",
+             "tests/test_scene_judge.py", "tests/test_toy_collective.py"]
 MORE_WORDS = r"(?i)\bE\d\d\b|\bmd0|\bmr_|\bmind\b|prototype night"
 
 

@@ -37,12 +37,19 @@ class SelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, 3 * dim)
         self.out = nn.Linear(dim, dim)
 
-    def forward(self, x: Tensor, rotary: Rotary) -> Tensor:
+    def forward(self, x: Tensor, rotary: Rotary, key_mask: Optional[Tensor] = None) -> Tensor:
+        """key_mask [B, N] bool (True = this token may be read), or None (every token reads every token, the path of
+        earlier versions). With a mask a query reads key y only when key_mask[y] is True or y is the query itself."""
         b, n, d = x.shape
         qkv = self.qkv(x).view(b, n, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q, k = rotary(q, k)
-        y = F.scaled_dot_product_attention(q, k, v)
+        if key_mask is None:
+            y = F.scaled_dot_product_attention(q, k, v)
+        else:
+            eye = torch.eye(n, dtype=torch.bool, device=x.device)
+            allowed = key_mask.to(device=x.device, dtype=torch.bool)[:, None, None, :] | eye[None, None]
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
         return self.out(y.transpose(1, 2).reshape(b, n, d))
 
 
@@ -87,9 +94,14 @@ class Block(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(dim, hidden), nn.GELU(approximate="tanh"), nn.Linear(hidden, dim))
         self.modulation = nn.Sequential(nn.SiLU(), zero_linear(dim, 6 * dim))
 
-    def forward(self, x: Tensor, ctx: Tensor, ctx_mask: Optional[Tensor], e: Tensor, rotary: Rotary) -> Tensor:
+    def forward(self, x: Tensor, ctx: Tensor, ctx_mask: Optional[Tensor], e: Tensor, rotary: Rotary,
+                key_mask: Optional[Tensor] = None) -> Tensor:
+        """key_mask: see ``SelfAttention.forward`` (None: the path of earlier versions)."""
         ds1, dh1, ds2, dh2, ds3, dh3 = self.modulation(e).unsqueeze(1).chunk(6, dim=-1)
-        x = x + self.attn(self.norm1(x) * (1 + ds1) + dh1, rotary)
+        if key_mask is None:
+            x = x + self.attn(self.norm1(x) * (1 + ds1) + dh1, rotary)
+        else:
+            x = x + self.attn(self.norm1(x) * (1 + ds1) + dh1, rotary, key_mask)
         x = x + self.cross(self.norm2(x) * (1 + ds2) + dh2, ctx, ctx_mask)
         x = x + self.mlp(self.norm3(x) * (1 + ds3) + dh3)
         return x
