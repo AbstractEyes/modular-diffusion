@@ -98,7 +98,8 @@ NEW_FILES = ["geolip/modular_diffusion/staged.py", "geolip/modular_diffusion/for
              "geolip/modular_diffusion/capture/measure.py", "geolip/modular_diffusion/capture/data.py",
              "tests/test_capture_frame_forms.py", "tests/test_capture_data.py", "tests/test_capture_measure.py",
              "tests/test_capture_sd15.py", "tests/test_capture_precision.py", "tests/test_capture_cuda.py",
-             "geolip/modular_diffusion/experiments/band_needs.py", "tests/test_band_needs.py"]
+             "geolip/modular_diffusion/experiments/band_needs.py", "tests/test_band_needs.py",
+             "tests/test_capture_runs.py", "geolip/modular_diffusion/hub.py"]
 MORE_WORDS = r"(?i)\bE\d\d\b|\bmd0|\bmr_|\bmind\b|prototype night"
 
 

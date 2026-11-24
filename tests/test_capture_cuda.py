@@ -116,6 +116,58 @@ def test_the_experiment_on_the_card(tmp_path):
     assert whole["final_latent_change"] == whole["final_latent_change"]
 
 
+def test_the_trainer_from_random_numbers_with_reads_on_the_card(tmp_path):
+    """A random start, reads during training and a finished job without its checkpoint, with a half-precision
+    teacher: the reads see card tensors, the weights stay float32, and a second call trains nothing."""
+    teacher = _teacher(HALF)
+    probe = _probe(teacher, batch=2)
+    source = random_source(1, (4, 16, 16))
+    seen = []
+
+    def on_every(n, engine, averaged):
+        seen.append(next(averaged.parameters()).device.type)
+        return {"live": reads.band_read(engine, teacher, "clean", probe)["mse"],
+                "averaged": reads.band_read(averaged, teacher, "clean", probe)["mse"]}
+
+    kw = dict(steps=4, batch=2, seed=2, lr=1e-3, log_every=0, log=lambda s: None, init="random", every=2,
+              on_every=on_every, keep_checkpoint=False)
+    one = T.train_band_engine(teacher, "small", "clean", source, out=str(tmp_path / "job"), **kw)
+    assert one["finished"] and [r["step"] for r in one["reads"]] == [2, 4] and seen == [DEV, DEV]
+    assert all(0.0 < r["value"]["live"] < float("inf") for r in one["reads"])
+    assert next(one["engine"].parameters()).dtype == torch.float32
+    assert not os.path.isfile(tmp_path / "job" / "checkpoint.pt")
+    again = T.train_band_engine(teacher, "small", "clean", source, out=str(tmp_path / "job"), **kw)
+    assert again["restored"] and next(again["engine"].parameters()).device.type == DEV
+    a = torch.cat([p.detach().flatten().cpu() for p in one["average"].parameters()])
+    b = torch.cat([p.detach().flatten().cpu() for p in again["average"].parameters()])
+    assert torch.equal(a, b)                                     # read back from its files, exactly
+
+
+def test_held_out_rows_a_read_curve_and_the_exchange_on_the_card(tmp_path):
+    """The experiment with a probe of held-out rows in file order, a read curve, a random start, then the exchange
+    variant sampling in groups: the same part put back reads exactly 0 on the card too."""
+    from geolip.modular_diffusion.capture.data import synthetic_shards
+    kind = "fp16" if DEV == "cuda" else "fp32"
+    rows = str(tmp_path / "rows")
+    synthetic_shards(rows, rows=8, shard_size=3, size=16, seed=4)
+    common = dict(tiny=1, device=DEV, dtype=kind, probe_data=rows, probe_first=2, probe_rows=5, chunk=2,
+                  probe_per_band=2, sample_steps=4, group=2)
+    job = tmp_path / "job"
+    r = capture.main(variant="band_engine", out=str(job), steps=4, batch=2, init="random", read_every=2,
+                     keep_checkpoint=0, save_every=0, log_every=0, **common)
+    assert [c["step"] for c in r["curve"]] == [0, 2, 4] and r["probe"]["rows"] == 5
+    assert all(0.0 < c["averaged"] < float("inf") for c in r["curve"])
+    parts = f"clean={job},middle=teacher,noisy=teacher"
+    same = capture.main(variant="exchange", parts=parts, band="clean", other=str(job), out=str(tmp_path / "same"),
+                        **common)
+    assert all(v["change"] == 0.0 for v in same["exchange"]["bands"].values())
+    assert same["exchange"]["final_latent_change"] == 0.0
+    copy = capture.main(variant="exchange", parts=parts, band="clean", other="teacher", out=str(tmp_path / "copy"),
+                        **common)
+    assert all(v["after"] == 0.0 for v in copy["exchange"]["bands"].values())
+    assert copy["exchange"]["final_latent_change"] > 0.0
+
+
 def test_band_needs_on_the_card(tmp_path):
     """The band-needs reads and their timing on the card: the born reads in full precision, the prompt read with the
     teacher cast to half precision; the exact controls hold there too."""

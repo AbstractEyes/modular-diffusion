@@ -91,15 +91,17 @@ capture loss L = lam_out mean((o_S - sg(o_T))^2) + lam_data mean((o_S - eps)^2) 
 | `capture.schedule` | the teacher's schedule; the band weights, served by the address frame's projective gate over three declared windows; step sets; the band sampling law with a whole-range share |
 | `capture.teacher` | `load_teacher` from a local folder, `find_snapshot` in the local hub cache, and a tiny random teacher for tests |
 | `capture.shapes`, `capture.engine` | engine shapes (layers kept per stage, middle block, three or four stages; `full`, `base`, `small`, `tiny`) and engines made by paired block removal, every tensor copied from the teacher exactly; an engine that ignores the prompt; size and measured cost |
-| `capture.loss`, `capture.train` | the capture loss and one band engine trained alone (pure Adam, an averaged copy, exact resume from a checkpoint) |
+| `capture.loss`, `capture.train` | the capture loss and one band engine trained alone (pure Adam, an averaged copy, exact resume from a checkpoint); from the teacher's numbers or from random ones (`init`); reads during training by a hook that changes no number of the training and survives a resume (`every`, `on_every`); a finished job may drop its checkpoint and is then read back, never trained again (`keep_checkpoint`); the median seconds a step and the trained parameter count in train.json |
 | `capture.assemble` | the assembly (parts blended by the band weights; only live parts run) and a deterministic DDIM sampler with guidance |
-| `capture.reads` | probes (float32 latents and noise; their rows read all at once or in batches) and reads: a band's read, the born read, the exchange test, the off-band control |
-| `capture.measure`, `capture.data` | the teacher measured per band with no training (the born read of every single removal; how much each band needs the prompt; measured cost); latent shards and batch sources |
-| `experiments.capture` | `python -m geolip.modular_diffusion.run capture variant=<band_engine, born or assembly> ...` (`tiny=1` for a smoke run on the tiny random teacher) |
+| `capture.reads` | probes (float32 latents and noise; their rows read all at once or in batches) and reads: a band's read, the born read, the exchange test (a part put back for itself reads exactly 0), the off-band control; a probe sampled in groups of rows, group j from the noise of seed + 100003 j, the same for every model compared (`sample_probe`) |
+| `capture.measure`, `capture.data` | the teacher measured per band with no training (the born read of every single removal; how much each band needs the prompt; measured cost); latent shards and batch sources; rows of the shards in file order (`rows_in_order`); parquet pictures after a skip |
+| `experiments.capture` | `python -m geolip.modular_diffusion.run capture variant=<band_engine, born, assembly or exchange> ...` (`tiny=1` for a smoke run on the tiny random teacher); a probe of held-out rows in file order (`probe_data`, `probe_first`, `probe_rows`, `chunk`); for band_engine `init`, `read_every` (the read curve) and `keep_checkpoint`; for exchange `parts`, `band`, `other`; sampling `group` rows at a time |
+| `hub` | `ship(folder, repo, path, message, ignore=("*.safetensors", "checkpoint.pt"))` uploads a folder without the files the patterns name (a pattern without a slash matches at any depth) |
 
 An engine's numbers are float32; the teacher may be kept in half precision on a card (every part casts its inputs to
 its own precision and answers in the latents'). `tests/test_capture_cuda.py` runs the reads, the measurements, the
-sampler and the trainer with its resume on a card (off unless `MD_TEST_CUDA=1`).
+sampler and the trainer with its resume on a card, and the random start, the reads during training, a held-out probe
+and the exchange variant (off unless `MD_TEST_CUDA=1`).
 
 ## Notebooks
 

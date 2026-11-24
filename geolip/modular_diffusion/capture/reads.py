@@ -10,6 +10,15 @@ evenly over the band's step set. At a step t the probe's input is z_t = sqrt(a_t
                                               final latents of the sampler
     off_band(part, teacher, served, trained, probe)
                                               a part read on a band it was not made for (the control that fails)
+    sample_probe(model, probe, steps, guidance, group)
+                                              the sampler's final latents of every probe row, ``group`` rows at a time
+
+GROUPED SAMPLING: the probe's rows are cut into consecutive groups of ``group`` rows (the last may be smaller; 0 = one
+group of every row). Group j starts from ``assemble.initial_noise(group_seed(probe.seed, j), rows of the group)``,
+group_seed(s, j) = s + 100003 j, so group 0 starts from the probe's own seed (one group gives exactly the sampling of
+all rows in one batch) and the noise depends only on the probe's seed, the group size and the group's index: two models
+sampled with the same probe and group size start every row from the same noise. The same rows with ANOTHER group size
+get other noise (not promised to match). With guidance a forward holds 2 x group rows.
 
 Every read returns a plain dict of numbers (and names), ready for ``write_json`` and ``table``.
 """
@@ -24,8 +33,8 @@ import torch
 from torch import Tensor
 
 from . import BANDS
-from .assemble import Assembly, sample
-from .engine import as_part, build_engine, param_count
+from .assemble import Assembly, initial_noise, sample
+from .engine import UNetPart, as_part, build_engine, param_count
 from .schedule import add_noise, band_index, band_steps, band_weights, sd15_alphas_cumprod
 from .shapes import Shape, shape_from
 
@@ -118,18 +127,65 @@ def born_read(teacher, shape: Union[str, Shape], band: str, probe: Probe, text: 
     return r
 
 
+def group_seed(seed: int, j: int) -> int:
+    """The start-noise seed of the sampling group j of a probe of seed ``seed`` (group 0: the seed itself)."""
+    return int(seed) + 100_003 * int(j)
+
+
+def sample_groups(rows: int, group: int):
+    """[(first row, rows)] of the sampling groups of ``rows`` rows (``group`` 0: one group)."""
+    rows, group = int(rows), int(group or 0)
+    if group < 0:
+        raise ValueError("group is 0 (one group) or a positive number of rows")
+    if group == 0 or group >= rows:
+        return [(0, rows)]
+    return [(i, min(group, rows - i)) for i in range(0, rows, group)]
+
+
+@torch.no_grad()
+def sample_probe(model, probe: Probe, sample_steps: int = 50, guidance: float = 7.5, group: int = 0,
+                 seed: Optional[int] = None) -> Tensor:
+    """The sampler's final latents [N, C, h, w] of every probe row (its states, its empty states, ``sample_steps``
+    steps), ``group`` rows at a time; group j starts from the noise of ``group_seed(seed, j)`` (``seed``: the probe's
+    by default). See the module's text for the rule."""
+    if probe.empty is None:
+        raise ValueError("sampling a probe needs its empty prompt's states")
+    s = probe.seed if seed is None else int(seed)
+    shape = tuple(probe.x0.shape[1:])
+    out = []
+    for j, (first, n) in enumerate(sample_groups(probe.states.shape[0], group)):
+        z = initial_noise(group_seed(s, j), n, shape)
+        out.append(sample(model, probe.states[first:first + n], probe.empty, s, sample_steps, guidance,
+                          latent_shape=shape, alphas_cumprod=probe.alphas_cumprod, z=z))
+    return torch.cat(out)
+
+
+def _reuse(parts: Dict[str, object], other_part):
+    """``other_part`` itself, or the assembly's own wrapped part when ``other_part`` is the same model (the same object,
+    or a teacher or U-Net whose U-Net is the same object): a part put back for itself then shares its slot as before."""
+    for p in parts.values():
+        if p is other_part:
+            return p
+        if isinstance(p, UNetPart):
+            unet = other_part if hasattr(other_part, "down_blocks") else getattr(other_part, "unet", None)
+            if unet is not None and p.unet is unet:
+                return p
+    return other_part
+
+
 def exchange(assembly: Assembly, band: str, other_part, probe: Probe, teacher=None, sample_steps: int = 50,
-             guidance: float = 7.5, seed: Optional[int] = None) -> dict:
+             guidance: float = 7.5, seed: Optional[int] = None, group: int = 0) -> dict:
     """Replace one band's part of an assembly by ``other_part`` and read what moves.
 
     Per band: its read against the teacher (``teacher``; the assembly itself when none is given, so the reads are the
     change of the answers) before and after, and the largest change of the answers on the probe steps where the
     replaced band's weight is exactly zero (outside its crossfade it must be exactly 0.0). Then the mean squared change
-    of the final latents of the sampler (the probe's states and empty states, ``sample_steps`` steps, the probe's seed)
-    when the probe holds empty states."""
+    over all rows of the final latents of the sampler (``sample_probe``: the probe's states and empty states,
+    ``sample_steps`` steps, ``group`` rows at a time, the same start noise for both assemblies) when the probe holds
+    empty states. A part put back for itself (the same model) changes nothing: every number is exactly 0."""
     band = BANDS[band_index(band)]
     parts = {b: assembly.part(b) for b in BANDS}
-    parts[band] = other_part
+    parts[band] = _reuse(parts, other_part)
     after = Assembly(parts)
     ref_model = teacher if teacher is not None else assembly
     out = {"band": band, "bands": {}}
@@ -147,13 +203,10 @@ def exchange(assembly: Assembly, band: str, other_part, probe: Probe, teacher=No
         out["bands"][b] = {"before": r0["mse"], "after": r1["mse"], "change": r1["mse"] - r0["mse"],
                            "silent_steps": silent, "largest_change_where_silent": moved}
     if probe.empty is not None and int(sample_steps) > 0:
-        s = probe.seed if seed is None else int(seed)
-        shape = tuple(probe.x0.shape[1:])
-        z0 = sample(assembly, probe.states, probe.empty, s, sample_steps, guidance, latent_shape=shape,
-                    alphas_cumprod=probe.alphas_cumprod)
-        z1 = sample(after, probe.states, probe.empty, s, sample_steps, guidance, latent_shape=shape,
-                    alphas_cumprod=probe.alphas_cumprod)
+        z0 = sample_probe(assembly, probe, sample_steps, guidance, group, seed)
+        z1 = sample_probe(after, probe, sample_steps, guidance, group, seed)
         out["final_latent_change"] = float((z1.double() - z0.double()).pow(2).mean())
+        out["sample_group"] = int(group or 0)
     return out
 
 

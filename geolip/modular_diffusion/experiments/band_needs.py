@@ -243,18 +243,9 @@ class _Job:
 
     def rows(self, first: int, n: int):
         """(latents float32 [n, C, h, w], ids long [n, 77]): rows first .. first + n - 1 of the shards, in file order."""
-        if self._rows is None:
-            from ..capture.data import read_index, read_shard
-            index = read_index(self.folder)
-            lat, ids, got = [], [], 0
-            for name in index["shards"]:
-                if got >= self.need:
-                    break
-                x, t = read_shard(os.path.join(self.folder, name))
-                lat.append(x)
-                ids.append(t)
-                got += x.shape[0]
-            self._rows = (torch.cat(lat)[: self.need].float(), torch.cat(ids)[: self.need].long())
+        if self._rows is None:                          # the job's rows read once (``capture.data.rows_in_order``)
+            from ..capture.data import rows_in_order
+            self._rows = rows_in_order(self.folder, 0, self.need)
         return self._rows[0][first:first + n], self._rows[1][first:first + n]
 
 

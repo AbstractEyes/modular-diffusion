@@ -15,7 +15,9 @@ encoded.
                                            writes shards from pictures and captions; a stopped job continues where it
                                            stopped
     synthetic_batches(size, ...)           a source of random latents and ids, for tests
-    parquet_pictures(path, n)              the first n pictures and captions of one parquet file, in file order
+    rows_in_order(folder, first, n)        rows first .. first + n - 1 of a folder of shards in FILE order (shard 0's
+                                           rows first), not shuffled: held-out probes and measurements
+    parquet_pictures(path, n, skip)        pictures and captions skip .. skip + n - 1 of one parquet file, in file order
 
 The stream's order: pass e (e = 0, 1, ...) visits the shards in a random order drawn from ``seed`` and ``e``, and the
 rows of each shard in a random order drawn from ``seed``, ``e`` and the shard's position; a batch takes the next B rows
@@ -62,6 +64,33 @@ def read_shard(path: str) -> Tuple[Tensor, Tensor]:
     from safetensors.torch import load_file
     d = load_file(path)
     return d["latents"], d["ids"]
+
+
+def rows_in_order(folder: str, first: int, n: int) -> Tuple[Tensor, Tensor]:
+    """(latents float32 [n, C, h, w], ids long [n, 77]): rows ``first`` .. ``first + n - 1`` of a folder of shards in
+    file order (row i is the i-th row of the shards taken in the index's order). Shards wholly before ``first`` or
+    after the last row are not read. ValueError when the folder holds fewer than ``first + n`` rows."""
+    first, n = int(first), int(n)
+    if first < 0 or n < 1:
+        raise ValueError("first >= 0 and n >= 1")
+    index = read_index(folder)
+    counts = [int(c) for c in index["counts"]]
+    if sum(counts) < first + n:
+        raise ValueError(f"{folder} holds {sum(counts)} rows, fewer than the {first + n} asked for (rows {first} .. "
+                         f"{first + n - 1})")
+    lat, ids = [], []
+    start = 0                                           # the file-order number of the shard's first row
+    for name, count in zip(index["shards"], counts):
+        end = start + count
+        if end > first and start < first + n:
+            x, t = read_shard(os.path.join(folder, name))
+            lo, hi = max(first, start) - start, min(first + n, end) - start
+            lat.append(x[lo:hi])
+            ids.append(t[lo:hi])
+        start = end
+        if start >= first + n:
+            break
+    return torch.cat(lat).float(), torch.cat(ids).long()
 
 
 def write_shard(path: str, latents: Tensor, ids: Tensor) -> None:
@@ -292,22 +321,29 @@ def encode_shards(images: Union[str, Iterable], captions: Sequence[str], out_fol
 
 # ------------------------------------------------------------------ pictures from a parquet file
 def parquet_pictures(path: str, n: int, image: str = "image", caption: str = "answer",
-                     keep: Sequence[str] = ("id", "license", "file_name")) -> Tuple[list, List[str], List[dict]]:
-    """The first ``n`` rows of ONE parquet file, in file order: (pictures: RGB PIL images, captions: str, meta: one dict
-    a row of the ``keep`` columns the file has). The file is read in batches of rows, never whole. The image cell is a
-    struct with ``bytes`` (an encoded picture, decoded here from memory); the caption cell is a string or a list of
-    strings (the first is taken). ValueError when the file holds fewer than ``n`` rows, lacks the image or caption
-    column, or a row's picture or caption is empty."""
+                     keep: Sequence[str] = ("id", "license", "file_name"),
+                     skip: int = 0) -> Tuple[list, List[str], List[dict]]:
+    """Rows ``skip`` .. ``skip + n - 1`` of ONE parquet file, in file order (``n`` 0: every row after ``skip``):
+    (pictures: RGB PIL images, captions: str, meta: one dict a row of the ``keep`` columns the file has). The file is
+    read in batches of rows, never whole, and the skipped rows are never decoded. The image cell is a struct with
+    ``bytes`` (an encoded picture, decoded here from memory); the caption cell is a string or a list of strings (the
+    first is taken). ValueError when the file holds fewer than ``skip + n`` rows (or none after ``skip``), lacks the
+    image or caption column, or a row's picture or caption is empty (the error names the row's number in the file)."""
     import io
     import pyarrow.parquet as pq
     from PIL import Image
-    n = int(n)
-    if n < 1:
-        raise ValueError("n is at least 1")
+    n, skip = int(n), int(skip)
+    if n < 0 or skip < 0:
+        raise ValueError("n >= 0 (0: every row after skip) and skip >= 0")
     pf = pq.ParquetFile(path)
     total = int(pf.metadata.num_rows)
-    if total < n:
-        raise ValueError(f"{path} holds {total} rows, fewer than the {n} asked for")
+    if n == 0:
+        n = total - skip
+        if n < 1:
+            raise ValueError(f"{path} holds {total} rows: none after the {skip} skipped")
+    if total < skip + n:
+        raise ValueError(f"{path} holds {total} rows, fewer than the {skip + n} asked for (rows {skip} .. "
+                         f"{skip + n - 1})")
     names = list(pf.schema_arrow.names)
     for col in (image, caption):
         if col not in names:
@@ -316,11 +352,17 @@ def parquet_pictures(path: str, n: int, image: str = "image", caption: str = "an
     pictures: list = []
     captions: List[str] = []
     meta: List[dict] = []
-    for batch in pf.iter_batches(batch_size=min(64, n), columns=[image, caption] + kept):
-        cols = batch.to_pydict()
-        for i in range(batch.num_rows):
-            row = len(pictures)
-            if row == n:
+    seen = 0                                            # file rows before the current batch
+    for batch in pf.iter_batches(batch_size=64 if skip else min(64, n), columns=[image, caption] + kept):
+        if seen + batch.num_rows <= skip:               # a batch wholly inside the skipped rows: not decoded
+            seen += batch.num_rows
+            continue
+        lo = max(0, skip - seen)
+        seen += batch.num_rows
+        cols = batch.slice(lo).to_pydict()
+        for i in range(batch.num_rows - lo):
+            row = skip + len(pictures)
+            if len(pictures) == n:
                 break
             cell = cols[image][i]
             raw = cell.get("bytes") if isinstance(cell, dict) else cell
