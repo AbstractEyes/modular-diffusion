@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modular-diffusion"
-version = "0.7.2"
+version = "0.8.0"
 description = "A flow-matching image model assembled from independently trainable units: noise-stage bodies, frequency-band members, content experts and a closed-form spectral anchor"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ hub = ["huggingface_hub>=0.30"]
 data = ["pyarrow>=15"]
 guard = ["psutil>=5.9"]
 judge = ["torchmetrics>=1.6", "torch-fidelity>=0.3", "torchvision>=0.19", "scipy>=1.11"]
+capture = ["diffusers>=0.30", "transformers>=4.40", "huggingface_hub>=0.30"]
 test = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]

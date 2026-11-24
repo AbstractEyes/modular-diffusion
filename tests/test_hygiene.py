@@ -87,7 +87,17 @@ NEW_FILES = ["geolip/modular_diffusion/staged.py", "geolip/modular_diffusion/for
              "tests/test_unchanged.py", "geolip/modular_diffusion/frame.py", "tests/test_frame.py", "tests/test_births.py",
              "tests/test_thaw.py", "tests/test_members_avg.py", "tests/test_optimizer_partial.py", "tests/test_rows.py",
              "tests/test_tree_parts.py", "tests/test_graft.py", "tests/test_parts_variant.py",
-             "tests/test_blind_source.py", "tests/test_tree_streams.py"]
+             "tests/test_blind_source.py", "tests/test_tree_streams.py",
+             "geolip/modular_diffusion/capture/__init__.py", "geolip/modular_diffusion/capture/schedule.py",
+             "geolip/modular_diffusion/capture/teacher.py", "geolip/modular_diffusion/capture/shapes.py",
+             "geolip/modular_diffusion/capture/engine.py", "geolip/modular_diffusion/capture/loss.py",
+             "geolip/modular_diffusion/capture/train.py", "geolip/modular_diffusion/capture/assemble.py",
+             "geolip/modular_diffusion/capture/reads.py", "geolip/modular_diffusion/experiments/capture.py",
+             "tests/test_capture_schedule.py", "tests/test_capture_engine.py", "tests/test_capture_assemble.py",
+             "tests/test_capture_reads.py", "tests/test_capture_train.py",
+             "geolip/modular_diffusion/capture/measure.py", "geolip/modular_diffusion/capture/data.py",
+             "tests/test_capture_frame_forms.py", "tests/test_capture_data.py", "tests/test_capture_measure.py",
+             "tests/test_capture_sd15.py", "tests/test_capture_precision.py", "tests/test_capture_cuda.py"]
 MORE_WORDS = r"(?i)\bE\d\d\b|\bmd0|\bmr_|\bmind\b|prototype night"
 
 

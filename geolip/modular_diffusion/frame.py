@@ -247,3 +247,42 @@ def check_cover(model) -> Tuple[List[Tuple[float, float]], List[Tuple[float, flo
     if not owners:
         return [], []
     return cover([(o.lo, o.hi) for o in owners])
+
+
+# ------------------------------------------------------------------ proposed forms (tested; used by no model yet)
+def overlap_weights(u: Tensor) -> Tuple[Tensor, Tensor]:
+    """The overlap form over owners' arguments u >= 0 (the last axis is the owners) -> (weights, base), float64:
+
+        w_i  = sinh(u_i) / (sum_j sinh(u_j) + exp(-sum_j u_j))
+        base = exp(-sum_j u_j) / (the same denominator)
+
+    The weights and the base weight sum to one. An owner at rest (u_i = 0) weighs exactly 0.0. With at most one owner
+    above zero the denominator is cosh(u) and the form equals the discounted form sinh(u_i) / (1 + sum_j (cosh(u_j) - 1));
+    with several owners above zero they share the mass instead of each taking up to one."""
+    u = u.double()
+    if bool((u < 0).any()):
+        raise ValueError("the overlap form takes non-negative arguments")
+    s = torch.sinh(u)
+    rest = torch.exp(-u.sum(dim=-1, keepdim=True))
+    den = s.sum(dim=-1, keepdim=True) + rest
+    return s / den, (rest / den).squeeze(-1)
+
+
+def request_arguments(requests: Sequence[Sequence[int]], owners: Sequence[Sequence[int]], U: float = 5.0) -> Tensor:
+    """[n]: the argument of each owner's gate for a set of requests, float64. An owner's address and every request are
+    tuples of digits of one length L. The argument is U times the SUM over requests of the PRODUCT over digits of the
+    exact digit match, so each request fires on the one address that matches it on every digit: k requests fire on at
+    most k addresses (never on the k^L addresses that a product over digits of per-digit sums would light)."""
+    req = torch.as_tensor([tuple(int(d) for d in r) for r in requests], dtype=torch.long)
+    own = torch.as_tensor([tuple(int(d) for d in o) for o in owners], dtype=torch.long)
+    if req.dim() != 2 or own.dim() != 2 or req.shape[1] != own.shape[1]:
+        raise ValueError("requests and owners are lists of digit tuples of one length")
+    match = (req[:, None, :] == own[None, :, :]).double()      # [k, n, L]: the exact match of each digit
+    return float(U) * match.prod(dim=2).sum(dim=0)
+
+
+def request_weights(requests: Sequence[Sequence[int]], owners: Sequence[Sequence[int]],
+                    U: float = 5.0) -> Tuple[Tensor, Tensor]:
+    """The overlap form (``overlap_weights``) over the owners' arguments for a set of requests
+    (``request_arguments``) -> (weights [n], base)."""
+    return overlap_weights(request_arguments(requests, owners, U))

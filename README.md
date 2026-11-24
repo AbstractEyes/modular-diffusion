@@ -74,6 +74,33 @@ anchor gain at a frequency of image power S:   g = (t S - (1 - t)) / (t^2 S + (1
 | `environment` | the installed versions against `requirements.txt` |
 | `compat` | the flat argument set and the single-file weight layout of the original research script |
 
+## Capture: band engines from an existing U-Net
+
+`geolip.modular_diffusion.capture` (extra `capture`: diffusers, transformers) takes Stable Diffusion 1.5 apart along
+the noise range. The teacher stays frozen and is read from a local diffusers folder (nothing is downloaded).
+
+```
+steps t = 0 .. 999 (larger is noisier); z_t = sqrt(a_t) x0 + sqrt(1 - a_t) eps; the teacher predicts eps
+band coordinate s = t / 1000; bands clean / middle / noisy with edges 0.35, 0.75 and a crossfade half-width 0.06
+w_clean = 1 - up1, w_middle = up1 (1 - up2), w_noisy = up1 up2, up1 = ramp(s - 0.35), up2 = ramp(s - 0.75)
+capture loss L = lam_out mean((o_S - sg(o_T))^2) + lam_data mean((o_S - eps)^2)      (lam_out 1, lam_data 0)
+```
+
+| module | what it holds |
+|---|---|
+| `capture.schedule` | the teacher's schedule; the band weights, served by the address frame's projective gate over three declared windows; step sets; the band sampling law with a whole-range share |
+| `capture.teacher` | `load_teacher` from a local folder, `find_snapshot` in the local hub cache, and a tiny random teacher for tests |
+| `capture.shapes`, `capture.engine` | engine shapes (layers kept per stage, middle block, three or four stages; `full`, `base`, `small`, `tiny`) and engines made by paired block removal, every tensor copied from the teacher exactly; an engine that ignores the prompt; size and measured cost |
+| `capture.loss`, `capture.train` | the capture loss and one band engine trained alone (pure Adam, an averaged copy, exact resume from a checkpoint) |
+| `capture.assemble` | the assembly (parts blended by the band weights; only live parts run) and a deterministic DDIM sampler with guidance |
+| `capture.reads` | probes (float32 latents and noise; their rows read all at once or in batches) and reads: a band's read, the born read, the exchange test, the off-band control |
+| `capture.measure`, `capture.data` | the teacher measured per band with no training (the born read of every single removal; how much each band needs the prompt; measured cost); latent shards and batch sources |
+| `experiments.capture` | `python -m geolip.modular_diffusion.run capture variant=<band_engine, born or assembly> ...` (`tiny=1` for a smoke run on the tiny random teacher) |
+
+An engine's numbers are float32; the teacher may be kept in half precision on a card (every part casts its inputs to
+its own precision and answers in the latents'). `tests/test_capture_cuda.py` runs the reads, the measurements, the
+sampler and the trainer with its resume on a card (off unless `MD_TEST_CUDA=1`).
+
 ## Notebooks
 
 | notebook | what it does | open |
@@ -95,7 +122,7 @@ pip install "modular-diffusion @ git+https://github.com/AbstractEyes/modular-dif
 ```
 
 Extras: `data` (parquet to npz), `hub` (upload to the Hub), `judge` (the picture score: torch-fidelity, torchmetrics),
-`guard` (the roster runner's memory guard), `test`; for example `"modular-diffusion[data,hub,judge] @ git+..."`.
+`guard` (the roster runner's memory guard), `capture` (diffusers and transformers, for `capture`), `test`; for example `"modular-diffusion[data,hub,judge] @ git+..."`.
 
 For development and tests:
 

@@ -8,8 +8,9 @@
 
 The experiments (``EXPERIMENTS``): time_split (what a stage costs when it shares nothing), chain_reads (reads on saved
 stage models), content (where and how the class enters; class experts; a class snapped in), closed_forms (heads solved
-by least squares; units trained on stored states), stages (K-stage models that continue one run, tails, growth) and
-load (a CPU load beside another job).
+by least squares; units trained on stored states), stages (K-stage models that continue one run, tails, growth), load
+(a CPU load beside another job) and capture (band engines made from an existing diffusion U-Net and read against it;
+needs the ``capture`` extra).
 
 ``det=on`` (any experiment): the matrix library's fixed workspace (``determinism``) is put into the process environment
 here, before the experiment module is imported and before anything touches a card.
@@ -23,7 +24,7 @@ from typing import Any, Iterable
 from .config import in_notebook
 
 EXPERIMENTS_PACKAGE = "geolip.modular_diffusion.experiments"
-EXPERIMENTS = ("time_split", "chain_reads", "content", "closed_forms", "stages", "load")
+EXPERIMENTS = ("time_split", "chain_reads", "content", "closed_forms", "stages", "load", "capture")
 
 
 def _det_value(argv: Iterable[str], overrides: dict) -> str:

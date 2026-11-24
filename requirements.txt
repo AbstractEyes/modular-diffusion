@@ -12,7 +12,14 @@ torchvision==0.26.0+cu128
 numpy==2.5.3
 pillow==12.3.0
 safetensors==0.8.0
-huggingface_hub==1.31.0
+# The capture packages below need this release of the Hub client (the set before them ran on 1.31.0). The test suite
+# passes on it; the upload helper (hub.py) has not yet been run against the Hub with it.
+huggingface_hub==2.4.0
+
+# capture (a diffusers U-Net as the teacher, its CLIP text encoder and tokenizer)
+diffusers==0.43.0
+transformers==5.24.0
+tokenizers==0.23.3
 
 # the picture judge (Frechet and kernel distances on generated samples)
 scipy==1.18.1
