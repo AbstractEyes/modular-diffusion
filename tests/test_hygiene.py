@@ -100,7 +100,9 @@ NEW_FILES = ["geolip/modular_diffusion/staged.py", "geolip/modular_diffusion/for
              "tests/test_capture_sd15.py", "tests/test_capture_precision.py", "tests/test_capture_cuda.py",
              "geolip/modular_diffusion/experiments/band_needs.py", "tests/test_band_needs.py",
              "tests/test_capture_runs.py", "geolip/modular_diffusion/hub.py",
-             "geolip/modular_diffusion/capture/pictures.py", "tests/test_capture_pictures.py"]
+             "geolip/modular_diffusion/capture/pictures.py", "tests/test_capture_pictures.py",
+             "geolip/modular_diffusion/layout.py", "geolip/modular_diffusion/experiments/layout_write.py",
+             "tests/test_layout.py", "tests/test_layout_write.py"]
 MORE_WORDS = r"(?i)\bE\d\d\b|\bmd0|\bmr_|\bmind\b|prototype night"
 
 

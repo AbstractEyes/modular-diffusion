@@ -72,6 +72,7 @@ anchor gain at a frequency of image power S:   g = (t S - (1 - t)) / (t^2 S + (1
 | `jobs` | a roster runner: one job at a time, a stop file, DONE / FAILED markers, a start guard, a wall cap; claims for several runners on one roster, a hook after each job, jobs that need others |
 | `hub` | upload a folder to the Hugging Face Hub with retries (token from `HF_TOKEN` only) |
 | `environment` | the installed versions against `requirements.txt` |
+| `layout`, `experiments.layout_write` | written picture layouts: prompts with known answers, the box, cell and chain forms with their strict readers, the address of a thing instance on a 3 x 3 grid, the scores and the controls; the experiment that asks a writer (a fake, the text parser, or a chat model with an optional LoRA merged in) and scores it (see below) |
 | `compat` | the flat argument set and the single-file weight layout of the original research script |
 
 ## Capture: band engines from an existing U-Net
@@ -116,6 +117,32 @@ distance between their pictures and, row by row, the difference of their text-to
 are the same, or one a prefix of the other, sampled with the same group size, noise seed, steps and guidance, start
 every common row from the same noise.
 
+## Layouts: how often a writer writes the right addresses
+
+`geolip.modular_diffusion.layout` (the standard library only) measures a writer of picture layouts from a text prompt:
+which things, how many, which color on which, and where each goes on a 3 x 3 grid. Each thing instance gets one
+ADDRESS, a cell of the grid (from a box on the 0 to 1000 grid: the cell holding its center, cut at 0.38 and 0.62 of
+the width and the height; from words: the named cell). 600 prompts have answers known by construction (100 each of
+count, absent, colour, place, relation and combined, from a seeded generator), three forms of written answer are read
+by strict grammars (a JSON list of boxes, one line a thing `name | color | column | row`, a written chain of thought
+read line by line), and every prompt is scored 0 or 1 on parsed, things, counts, colors, placed, spatial, no conflict
+(no cell holds two different things) and absent, with ADDRESS RIGHT the product of the scores of its family; the
+published rules of three layout papers are computed beside it on the raw boxes. Controls: the generator's own layouts
+score 1, answers scored against another prompt of the family score near 0, broken answers each give their own kind of
+failure, and a repeated ask gives the same text.
+
+```
+address of a box: col = left if c_x < 0.38, right if c_x > 0.62, else centre (rows the same on c_y)
+rate p over n distinct prompt texts with standard error sqrt(p (1 - p) / n) (a text asked several times counts once
+when its copies are scored alike); two writers compared text by text:
+d = mean(x_a - x_b), se_d = sd(x_a - x_b) / sqrt(n), a tie when |d| < 2 se_d
+```
+
+`python -m geolip.modular_diffusion.run layout_write variant=write writer=<fake:truth | parser | model> form=<box | cell
+| chain_records | chain_text | spec> examples=1 out=<folder>` runs one cell (extra `layout` for a model writer;
+`writer=parser` and `form=chain_records` need the `thought-image-seeds` and `qwen-symbolic-thinking` packages);
+`variant=write_compare a=<cell> b=<cell>` compares two cells prompt by prompt.
+
 ## Notebooks
 
 | notebook | what it does | open |
@@ -130,6 +157,8 @@ every common row from the same noise.
 | `colab/band_needs.ipynb` | what each noise band of Stable Diffusion 1.5 needs, with no training (`python -m geolip.modular_diffusion.run band_needs ...`): 256 captioned COCO pictures with their content hash, encoded once by the model's own image encoder; a smoke run; a measured projection of the run's minutes; then the born reads of every single block removal and of the shapes base, small and tiny on each band, the prompt's weight per band by sampling, and the measured cost of every shape, on two probe seeds, resumable unit by unit | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.8.0/colab/band_needs.ipynb) |
 | `colab/first_capture.ipynb` | the first capture: the clean band's engine of Stable Diffusion 1.5, with no prompt input, made three ways on the shape `tiny` (the model's weights inherited and taught by the model; random weights taught by the model; random weights taught by the noise) and inherited on `2222/nomid/3`, two seeds each, read every 250 steps on 64 held-out rows; then served in the sampler beside the model, exchanged for its twin and served off its band; a smoke run of every job kind, the sampler checked against the diffusers DDIM scheduler, a timing; a copy of the model's license and a notice shipped first, then each job folder with its engine files; the machine kept until everything finished is shipped | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.9.1/colab/first_capture.ipynb) |
 | `colab/three_band.ipynb` | the three-band assembly: the middle and the noisy bands' engines of Stable Diffusion 1.5, inherited and reading the prompt, on the shapes `tiny` and `2222/nomid/3`, two seeds each, and one `tiny` engine trained on the whole noise range at the same total steps; the distance reads of the first capture (each engine beside the model, the three-band assembly with the first capture's clean engines, exchanges, each engine served in the other band); then every assembly judged by its pictures on 1,000 held-out prompts: Inception features, the kernel and Frechet distances against the model's own pictures and the real ones, the CLIP text-to-picture score, the model against itself from another start noise as the floor; a smoke run of every job kind with its exactness checks, the real judges checked on 16 pictures, a timing; the license copy and notice first, then each job folder; the machine kept until everything finished is shipped | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.10.0/colab/three_band.ipynb) |
+| `colab/three_band_part2.ipynb` | the three-band assembly, part 2: whether inheriting the model's weights is what makes the bands that read the prompt work: the shape `tiny` from random weights, taught by the model's answers and reading the prompt, on the middle and the noisy band, two seeds each, by part 1's recipe and data; each engine beside the model in the sampler, each band's first engine judged by its pictures on 500 held-out prompts against the model's pictures and the real ones; the model's own pictures brought back from part 1's results; a smoke run of every job kind, the real judges checked on 16 pictures, a timing; each job folder shipped as it finishes; the machine kept until everything finished is shipped | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.11.0/colab/three_band_part2.ipynb) |
+| `colab/layout_write.ipynb` | who writes the addresses of a picture and how often they are wrong: the text parser alone, Qwen3.5-2B and its LoRA fine-tune (merged) writing layouts for 600 prompts with known answers and 100 real COCO captions, as boxes, as grid cells and in the fine-tune's own text-only forms (the short form and the whole row with its question lines), with and without six worked examples (13 cells); a smoke run of every cell with the scorer's controls and a projection; each cell shipped as it finishes; the prompt-by-prompt comparisons; the machine kept until everything finished is shipped | [Open in Colab](https://colab.research.google.com/github/AbstractEyes/modular-diffusion/blob/v0.11.0/colab/layout_write.ipynb) |
 
 ## Install
 
@@ -140,7 +169,8 @@ pip install "modular-diffusion @ git+https://github.com/AbstractEyes/modular-dif
 ```
 
 Extras: `data` (parquet to npz), `hub` (upload to the Hub), `judge` (the picture score: torch-fidelity, torchmetrics),
-`guard` (the roster runner's memory guard), `capture` (diffusers and transformers, for `capture`), `test`; for example `"modular-diffusion[data,hub,judge] @ git+..."`.
+`guard` (the roster runner's memory guard), `capture` (diffusers and transformers, for `capture`), `layout`
+(transformers, accelerate, peft, for a model writing layouts), `test`; for example `"modular-diffusion[data,hub,judge] @ git+..."`.
 
 For development and tests:
 
