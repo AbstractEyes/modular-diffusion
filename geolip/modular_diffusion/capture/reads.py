@@ -162,7 +162,7 @@ def off_band(part, teacher, band_served: str, band_trained: str, probe: Probe) -
     served = band_read(part, teacher, band_served, probe)
     own = band_read(part, teacher, band_trained, probe)
     return {"served": served["band"], "trained": own["band"], "off_band_mse": served["mse"], "on_band_mse": own["mse"],
-            "ratio": served["mse"] / own["mse"] if own["mse"] > 0 else float("inf")}
+            "ratio": served["mse"] / own["mse"] if own["mse"] > 0 else None}      # None: the on-band read is exactly 0
 
 
 # ------------------------------------------------------------------ output

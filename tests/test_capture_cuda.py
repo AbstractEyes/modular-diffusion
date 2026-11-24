@@ -114,3 +114,23 @@ def test_the_experiment_on_the_card(tmp_path):
     whole = capture.main(variant="assembly", tiny=1, out=str(tmp_path / "whole"), device=DEV, dtype=kind, parts=parts,
                          sample_steps=6)
     assert whole["final_latent_change"] == whole["final_latent_change"]
+
+
+def test_band_needs_on_the_card(tmp_path):
+    """The band-needs reads and their timing on the card: the born reads in full precision, the prompt read with the
+    teacher cast to half precision; the exact controls hold there too."""
+    from geolip.modular_diffusion.experiments import band_needs
+    kind = "fp16" if DEV == "cuda" else "fp32"
+    small = dict(rows=4, prompts=4, group=2, chunk=2, per_band=2, steps=6, cost_batch=2, cost_repeats=1,
+                 sample_dtype=kind)
+    r = band_needs.main(tiny=1, device=DEV, out=str(tmp_path / "reads"), **small)
+    assert r["sample_dtype_used"] == kind and r["switches"]["cudnn.allow_tf32"] is False
+    for s in ("0", "1"):
+        assert all(v == 0.0 for v in r["controls"][s]["full"].values())          # the copy reads exactly 0
+        assert r["r3"][s]["repeat"] == 0.0                                       # the sampler repeats itself
+        assert all(0.0 < v["empty"] < float("inf") for v in r["r3"][s]["table"].values())
+    assert all(x["seconds"] > 0 for x in r["r4"])
+    again = band_needs.main(tiny=1, device=DEV, out=str(tmp_path / "reads"), **small)
+    assert again["units"]["ran"] == [] and again["r3"] == r["r3"]
+    t = band_needs.main(variant="timing", tiny=1, device=DEV, out=str(tmp_path / "timing"), **small)
+    assert all(v > 0 for v in t["minutes"].values())

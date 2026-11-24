@@ -15,6 +15,7 @@ encoded.
                                            writes shards from pictures and captions; a stopped job continues where it
                                            stopped
     synthetic_batches(size, ...)           a source of random latents and ids, for tests
+    parquet_pictures(path, n)              the first n pictures and captions of one parquet file, in file order
 
 The stream's order: pass e (e = 0, 1, ...) visits the shards in a random order drawn from ``seed`` and ``e``, and the
 rows of each shard in a random order drawn from ``seed``, ``e`` and the shard's position; a batch takes the next B rows
@@ -287,6 +288,59 @@ def encode_shards(images: Union[str, Iterable], captions: Sequence[str], out_fol
     if sum(index["counts"]) != len(captions):
         raise ValueError(f"{sum(index['counts'])} rows encoded for {len(captions)} captions (fewer pictures?)")
     return index
+
+
+# ------------------------------------------------------------------ pictures from a parquet file
+def parquet_pictures(path: str, n: int, image: str = "image", caption: str = "answer",
+                     keep: Sequence[str] = ("id", "license", "file_name")) -> Tuple[list, List[str], List[dict]]:
+    """The first ``n`` rows of ONE parquet file, in file order: (pictures: RGB PIL images, captions: str, meta: one dict
+    a row of the ``keep`` columns the file has). The file is read in batches of rows, never whole. The image cell is a
+    struct with ``bytes`` (an encoded picture, decoded here from memory); the caption cell is a string or a list of
+    strings (the first is taken). ValueError when the file holds fewer than ``n`` rows, lacks the image or caption
+    column, or a row's picture or caption is empty."""
+    import io
+    import pyarrow.parquet as pq
+    from PIL import Image
+    n = int(n)
+    if n < 1:
+        raise ValueError("n is at least 1")
+    pf = pq.ParquetFile(path)
+    total = int(pf.metadata.num_rows)
+    if total < n:
+        raise ValueError(f"{path} holds {total} rows, fewer than the {n} asked for")
+    names = list(pf.schema_arrow.names)
+    for col in (image, caption):
+        if col not in names:
+            raise ValueError(f"{path} has no column {col!r}; its columns: {names}")
+    kept = [k for k in keep if k in names and k not in (image, caption)]
+    pictures: list = []
+    captions: List[str] = []
+    meta: List[dict] = []
+    for batch in pf.iter_batches(batch_size=min(64, n), columns=[image, caption] + kept):
+        cols = batch.to_pydict()
+        for i in range(batch.num_rows):
+            row = len(pictures)
+            if row == n:
+                break
+            cell = cols[image][i]
+            raw = cell.get("bytes") if isinstance(cell, dict) else cell
+            if not raw:
+                raise ValueError(f"row {row} of {path} has no picture bytes")
+            with Image.open(io.BytesIO(raw)) as img:
+                pictures.append(img.convert("RGB"))
+            text = cols[caption][i]
+            if isinstance(text, (list, tuple)):
+                text = text[0] if text else None
+            text = "" if text is None else str(text)
+            if not text.strip():
+                raise ValueError(f"row {row} of {path} has an empty caption")
+            captions.append(text)
+            meta.append({k: cols[k][i] for k in kept})
+        if len(pictures) == n:
+            break
+    if len(pictures) != n:
+        raise ValueError(f"{len(pictures)} rows read from {path}, {n} asked for")
+    return pictures, captions, meta
 
 
 # ------------------------------------------------------------------ random batches for tests

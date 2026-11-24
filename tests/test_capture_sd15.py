@@ -23,11 +23,9 @@ def sd15():
     teacher = load_teacher(path, device="cpu", dtype=torch.float32)
     # Tensors read from a mapped safetensors file can sit at addresses that are not 64-byte aligned, and the CPU
     # kernels then take another path: equal numbers give answers that differ in the last digits (measured: 2e-6 at one
-    # step against a fresh copy of the same U-Net). Fresh copies of the tensors make the teacher's kernels the engine's.
-    with torch.no_grad():
-        for p in list(teacher.unet.parameters()) + list(teacher.unet.buffers()):
-            if p.data_ptr() % 64:
-                p.data = p.data.clone()
+    # step against a fresh copy of the same U-Net). ``load_teacher`` copies every tensor into memory of its own, so
+    # the teacher's kernels are the engine's; the test below depends on it.
+    assert all(p.data_ptr() % 64 == 0 for p in teacher.unet.parameters())
     return teacher
 
 
