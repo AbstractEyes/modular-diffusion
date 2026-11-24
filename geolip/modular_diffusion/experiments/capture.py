@@ -8,7 +8,8 @@
 | band_engine  | trains one band engine alone (``capture.train``), from the teacher's numbers or from random ones    |
 |              | (``init``); reads it as born, during training (``read_every``) and, with its averaged copy, at the  |
 |              | end on its own band and on the two others (the off-band control); the teacher's copy read beside    |
-| born         | reads only: on each band, the teacher's copy (reads 0) and the shape's engine as born               |
+| born         | reads only: on each band, the teacher's copy and the engine of the shape full with the prompt (both |
+|              | read exactly 0), and the shape's engine as born                                                     |
 | assembly     | reads of an assembly (``parts=``) on each band, and the change of its sampled final latents against |
 |              | the teacher's                                                                                       |
 | exchange     | one band's part of an assembly (``parts=``) replaced by ``other`` (a band engine's job folder or    |
@@ -207,12 +208,17 @@ def _run(a: dict, det) -> dict:
               "probe": _probe_record(a, probe)}
     curve_text = ""
     if a["variant"] == "born":
+        from ..capture.engine import build_engine
+        full = build_engine(teacher, "full", text=True).eval()     # the shape full with the prompt: must read exactly 0
         for b in BANDS:
             copy_read = reads.band_read(teacher, teacher, b, probe, refs[b])
+            full_read = reads.band_read(full, teacher, b, probe, refs[b])
             born = reads.born_read(teacher, a["shape"], b, probe, text=bool(a["text"]), reference=refs[b])
             rows.append({"band": b, "part": "teacher copy", "mse": copy_read["mse"]})
+            rows.append({"band": b, "part": "full copy with the prompt", "mse": full_read["mse"]})
             rows.append({"band": b, "part": f"{born['shape']} as born", "mse": born["mse"], "share": born["share"]})
-            result.setdefault("reads", {})[b] = {"teacher_copy": copy_read, "born": born}
+            result.setdefault("reads", {})[b] = {"teacher_copy": copy_read, "full_copy": full_read, "born": born}
+        del full
     elif a["variant"] == "band_engine":
         from ..capture.schedule import band_index
         band = BANDS[band_index(a["band"])]

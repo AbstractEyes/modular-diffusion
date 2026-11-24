@@ -110,6 +110,9 @@ def test_the_experiment_variants_run_on_the_tiny_teacher(tmp_path):
     born = run.main("capture", ["variant=born", "shape=small", "out=" + str(tmp_path / "born")], **common)
     assert {r["part"] for r in born["rows"]} >= {"teacher copy", "small as born"}
     assert all(r["mse"] == 0.0 for r in born["rows"] if r["part"] == "teacher copy")
+    full = [r for r in born["rows"] if r["part"] == "full copy with the prompt"]
+    assert len(full) == 3 and all(r["mse"] == 0.0 for r in full)               # the shape full with the prompt reads 0
+    assert all(born["reads"][b]["full_copy"]["mse"] == 0.0 for b in ("clean", "middle", "noisy"))
     job = tmp_path / "band"
     tr = run.main("capture", ["variant=band_engine", "shape=tiny", "band=noisy", "steps=2", "batch=2",
                               "out=" + str(job)], log_every=1, **common)

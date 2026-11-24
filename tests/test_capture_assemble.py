@@ -92,6 +92,39 @@ def test_5_guidance_commutes_with_the_blend(teacher, states):
         assert torch.allclose(g_blend.double(), g_parts, rtol=1e-5, atol=1e-5), t
 
 
+def _diffusers_ddim(unet, cond, empty, z, steps, guidance):
+    """The diffusers library's own DDIM loop (eta 0, epsilon prediction) with the same guidance arithmetic."""
+    from diffusers import DDIMScheduler
+    sch = DDIMScheduler(num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear",
+                        steps_offset=1, set_alpha_to_one=False, clip_sample=False, prediction_type="epsilon")
+    sch.set_timesteps(steps)
+    b = z.shape[0]
+    states = torch.cat([empty.expand(b, -1, -1), cond])
+    ts = []
+    with torch.no_grad():
+        for t in sch.timesteps:
+            ts.append(int(t))
+            both = unet(torch.cat([z, z]), t, encoder_hidden_states=states).sample
+            u, c = both[:b], both[b:]
+            eps = u + guidance * (c - u)
+            z = sch.step(eps, t, z, eta=0.0).prev_sample
+    return z, ts
+
+
+@pytest.mark.parametrize("steps", (10, 50))
+def test_the_sampler_agrees_with_the_diffusers_ddim_scheduler(teacher, states, steps):
+    """The same start noise, prompts and guidance through assemble.sample and through diffusers.DDIMScheduler: the
+    final latents agree to 1e-4 relative (the step lists are the same)."""
+    from geolip.modular_diffusion.capture.assemble import initial_noise
+    cond, empty = states
+    z0 = initial_noise(3, cond.shape[0], (4, 16, 16))
+    ours = sample(teacher, cond, empty, seed=3, steps=steps, guidance=7.5)
+    theirs, ts = _diffusers_ddim(teacher.unet, cond, empty, z0.clone(), steps, 7.5)
+    assert ts == ddim_timesteps(steps)
+    rel = float((ours.double() - theirs.double()).norm() / theirs.double().norm())
+    assert rel < 1e-4, (steps, rel)
+
+
 def test_an_assembly_needs_every_band(teacher):
     with pytest.raises(ValueError):
         Assembly({"clean": teacher, "middle": teacher})
