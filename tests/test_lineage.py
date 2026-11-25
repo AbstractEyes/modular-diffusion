@@ -16,7 +16,6 @@ from geolip.modular_diffusion.capture.teacher import _perturb, tiny_unet  # noqa
 from geolip.modular_diffusion.experiments import lineage  # noqa: E402
 
 FLOW = dict(tiny=1, kind="flow", shift="2.5", unet_seed=5, probe_n=3, probe_per_band=2, chunk=2)
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.fixture(scope="module")
@@ -150,12 +149,14 @@ def test_stretch_snr():
     assert eps["middle"]["snr_at_hi"] < eps["middle"]["snr_at_lo"]
 
 
-def test_the_new_files_read_clean():
+def test_the_new_files_read_clean(request):
     # the hygiene test's words and a few more; each word written with a class so this line does not match itself
+    root = str(request.config.rootpath)                      # the repository (the folder of pyproject.toml)
+    assert os.path.isfile(os.path.join(root, "pyproject.toml")), root
     pattern = (r"(?i)\bE\d\d\b|\bm[d]0|\bm[r]_|\bm[i]nd\b|\bl[u]ne\b|\bd[o]cket|\bP[h]il\b|\ba[r]m\b|\bc[a]non\b"
                r"|\bn[i]ght\b")
     for rel in ("geolip/modular_diffusion/capture/process.py", "geolip/modular_diffusion/experiments/lineage.py",
                 "tests/test_process.py", "tests/test_lineage.py"):
-        text = open(os.path.join(ROOT, *rel.split("/")), encoding="utf-8").read()
+        text = open(os.path.join(root, *rel.split("/")), encoding="utf-8").read()
         m = re.search(pattern, text)
         assert m is None, (rel, text[max(0, m.start() - 40):m.end() + 40])

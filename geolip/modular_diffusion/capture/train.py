@@ -15,6 +15,14 @@ Per step k (counted from 0), every draw from one generator seeded from (seed, k)
 The engine's numbers are kept in float32; on a card the forwards may run under autocast (bf16 by default there; on the
 CPU everything is float32).
 
+SMALLER GROUPS (``micro``): with 0 < micro < batch, the step's rows, noise, steps and dropped prompts are drawn for
+the whole batch exactly as above; then the rows go through the forwards and the backward in consecutive groups of
+``micro`` rows (the last group may be smaller). Each group's loss is weighted by (rows in the group / batch), so the
+gradients added over the groups are the gradient of the whole batch's loss (the same update, up to the order of a
+floating-point sum), and ONE optimizer step follows. The logged terms are the same weighted sums. ``micro`` = 0 or
+micro >= batch is the one-forward path. ``micro`` changes the memory a step needs, not what it computes, so it is not
+one of the settings a checkpoint is checked against: a resumed job may use another value.
+
 An AVERAGED copy of the engine's parameters is kept: after update n (n = 1, 2, ..)
     avg <- d_n avg + (1 - d_n) w,     d_n = min(decay, (1 + n) / (10 + n))      decay 0.9999 by default
 (the warm-up keeps the early average close to the recent weights). Reads use the averaged copy.
@@ -44,7 +52,8 @@ its averaged copy read back from the engine files) and nothing is trained.
 
 The trainer never downloads and writes only inside its job folder: checkpoint.pt, engine.safetensors,
 engine_avg.safetensors, engine.json, train.json (the settings, the loss log, the reads, the median seconds a step over
-every step of the job, the trained parameter count). It prints the job's size, the time spent and the time left.
+every step of the job, the trained parameter count, the group size of the call that wrote it). It prints the job's
+size, the time spent and the time left.
 """
 from __future__ import annotations
 
@@ -146,10 +155,13 @@ def _finished_result(teacher, out: str, settings: dict, log: Callable[[str], Non
     steps = int(settings["steps"])
     log(f"FINISHED already at step {steps:,} of {steps:,} ({out}: {TRAIN_JSON} and the engine files, no checkpoint); "
         f"nothing trained")
-    return {"engine": engine, "average": average, "log": list(stored.get("log", [])), "step": steps, "finished": True,
-            "seconds": 0.0, "settings": settings, "reads": list(stored.get("reads", [])),
-            "seconds_a_step": stored.get("seconds_a_step"), "trained": stored.get("trained", param_count(engine)),
-            "restored": True}
+    result = {"engine": engine, "average": average, "log": list(stored.get("log", [])), "step": steps, "finished": True,
+              "seconds": 0.0, "settings": settings, "reads": list(stored.get("reads", [])),
+              "seconds_a_step": stored.get("seconds_a_step"), "trained": stored.get("trained", param_count(engine)),
+              "restored": True}
+    if "micro" in stored:
+        result["micro"] = int(stored["micro"])
+    return result
 
 
 def _save(path: str, state: dict) -> None:
@@ -163,11 +175,13 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
                       lam_data: float = 0.0, drop: float = 0.1, text: bool = True, average_decay: float = 0.9999,
                       save_every: int = 0, log_every: int = 10, until: Optional[int] = None, autocast: str = "auto",
                       log: Callable[[str], None] = print, init: str = "inherit", every: int = 0,
-                      on_every: Optional[Callable] = None, keep_checkpoint: bool = True) -> dict:
+                      on_every: Optional[Callable] = None, keep_checkpoint: bool = True, micro: int = 0) -> dict:
     """Train the band engine of a shape alone (see the module's text). Returns {"engine", "average" (the engine with
     the averaged parameters), "log" (one dict per step), "step", "finished", "seconds", "settings", "reads" (the
     values ``on_every`` returned, with their steps), "seconds_a_step" (the median over the job's steps), "trained"
-    (the trained parameter count)}; a finished job read back from its files also holds "restored": True."""
+    (the trained parameter count), "micro" (the group size this run used; 0: the whole batch, also when the asked group
+    holds the whole batch)}; a finished job read back from its files also holds "restored": True, and its "micro" is the
+    one train.json holds (the group size of the call that wrote that file; the asked value when it holds none)."""
     kind = getattr(getattr(teacher, "process", None), "kind", "eps")
     if kind != "eps":
         raise ValueError(f"a band engine is trained from a noise-predicting teacher only; this source is of the kind "
@@ -175,6 +189,11 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
     shape = shape_from(shape)
     band = BANDS[band_index(band)]
     steps, batch = int(steps), int(batch)
+    micro = int(micro or 0)
+    if micro < 0:
+        raise ValueError(f"micro is 0 (the whole batch in one forward) or a positive number of rows, not {micro}")
+    if micro >= batch:
+        micro = 0                                           # one group holds the whole batch: the one-forward path
     if init not in INITS:
         raise ValueError(f"init is one of {list(INITS)}, not {init!r}")
     every = int(every or 0)
@@ -187,7 +206,8 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
     os.makedirs(out, exist_ok=True)
     ck_path = os.path.join(out, CHECKPOINT)
     if not os.path.isfile(ck_path) and os.path.isfile(os.path.join(out, TRAIN_JSON)):
-        return _finished_result(teacher, out, settings, log)
+        back = _finished_result(teacher, out, settings, log)
+        return dict(back, micro=back.get("micro", micro))   # the recorded group size when train.json holds one
     device = next(teacher.unet.parameters()).device
     if init == "random":
         engine = fresh_engine(teacher, shape, seed=int(seed), text=text)
@@ -218,7 +238,9 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
     log(f"JOB band engine: shape {shape.name}, band {band}, init {init}, rho {rho:g}, {steps:,} steps x batch {batch}"
         f" = {steps * batch:,} rows; {trained:,} trained numbers ({trained / param_count(teacher):.3f} of the teacher's); "
         f"pure Adam lr {lr:g}; average decay {average_decay:g}; device {device}"
-        + (f"; a read every {every:,} updates" if every and on_every is not None else ""))
+        + (f"; a read every {every:,} updates" if every and on_every is not None else "")
+        + (f"; micro {micro} (the rows of a step in groups of {micro}, one optimizer step)" if micro > 0 else ""))
+    grouped = 0 < micro < batch
 
     def checkpoint(step: int) -> None:
         _save(ck_path, {"engine": engine.state_dict(), "average": average, "adam": opt.state_dict(), "step": step,
@@ -248,12 +270,27 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
         z = add_noise(x0, eps, t, ac)
         states = teacher.text_states(ids.to(device)).float()
         states, dropped = drop_prompts(states, empty.float(), drop, g)
-        with _autocast(autocast, device):
-            o_t = teacher.predict(z, t, states)        # no gradient; the inputs cast to the teacher's precision
-            o_s = engine(z, t, states)
-        loss, terms = capture_loss(o_s, o_t, eps, lam_out, lam_data)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
+        if grouped:
+            opt.zero_grad(set_to_none=True)
+            terms = {"out": 0.0, "data": 0.0, "total": 0.0}
+            for a in range(0, batch, micro):
+                b = min(a + micro, batch)
+                w = (b - a) / batch                 # this group's share of the whole batch's mean
+                with _autocast(autocast, device):
+                    o_t = teacher.predict(z[a:b], t[a:b], states[a:b])
+                    o_s = engine(z[a:b], t[a:b], states[a:b])
+                loss, part = capture_loss(o_s, o_t, eps[a:b], lam_out, lam_data)
+                (loss * w).backward()               # the gradients add up in the parameters
+                for key in terms:
+                    terms[key] += w * part[key]
+                del o_t, o_s, loss
+        else:
+            with _autocast(autocast, device):
+                o_t = teacher.predict(z, t, states)        # no gradient; the inputs cast to the teacher's precision
+                o_s = engine(z, t, states)
+            loss, terms = capture_loss(o_s, o_t, eps, lam_out, lam_data)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
         # one host read a step: the per-tensor sums are added on the device first
         sq = float(torch.stack([p.grad.double().pow(2).sum() for p in params if p.grad is not None]).sum())
         opt.step()
@@ -288,8 +325,8 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
                     extra={"band": band, "rho": float(rho), "steps": steps, "init": init})
         tmp = os.path.join(out, TRAIN_JSON + ".part")
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"settings": settings, "seconds_a_step": per_step, "trained": int(trained), "reads": reads_log,
-                       "log": history}, fh, indent=1)
+            json.dump({"settings": settings, "seconds_a_step": per_step, "trained": int(trained), "micro": micro,
+                       "reads": reads_log, "log": history}, fh, indent=1)
             fh.write("\n")
         os.replace(tmp, os.path.join(out, TRAIN_JSON))
         if not keep_checkpoint:
@@ -299,4 +336,4 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
         + (f"; {per_step:.4g} s a step (median)" if per_step is not None else ""))
     return {"engine": engine, "average": avg_engine, "log": history, "step": final, "finished": finished,
             "seconds": seconds, "settings": settings, "reads": reads_log, "seconds_a_step": per_step,
-            "trained": int(trained)}
+            "trained": int(trained), "micro": micro}
