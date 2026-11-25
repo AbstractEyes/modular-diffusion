@@ -19,7 +19,7 @@ schedule, the last step to alpha_bar of step 0, guidance 7.5 by default: eps = u
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -131,9 +131,14 @@ def guided(part: nn.Module, z: Tensor, t: Tensor, states: Tensor, empty: Optiona
 @torch.no_grad()
 def sample(model, prompts_states: Tensor, empty_states: Optional[Tensor], seed: int, steps: int = 50,
            guidance: float = 7.5, *, latent_shape: Optional[Sequence[int]] = None,
-           alphas_cumprod: Optional[Tensor] = None, z: Optional[Tensor] = None, offset: int = 1) -> Tensor:
+           alphas_cumprod: Optional[Tensor] = None, z: Optional[Tensor] = None, offset: int = 1,
+           on_step: Optional[Callable[[int, Tensor, Tensor], None]] = None) -> Tensor:
     """The final latents of DDIM (eta 0) from the seed's noise (or from ``z``), with guidance. ``model``: an assembly,
-    an engine, a teacher or a diffusers U-Net. The latents are in the prompt states' dtype and device."""
+    an engine, a teacher or a diffusers U-Net. The latents are in the prompt states' dtype and device.
+
+    ``on_step(t, z, eps)``, when given, is called at every step with the step, the state the model was asked on and its
+    guided answer as the sampler uses it, before the update; it only watches (the latents are the same with or
+    without it)."""
     part = as_part(model)
     dev, dtype = prompts_states.device, prompts_states.dtype
     b = prompts_states.shape[0]
@@ -147,6 +152,8 @@ def sample(model, prompts_states: Tensor, empty_states: Optional[Tensor], seed: 
     for t in ts:
         tt = torch.full((b,), t, dtype=torch.long, device=dev)
         eps = guided(part, z, tt, prompts_states, empty, guidance)
+        if on_step is not None:
+            on_step(t, z, eps)
         a = float(ac[t])
         prev = t - ratio
         a_prev = float(ac[prev]) if prev >= 0 else float(ac[0])

@@ -22,6 +22,9 @@
 | picture_compare | two ``pictures`` job folders (``a``, ``b``) compared: the Frechet distance of their features, the |
 |              | kernel distance (``capture.pictures.kid``), and the text-to-picture means and their row-by-row       |
 |              | difference; no teacher                                                                               |
+| chain_read   | an assembly (``parts=``) against the teacher on the states of the sampler's chain: on its own chain |
+|              | (the assembly drives, the teacher is asked) and on the teacher's (the teacher drives, the assembly  |
+|              | is asked), per band the mean error on each chain and their ratio (``capture.reads.chain_read``)      |
 
 The teacher is a local diffusers folder: ``teacher=<folder>``, or found in the local hub cache by ``repo`` and
 ``revision`` (nothing is ever downloaded). ``tiny=1`` uses a tiny random teacher and random batches instead (16 x 16
@@ -31,7 +34,7 @@ THE PROBE: ``probe_n`` fixed prompts with standard normal latents; or, with ``pr
 ``probe_first + probe_rows - 1`` of that folder of latent shards in FILE order (``capture.data.rows_in_order``): their
 clean latents as x0 and their token ids through the teacher's text encoder. Either way the noise comes from
 ``probe_seed``, each band is read on ``probe_per_band`` even steps, and the reads put ``chunk`` rows through a forward.
-Sampling reads (assembly, exchange) sample the probe's rows ``group`` at a time (``capture.reads.sample_probe``: group j
+Sampling reads (assembly, exchange, chain_read) sample the probe's rows ``group`` at a time (``capture.reads.sample_probe``: group j
 starts from the noise of probe_seed + 100003 j, the same for every model compared).
 
 READS DURING TRAINING (band_engine, ``read_every`` > 0): every ``read_every`` updates and after the last one, the live
@@ -45,7 +48,7 @@ whole-range share of the band's training law), steps, batch, lr, lam_out, lam_da
 removed once the job has finished), data (a folder of latent shards, read by ``capture.data.LatentBatches``), out,
 device, dtype (fp32 / bf16 / fp16: the teacher's numbers; an engine's are float32), autocast (auto / none / bf16 /
 fp16), save_every, log_every, average_decay, probe_n, probe_per_band, probe_seed, probe_data, probe_first, probe_rows,
-chunk, sample_steps, guidance, group, parts (for assembly, exchange and pictures: one part a band, comma separated, for
+chunk, sample_steps, guidance, group, parts (for assembly, exchange, chain_read and pictures: one part a band, comma separated, for
 example clean=runs/a,middle=teacher,noisy=born:tiny; a part is ``teacher``, a band engine's job folder (its averaged
 engine), ``born:<shape>`` (the shape's engine with every number inherited from the teacher, untrained, reading the
 prompt) or ``born:<shape>:notext`` (the same without the prompt); ``<shape>`` is a name or the text form such as
@@ -84,7 +87,7 @@ from ..config import in_notebook, parse
 from ..determinism import mode as det_mode
 
 EXPERIMENT = "capture"
-VARIANTS = ("band_engine", "born", "assembly", "exchange", "pictures", "picture_compare")
+VARIANTS = ("band_engine", "born", "assembly", "exchange", "pictures", "picture_compare", "chain_read")
 PICTURE_VARIANTS = ("pictures", "picture_compare")
 SOURCES = ("parts", "rows")
 PROBE_PROMPTS = ("a photograph of a red house by a lake", "a bowl of fruit on a wooden table",
@@ -114,8 +117,10 @@ def main(argv=(), **overrides) -> dict:
         raise ValueError(f"init is inherit or random, not {a['init']!r}")
     if int(a["read_every"]) < 0 or int(a["group"]) < 0 or int(a["chunk"]) < 0:
         raise ValueError("read_every, group and chunk are at least 0")
-    if a["variant"] in ("assembly", "exchange") and not a["parts"]:
+    if a["variant"] in ("assembly", "exchange", "chain_read") and not a["parts"]:
         raise ValueError(f"the {a['variant']} variant needs parts=")
+    if a["variant"] == "chain_read" and int(a["sample_steps"]) < 1:
+        raise ValueError("the chain_read variant samples: sample_steps is at least 1")
     if a["variant"] == "exchange" and not a["other"]:
         raise ValueError("the exchange variant needs other= (a band engine's job folder or teacher)")
     if a["part_dtype"] not in PART_DTYPES:
@@ -367,6 +372,18 @@ def _run(a: dict, det) -> dict:
             result["sample_group"] = int(a["group"])
             rows.append({"band": "all", "part": "final latents against the teacher's",
                          "mse": result["final_latent_change"]})
+    elif a["variant"] == "chain_read":
+        model = Assembly(_parts(a, teacher))
+        r = reads.chain_read(model, teacher, probe, int(a["sample_steps"]), float(a["guidance"]), int(a["group"]))
+        result.update({"parts": a["parts"], "chain": r, "final_latent_change": r["final_latent_change"],
+                       "sample_group": int(a["group"])})
+        for b in BANDS:
+            x = r["bands"][b]
+            rows.append({"band": b, "own chain": x["own_mean"], "teacher's chain": x["teacher_mean"],
+                         "ratio": x["ratio"], "log ratio SE": x["log_ratio_se"], "rows in the ratio": x["rows_in_ratio"],
+                         "rows left out": x["rows_left_out"]})
+        rows.append({"band": "all", "part": "final latents, own chain against the teacher's",
+                     "mse": r["final_latent_change"]})
     else:
         loaded: Dict[str, object] = {}
         parts = _parts(a, teacher, loaded)
@@ -388,8 +405,13 @@ def _run(a: dict, det) -> dict:
     result["seconds"] = time.time() - t0
     det.record(result)
     reads.write_json(result, os.path.join(out, "result.json"))
-    columns = (["band", "part", "before", "after", "change", "largest change where silent", "mse"]
-               if a["variant"] == "exchange" else ["band", "part", "mse", "share"])
+    if a["variant"] == "exchange":
+        columns = ["band", "part", "before", "after", "change", "largest change where silent", "mse"]
+    elif a["variant"] == "chain_read":
+        columns = ["band", "part", "own chain", "teacher's chain", "ratio", "log ratio SE", "rows in the ratio",
+                   "rows left out", "mse"]
+    else:
+        columns = ["band", "part", "mse", "share"]
     text = f"# capture: {a['variant']}\n\n" + reads.table(rows, columns) + curve_text
     with open(os.path.join(out, "result.md"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
