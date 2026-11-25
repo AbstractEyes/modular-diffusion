@@ -16,6 +16,22 @@ by the image tokens (``scenes``, ``frame``, ``collective``, ``scene_judge``, ``s
 | exact    | the exchange and snap-in reads on the rows of ``rows`` (the first ``exact_lists`` lists at n = 4)        |
 | leak     | the leak read of the whole-picture parts                                                               |
 | wrong    | R1 on bed F with corrupted request lists judged against the true lists                                 |
+| draw     | the written layouts of a finished writer cell on the toy bed's captions (``answers``) turned into      |
+|          | requests, drawn by R1 with the engines found under ``parts`` and judged; per caption W, C, P, H         |
+| parity   | R1 on the earlier run's lists at n = 4 beside that run's stored row (``stored``); the judge's stored    |
+|          | ceiling and the real row's scene right at nine things (``real_row``); stored wrong-address curves        |
+
+FROM A WRITTEN LAYOUT TO A PICTURE (``draw``): each answer is read by the table-tolerant read and the strict cell
+grammar and handed on as requests by ``layout.bed_requests`` (a thing that is none of the nine and an instance with no
+address are dropped; the first written keeps a cell; a missing or foreign colour is drawn from ``random.Random(9000 +
+the caption's index)``); the requests are drawn by R1 (``build_row``) in 50 Euler steps from the start noise of the
+caption (row k of ``collective.start_noise(100, 7100 + the family's index)``, k the number of its id) and the judge
+reads the nine cells. Per caption (``layout.caption_reads``, ``layout.picture_reads``): W written right (the family's
+address right of the written layout), H handed right (of the requests, a drawn colour counting as no stated colour), C
+drawn as written (all nine cells as the requests say, things, empties and colours) and P picture right (the family's
+address right of the picture's layout); an answer that does not parse gives no picture and 0 in every read. Output:
+result.json (every caption's record), result.md, sheet.jpg (the first ``sheet_n`` combined captions with the caption and
+the written layout under each picture).
 
 THE ROWS (``row``): R1 (nine addressed thing parts and the addressed base, the gate), R1r (the same in the rotary read),
 R2 (nine whole-picture thing parts and the empty-scene engine, the gate), R3 (the same parts, the sum with the empty
@@ -45,7 +61,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 
-from .. import __version__, determinism, frame
+from .. import __version__, determinism, frame, layout
 from .. import collective as C
 from .. import scene_judge as SJ
 from .. import scene_reads as SR
@@ -53,7 +69,7 @@ from .. import scenes as S
 from ..config import in_notebook, parse
 
 EXPERIMENT = "toy_collective"
-VARIANTS = ("parts", "judge", "timing", "compose", "controls", "exact", "leak", "wrong")
+VARIANTS = ("parts", "judge", "timing", "compose", "controls", "exact", "leak", "wrong", "draw", "parity")
 ROWS = ("R1", "R1r", "R2", "R3", "R4", "R5a", "R5ar", "R5b", "R6", "REAL")
 DEFAULTS = dict(variant="parts", kind="addressed_thing", classes="0-8", bed="F", seed=0, steps=3000, dim=128, heads=2,
                 depth=3, read="embedding", batch=128, lr=1e-3, warmup=100, every=250, heldout=2048, save_every=500,
@@ -62,11 +78,14 @@ DEFAULTS = dict(variant="parts", kind="addressed_thing", classes="0-8", bed="F",
                 sample_steps=50, part_steps=3000, part_cells="", model_steps=30000, model_dim=128, model_heads=2,
                 model_depth=3, lists="", twin_seed=1, sheet=1, judge_steps=2000, judge_batch=256,
                 e="0.05,0.10,0.20", wrong_ns="2,4,6", leak_ns="2,4,9", leak_ts="0.15,0.45,0.85", leak_scenes=256,
-                exact_lists=64, device="cpu", det="on", threads=4, out="")
+                exact_lists=64, answers="", role="", stored="", real_row="", wrong_rows="", sheet_n=16,
+                device="cpu", det="on", threads=4, out="")
 LIST_SEED, NOISE_SEED = 5000, 7000
 CENTER_SEED, OTHERS_SEED = 5100, 5101
 CENTER = 4
 LEAK_SEED, WRONG_SEED = 8000, 9000
+CAPTION_NOISE_SEED = 7100          # the start noise of a caption: seeded 7100 + its family's index, row = its number
+PARITY_N = 4
 CONTROL_G_TS = (0.1, 0.5, 0.9)
 LIMITS = {"a_rate": 0.99, "a_real_n9": 0.90, "b": 0.05, "c": 0.2, "e": 1e-12, "f": 0.2, "g": 1e-5}
 
@@ -115,7 +134,10 @@ def index_engines(root: str) -> Dict[str, str]:
 class Parts:
     def __init__(self, a: dict):
         self.a = a
-        self.index = index_engines(a["parts"])
+        self.index: Dict[str, str] = {}
+        for root in str(a["parts"] or "").split(","):      # one folder, or several separated by commas
+            for k, v in index_engines(root.strip()).items():
+                self.index.setdefault(k, v)
         self.used: List[dict] = []
 
     def get(self, kind: str, cls: Optional[int], seed: Optional[int] = None, steps: Optional[int] = None,
@@ -480,8 +502,225 @@ def _run_wrong(a: dict, log) -> dict:
     return {"wrong": out, "engines": parts.used, "inconclusive": any(not u["descended"] for u in parts.used)}
 
 
+# ------------------------------------------------------------------ written layouts drawn and judged
+def pictures_sha256(pixels: torch.Tensor) -> str:
+    """The sha256 of a batch of pictures (float32, contiguous, on the CPU)."""
+    import hashlib
+    return hashlib.sha256(pixels.detach().to("cpu", torch.float32).contiguous().numpy().tobytes()).hexdigest()
+
+
+def _rate_of(values) -> dict:
+    return layout.rate([int(v) for v in values])
+
+
+def _read_answers(folder: str):
+    with open(os.path.join(folder, "result.json"), encoding="utf-8") as fh:
+        res = json.load(fh)
+    with open(os.path.join(folder, "outputs.jsonl"), encoding="utf-8") as fh:
+        outputs = [json.loads(x) for x in fh if x.strip()]
+    return res, outputs
+
+
+def caption_noise(records: Sequence[dict]) -> torch.Tensor:
+    """The start noise of each caption: row k (the number of its id) of ``start_noise(100, 7100 + its family's
+    index)``, the same for every writer and every seed."""
+    cache: Dict[str, torch.Tensor] = {}
+    rows = []
+    for r in records:
+        fam = r["family"]
+        if fam not in cache:
+            cache[fam] = C.start_noise(layout.PER_FAMILY, CAPTION_NOISE_SEED + layout.FAMILIES.index(fam))
+        rows.append(cache[fam][int(r["id"].rsplit("_", 1)[1])])
+    return torch.stack(rows) if rows else torch.zeros(0, S.CHANNELS, S.CANVAS, S.CANVAS)
+
+
+def drawn_tables(records: Sequence[dict]) -> dict:
+    """The reported numbers of a set of caption records: per family and over the six, P, W, C, H (rates over the
+    captions) and the means of W x C and H x C; P by the number of asked instances; the 2 x 2 table of W and C with P
+    inside each cell; the handoff loss (W = 1 and H = 0) with its kinds; the per-instance error of the written
+    layouts (errors over asked instances, over the captions)."""
+    out: dict = {"families": {}}
+    groups = [(f, [r for r in records if r["family"] == f]) for f in layout.FAMILIES]
+    for name, rs in groups + [("all", list(records))]:
+        if not rs:
+            continue
+        loss = [r for r in rs if r["W"] == 1 and r["H"] == 0]
+        kinds: Dict[str, int] = {}
+        for r in loss:
+            for d in {x["why"] for x in r["dropped"]}:
+                kinds[d] = kinds.get(d, 0) + 1
+            for k in r.get("kinds_handed") or ():
+                kinds["handed: " + k] = kinds.get("handed: " + k, 0) + 1
+        errors = sum(int(r["instance_errors"]) for r in rs)
+        asked = sum(int(r["instances_asked"]) for r in rs)
+        block = {"n": len(rs), **{k: _rate_of(r[k] for r in rs) for k in ("P", "W", "C", "H")},
+                 "WC": sum(r["W"] * r["C"] for r in rs) / len(rs), "HC": sum(r["H"] * r["C"] for r in rs) / len(rs),
+                 "WH": sum(r["W"] * r["H"] for r in rs) / len(rs),
+                 "lucky": sum(1 for r in rs if r["W"] == 0 and r["P"] == 1) / len(rs),
+                 "handoff_loss": {"rate": len(loss) / len(rs), "captions": len(loss), "kinds": kinds},
+                 "per_instance_error": {"errors": errors, "asked": asked, "rate": errors / asked if asked else None}}
+        if name == "all":
+            out["all"] = block
+        else:
+            out["families"][name] = block
+    by_n: Dict[str, dict] = {}
+    for k in sorted({int(r["instances_asked"]) for r in records}):
+        by_n[str(k)] = _rate_of(r["P"] for r in records if int(r["instances_asked"]) == k)
+    out["P_by_asked"] = by_n
+    out["W_by_C"] = {f"W{w}_C{c}": {"captions": len(sel), "P": _rate_of(r["P"] for r in sel)}
+                     for w in (0, 1) for c in (0, 1)
+                     for sel in [[r for r in records if r["W"] == w and r["C"] == c]]}
+    return out
+
+
+def write_caption_sheet(path: str, items: Sequence[tuple]) -> None:
+    """A sheet of pictures (enlarged 4 times), each with its caption and its written layout under it: ``items`` =
+    [(pixels [3, 48, 48] or None, caption, written layout)], four a row."""
+    from PIL import Image, ImageDraw, ImageFont
+    import textwrap
+    if not items:
+        return
+    side, text_h, width = S.CANVAS * 4, 150, 260
+    cols = 4
+    rows = -(-len(items) // cols)
+    sheet = Image.new("RGB", (cols * width, rows * (side + text_h)), (255, 255, 255))
+    draw = ImageDraw.Draw(sheet)
+    font = ImageFont.load_default()
+    for i, (pix, caption, written) in enumerate(items):
+        x, y = (i % cols) * width, (i // cols) * (side + text_h)
+        if pix is not None:
+            arr = (pix.clamp(0, 1) * 255).round().byte().permute(1, 2, 0).numpy()
+            sheet.paste(Image.fromarray(arr).resize((side, side), Image.NEAREST), (x + (width - side) // 2, y))
+        else:
+            draw.text((x + 8, y + side // 2), "no picture: the answer does not parse", fill=(0, 0, 0), font=font)
+        lines = textwrap.wrap(caption, 42)[:5] + [ln[:42] for ln in str(written).splitlines()[:6]]
+        for k, ln in enumerate(lines):
+            draw.text((x + 4, y + side + 2 + 12 * k), ln, fill=(0, 0, 0) if k < 5 else (40, 40, 160), font=font)
+    sheet.save(path, quality=92)
+
+
+def _run_draw(a: dict, log) -> dict:
+    if not a["answers"]:
+        raise ValueError("draw needs answers=<a finished writer cell's folder on the toy bed's captions>")
+    if not a["judge"]:
+        raise ValueError("draw needs judge=<the judge's folder>")
+    if a["bed"] != "F":
+        raise ValueError("written layouts are drawn on bed F")
+    res, outputs = _read_answers(a["answers"])
+    if res.get("captions") != "bed":
+        raise ValueError(f"{a['answers']} is not a writer cell on the toy bed's captions")
+    prompts = layout.bed_prompts(int(res["args"].get("seed", 0)))
+    index = {p["id"]: k for k, p in enumerate(prompts)}
+    records = []
+    for o in outputs:
+        if o["id"] not in index:
+            continue
+        k = index[o["id"]]
+        r = layout.caption_reads(prompts[k], k, o["answer"])
+        r["text"] = prompts[k]["text"]
+        r["answer"] = o["answer"]
+        r["kinds_handed"] = layout.score(prompts[k], layout.requests_reading(r["requests"]), "cell")["kinds"] \
+            if r["parsed"] else ["broken format"]
+        records.append(r)
+    drawn = [r for r in records if r["parsed"]]
+    log(f"DRAW: {len(records)} captions of {a['answers']}; {len(drawn)} with a picture; engines of seed {a['seed']}")
+    t0 = time.time()
+    pix = None
+    if drawn:
+        cells = torch.tensor([[-1 if c[0] is None else c[0] for c in layout.request_cells(r["requests"])] for r in drawn])
+        colors = torch.tensor([[-1 if c[1] is None else c[1] for c in layout.request_cells(r["requests"])] for r in drawn])
+        parts = Parts(a)
+        answer, _ = build_row("R1", parts)
+        z = C.sample(answer, cells, colors, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]),
+                     noise=caption_noise(drawn))
+        pix = made_pixels(z)
+        judge = SJ.load_judge(a["judge"], a["device"])
+        pt, pc = SJ.predict(judge, S.to_model(pix))
+        engines = parts.used
+    else:
+        engines = []
+    sample_s = time.time() - t0
+    j = 0
+    by_id = {}
+    for r in records:
+        if r["parsed"]:
+            judged = [[None, None] if int(pt[j, c]) == SR.NOTHING else [int(pt[j, c]), int(pc[j, c])] for c in range(9)]
+            by_id[r["id"]] = j
+            j += 1
+        else:
+            judged = None
+        r["judged"] = judged
+        r.update(layout.picture_reads(prompts[index[r["id"]]], r, judged))
+    tables = drawn_tables(records)
+    first = [r for r in records if r["family"] == "combined"][:int(a["sheet_n"])]
+    if int(a["sheet"]) and first:
+        write_caption_sheet(os.path.join(a["out"], "sheet.jpg"),
+                            [(pix[by_id[r["id"]]] if r["id"] in by_id else None, r["text"], r["answer"]) for r in first])
+    bad = [u["tag"] for u in engines if not u["descended"]]
+    return {"role": a["role"], "answers": os.path.basename(os.path.normpath(a["answers"])),
+            "writer": res.get("writer"), "example_set": res.get("example_set"), "captions": len(records),
+            "drawn": len(drawn), "records": records, "tables": tables, "engines": engines, "not_descended": bad,
+            "inconclusive": bool(bad), "sample_seconds": sample_s,
+            "pictures_sha256": pictures_sha256(pix) if pix is not None else None}
+
+
+def _stored(folder: str) -> Optional[dict]:
+    p = os.path.join(folder, "result.json")
+    if not folder or not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _run_parity(a: dict, log) -> dict:
+    """Part of the earlier run read again: the collective of the fetched engines on that run's own lists at n = 4 (its
+    start noise), its cell rate beside the stored one; the judge's stored ceiling and the real row's scene right at
+    nine things; the stored wrong-address curves."""
+    stored = _stored(a["stored"])
+    if stored is None:
+        raise ValueError("parity needs stored=<the earlier run's row folder (its result.json)>")
+    parts = Parts(a)
+    judge = SJ.load_judge(a["judge"], a["device"])
+    answer, _ = build_row("R1", parts)
+    L = lists_for(dict(a, ns=str(PARITY_N), lists=""))[PARITY_N]
+    pix = made_pixels(_sample_lists(answer, L, a))
+    rd = judge_reads(judge, pix, L["cells"], L["colors"])
+    old = (stored.get("by_n") or {}).get(str(PARITY_N)) or {}
+    oc = old.get("cell_rate") or {}
+    diff = None if oc.get("mean") is None else rd["cell_rate"]["mean"] - oc["mean"]
+    sha = pictures_sha256(pix)
+    old_sha = old.get("pictures_sha256")
+    parity = {"n": PARITY_N, "lists": int(L["cells"].shape[0]), "cell_rate": rd["cell_rate"], "stored_cell_rate": oc,
+              "difference": diff, "bar": None if oc.get("se") is None else 2 * oc["se"],
+              "holds": None if diff is None or oc.get("se") is None else abs(diff) <= 2 * oc["se"],
+              "pictures_sha256": sha, "stored_pictures_sha256": old_sha,
+              "pictures_equal": None if old_sha is None else sha == old_sha,
+              "stored_args": {k: stored.get("args", {}).get(k) for k in ("seed", "bed", "count", "sample_steps", "device")},
+              "stored_version": stored.get("version")}
+    jr = _stored(a["judge"])
+    ceil = ((jr or {}).get("judge") or {}).get("ceiling")
+    real = _stored(a["real_row"])
+    r9 = ((real or {}).get("by_n") or {}).get("9", {}).get("scene_right")
+    k = {"ceiling": ceil, "real_scene_right_n9": r9,
+         "holds_rates": None if not ceil else bool(ceil["thing_rate"]["mean"] >= LIMITS["a_rate"]
+                                                    and ceil["color_rate"]["mean"] >= LIMITS["a_rate"]),
+         "holds_real": None if not r9 else bool(r9["mean"] >= LIMITS["a_real_n9"])}
+    k["holds"] = None if k["holds_rates"] is None or k["holds_real"] is None else k["holds_rates"] and k["holds_real"]
+    curve = []
+    for folder in [x.strip() for x in str(a["wrong_rows"]).split(",") if x.strip()]:
+        w = _stored(folder)
+        for x in (w or {}).get("wrong", []):
+            curve.append({"seed": (w.get("args") or {}).get("seed"), "n": x["n"], "e": x["e"],
+                          "scene_right": x["scene_right"]})
+    log(f"parity: cell rate {rd['cell_rate']['mean']:.4f} against the stored {oc.get('mean')}; holds {parity['holds']}; "
+        f"pictures equal {parity['pictures_equal']}; the judge's stored control holds {k['holds']}")
+    return {"parity": parity, "judge_control": k, "wrong_curve": curve, "engines": parts.used,
+            "inconclusive": any(not u["descended"] for u in parts.used)}
+
+
 RUNNERS = {"parts": _run_parts, "judge": _run_judge, "timing": _run_timing, "compose": _run_compose,
-           "controls": _run_controls, "exact": _run_exact, "leak": _run_leak, "wrong": _run_wrong}
+           "controls": _run_controls, "exact": _run_exact, "leak": _run_leak, "wrong": _run_wrong,
+           "draw": _run_draw, "parity": _run_parity}
 
 
 # ------------------------------------------------------------------ the result
@@ -510,6 +749,38 @@ def _text(result: dict) -> str:
                   f"{_f(e['train_seconds'])} |" for e in result["engines"]]
     elif v == "controls":
         lines += [f"- ({k}): holds {_f(c.get('holds', c.get('holds_true')))}" for k, c in result["controls"].items()]
+    elif v == "draw":
+        t = result["tables"]
+        lines += [f"writer cell {result['answers']} (role {result['role'] or '-'}); {result['captions']} captions, "
+                  f"{result['drawn']} drawn; engines of seed {result['args']['seed']}", "",
+                  "P picture right, W written right, C drawn as written, H handed right (the requests after the "
+                  "conversion); rates over the captions, se = sqrt(p (1 - p) / n)", "",
+                  "| family | n | P | se | W | se | C | se | H | se | mean W x C | mean H x C | W = 1, H = 0 | "
+                  "per-instance error |", "|" + "---|" * 14]
+        for name, b in list(t["families"].items()) + [("all six", t.get("all"))]:
+            if not b:
+                continue
+            lines.append(f"| {name} | {b['n']} | " + " | ".join(f"{_f(b[k]['mean'])} | {_f(b[k]['se'])}"
+                                                               for k in ("P", "W", "C", "H"))
+                         + f" | {_f(b['WC'])} | {_f(b['HC'])} | {_f(b['handoff_loss']['rate'])} | "
+                           f"{_f(b['per_instance_error']['rate'])} |")
+        kinds = (t.get("all") or {}).get("handoff_loss", {}).get("kinds", {})
+        lines += ["", "the handoff loss by kind (captions): " + (", ".join(f"{k} {v}" for k, v in kinds.items()) or "none"),
+                  "", "| asked instances | P | se | n |", "|---|---|---|---|"]
+        lines += [f"| {k} | {_f(x['mean'])} | {_f(x['se'])} | {x['n']} |" for k, x in t["P_by_asked"].items()]
+        lines += ["", "| W, C | captions | P |", "|---|---|---|"]
+        lines += [f"| {k} | {x['captions']} | {_f(x['P']['mean'])} |" for k, x in t["W_by_C"].items()]
+        lines.append(f"\ninconclusive: {_f(result['inconclusive'])}; sampling {result['sample_seconds']:.1f} s")
+    elif v == "parity":
+        p, k = result["parity"], result["judge_control"]
+        lines += [f"- the collective on the earlier run's lists at n = {p['n']}: cell rate {_f(p['cell_rate']['mean'])} "
+                  f"against the stored {_f(p['stored_cell_rate'].get('mean'))} (difference {_f(p['difference'])}, bar "
+                  f"{_f(p['bar'])}): holds {_f(p['holds'])}",
+                  f"- the pictures equal the stored ones bit for bit: "
+                  + ("not stored" if p["pictures_equal"] is None else _f(p["pictures_equal"])),
+                  f"- the judge's stored control: rates holds {_f(k['holds_rates'])}, real scenes at nine things "
+                  f"{_f((k['real_scene_right_n9'] or {}).get('mean'))} holds {_f(k['holds_real'])}",
+                  f"- the stored wrong-address curve: {len(result['wrong_curve'])} points"]
     else:
         body = {k: result[k] for k in ("judge", "timing", "exact", "leak") if k in result}
         if "wrong" in result:
@@ -568,6 +839,27 @@ def summarize(root: str) -> str:
         for n, x in r["by_n"].items():
             rows.append(f"| {os.path.relpath(dirpath, root)} | {r['row']} | {r['args']['bed']} | {r['args']['seed']} | {n} | "
                         f"{_f(x['cell_rate']['mean'])} | {_f(x['scene_right']['mean'])} | {_f(r['inconclusive'])} |")
+    return "\n".join(rows) + "\n"
+
+
+def summarize_drawn(root: str) -> str:
+    """A markdown table of the draw results under ``root``: the writer cell, its role, the seed, and P, W, C, H over the
+    six families and on combined."""
+    rows = ["| job | writer cell | role | seed | P | W | C | H | P combined | W combined | inconclusive |",
+            "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for dirpath, _, files in sorted(os.walk(root)):
+        if "result.json" not in files:
+            continue
+        with open(os.path.join(dirpath, "result.json"), encoding="utf-8") as fh:
+            r = json.load(fh)
+        if r.get("experiment") != EXPERIMENT or r.get("variant") != "draw":
+            continue
+        t = r["tables"]
+        al, cb = t.get("all") or {}, t["families"].get("combined") or {}
+        get = lambda b, k: (b.get(k) or {}).get("mean")
+        rows.append(f"| {os.path.relpath(dirpath, root)} | {r['answers']} | {r['role'] or '-'} | {r['args']['seed']} | "
+                    + " | ".join(_f(get(al, k)) for k in ("P", "W", "C", "H"))
+                    + f" | {_f(get(cb, 'P'))} | {_f(get(cb, 'W'))} | {_f(r['inconclusive'])} |")
     return "\n".join(rows) + "\n"
 
 

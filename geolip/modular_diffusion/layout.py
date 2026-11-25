@@ -59,6 +59,17 @@ reads what remains. A scored cell-form row carries its scores under this read in
 summary carries the same summary of them under ``table``. Its control (``tolerant_check``): on the generator's layouts
 it equals the strict read, and on those layouts dressed as a table it reads them right wherever the strict read fails.
 
+THE TOY BED'S CAPTIONS (``bed_prompts``): the same six families and wordings generated with the toy scenes' nine things
+(BED_THINGS, with the plural table BED_PLURALS) and nine colours (BED_COLOURS) for every family, at most one instance a
+cell in every true layout (asserted); with nine things count gives the first ten (thing, number) pairs a third prompt
+and absent gives the first thing a twelfth, so each family keeps 100. Each caption carries ``vocabulary`` "bed", and
+``score`` reads an answer to it with the bed's listed things (the nine and the worked examples' eight: ``relabel``).
+FROM A WRITTEN LAYOUT TO THE BED'S REQUESTS (``bed_requests``): instances that name no thing of the bed or have no
+address are dropped, the first written keeps a cell, a missing or foreign colour is drawn from a seeded generator;
+every dropped instance is kept with its reason. The reads of a caption (``caption_reads``, ``picture_reads``): written
+right, handed right (the requests scored as a layout, a drawn colour counting as no stated colour), drawn as written
+and picture right (the picture's layout scored).
+
 THE WHOLE-ROW CHAIN FORM ("chain_full", ``chain_full_read``): the chain reader joined with the records stated by the
 answer's ``question: <key> -> <value> [record|chain|unknown]`` lines. COPIED (``copied``, box readings only; it judges
 nothing): every written box equals a box the box form writes for one of the six worked examples.
@@ -213,14 +224,16 @@ def _listed(w: str) -> Optional[str]:
     return SINGULAR.get(w)
 
 
-def thing_of(label: str) -> Optional[str]:
-    """The listed thing a label names, or None (no listed thing, or two different ones: an extra thing)."""
+def thing_of(label: str, plurals: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """The listed thing a label names, or None (no listed thing, or two different ones: an extra thing). ``plurals``: the
+    listed things with their plurals (default PLURALS)."""
     dropped = set(ARTICLES) | set(COLOURS) | set(COLOUR_SPELLINGS) | set(NUMBER_WORDS)
+    singular = None if plurals is None else {p: s for s, p in plurals.items()}
     found: List[str] = []
     for w in _words(label):
         if w in dropped:
             continue
-        t = _listed(w)
+        t = _listed(w) if plurals is None else (w if w in plurals else singular.get(w))
         if t is not None and t not in found:
             found.append(t)
     return found[0] if len(found) == 1 else None
@@ -242,44 +255,68 @@ def _inst(thing, colour, col, row) -> dict:
     return {"thing": thing, "colour": colour, "col": int(col), "row": int(row)}
 
 
-def _draw_cells(rng: random.Random, n: int, allowed: Sequence[int], used: Optional[Dict[int, int]] = None) -> List[int]:
-    """n cells (0..8, col = c % 3, row = c // 3) drawn from ``allowed``, at most MAX_IN_CELL a cell."""
+def _spec(things: Optional[Sequence[str]] = None, colours: Optional[Sequence[str]] = None,
+          plurals: Optional[Dict[str, str]] = None, max_in_cell: Optional[int] = None) -> dict:
+    """What the prompt generator draws from: the things of the four simple families and of the two harder ones, the
+    colours, the plural table and the most instances a cell. The default is the generator's own lists; a given list of
+    things serves every family."""
+    return {"simple": tuple(things) if things else THINGS_SIMPLE, "hard": tuple(things) if things else THINGS_HARD,
+            "colours": tuple(colours) if colours else COLOURS, "plurals": dict(plurals) if plurals else PLURALS,
+            "max_in_cell": int(max_in_cell) if max_in_cell else MAX_IN_CELL}
+
+
+_DEFAULT_SPEC = _spec()
+
+
+def _draw_cells(rng: random.Random, n: int, allowed: Sequence[int], used: Optional[Dict[int, int]] = None,
+                max_in_cell: int = MAX_IN_CELL) -> List[int]:
+    """n cells (0..8, col = c % 3, row = c // 3) drawn from ``allowed``, at most ``max_in_cell`` a cell."""
     used = {} if used is None else used
     cells = []
     for _ in range(n):
-        free = [c for c in allowed if used.get(c, 0) < MAX_IN_CELL]
+        free = [c for c in allowed if used.get(c, 0) < max_in_cell]
         c = free[rng.randrange(len(free))]
         used[c] = used.get(c, 0) + 1
         cells.append(c)
     return cells
 
 
-def _count_text(n: int, thing: str) -> str:
-    return f"A realistic photo of a scene with {NUMBER_WORDS[n - 1]} {thing if n == 1 else plural(thing)}"
+def _count_text(n: int, thing: str, plurals: Optional[Dict[str, str]] = None) -> str:
+    many = (plurals or PLURALS)[thing]
+    return f"A realistic photo of a scene with {NUMBER_WORDS[n - 1]} {thing if n == 1 else many}"
 
 
-def _count_prompts(rng: random.Random) -> List[dict]:
+def _copies(k: int, slots: int) -> int:
+    """How many prompts the k-th of ``slots`` equal slots gets so that PER_FAMILY are made: an equal share, and one more
+    for each of the first PER_FAMILY mod slots (with the default lists every slot gets the same share)."""
+    base, extra = divmod(PER_FAMILY, slots)
+    return base + (1 if k < extra else 0)
+
+
+def _count_prompts(rng: random.Random, g: dict = _DEFAULT_SPEC) -> List[dict]:
     out = []
-    for thing in THINGS_SIMPLE:
+    things = g["simple"]
+    for ti, thing in enumerate(things):
         for n in range(1, 6):
             seen: List[List[int]] = []
-            for _ in range(2):
+            for _ in range(_copies(ti * 5 + n - 1, len(things) * 5)):
                 while True:
-                    cells = sorted(_draw_cells(rng, n, range(9)))
+                    cells = sorted(_draw_cells(rng, n, range(9), max_in_cell=g["max_in_cell"]))
                     if cells not in seen:
                         break
                 seen.append(cells)
                 truth = [_inst(thing, None, c % 3, c // 3) for c in cells]
-                out.append(("count", _count_text(n, thing), [{"thing": thing, "count": n, "colour": None}], [], [], [],
-                            truth))
+                out.append(("count", _count_text(n, thing, g["plurals"]), [{"thing": thing, "count": n, "colour": None}],
+                            [], [], [], truth))
     return out
 
 
-def _absent_prompts(rng: random.Random) -> List[dict]:
+def _absent_prompts(rng: random.Random, g: dict = _DEFAULT_SPEC) -> List[dict]:
     out = []
-    for thing in THINGS_SIMPLE:
-        for _ in range(10):
-            out.append(("absent", f"A realistic photo of a scene without {plural(thing)}", [], [], [], [thing], []))
+    things = g["simple"]
+    for ti, thing in enumerate(things):
+        for _ in range(_copies(ti, len(things))):
+            out.append(("absent", f"A realistic photo of a scene without {g['plurals'][thing]}", [], [], [], [thing], []))
     return out
 
 
@@ -291,11 +328,11 @@ def _pair(rng: random.Random, things: Sequence[str]):
     return a, b
 
 
-def _colour_prompts(rng: random.Random) -> List[tuple]:
+def _colour_prompts(rng: random.Random, g: dict = _DEFAULT_SPEC) -> List[tuple]:
     out, texts = [], []
     while len(out) < PER_FAMILY:
-        a, b = _pair(rng, THINGS_SIMPLE)
-        ca, cb = _pair(rng, COLOURS)
+        a, b = _pair(rng, g["simple"])
+        ca, cb = _pair(rng, g["colours"])
         text = f"A realistic photo of a scene with {article(ca)} {ca} {a} and {article(cb)} {cb} {b}"
         if text in texts:
             continue
@@ -313,11 +350,11 @@ def _on_side(rng: random.Random, side: str):
     return (value, other) if axis == "col" else (other, value)
 
 
-def _place_prompts(rng: random.Random) -> List[tuple]:
+def _place_prompts(rng: random.Random, g: dict = _DEFAULT_SPEC) -> List[tuple]:
     out, texts = [], []
     sides = ("left", "right", "top", "bottom")
     while len(out) < PER_FAMILY:
-        a, b = _pair(rng, THINGS_SIMPLE)
+        a, b = _pair(rng, g["simple"])
         side = sides[rng.randrange(4)]
         opp = OPPOSITE[side]
         text = f"A realistic photo of a scene with {article(a)} {a} on the {side} and {article(b)} {b} on the {opp}"
@@ -336,10 +373,10 @@ def _relation_holds_cells(rel: str, ca: int, ra: int, cb: int, rb: int) -> bool:
     return {"left of": ca < cb, "right of": ca > cb, "above": ra < rb, "below": ra > rb}[rel]
 
 
-def _relation_prompts(rng: random.Random) -> List[tuple]:
+def _relation_prompts(rng: random.Random, g: dict = _DEFAULT_SPEC) -> List[tuple]:
     out, texts = [], []
     while len(out) < PER_FAMILY:
-        a, b = _pair(rng, THINGS_HARD)
+        a, b = _pair(rng, g["hard"])
         rel = RELATIONS[rng.randrange(4)]
         text = f"A realistic photo of {article(a)} {a} {RELATION_WORDS[rel]} {article(b)} {b}"
         if text in texts:
@@ -377,19 +414,21 @@ def _is_are(n: int) -> str:
     return "is" if n == 1 else "are"
 
 
-def _named(thing: str, n: int) -> str:
-    return thing if n == 1 else plural(thing)
+def _named(thing: str, n: int, plurals: Optional[Dict[str, str]] = None) -> str:
+    return thing if n == 1 else (plurals or PLURALS)[thing]
 
 
-def _combined_prompt(rng: random.Random, size: int) -> tuple:
+def _combined_prompt(rng: random.Random, size: int, g: dict = _DEFAULT_SPEC) -> tuple:
+    most = g["max_in_cell"]
+    pl = g["plurals"]
     while True:
         kinds = 2 if size == 2 else (2, 3)[rng.randrange(2)]
-        things = rng.sample(THINGS_HARD, kinds)
+        things = rng.sample(g["hard"], kinds)
         counts = [1] * kinds
         for _ in range(size - kinds):
             counts[rng.randrange(kinds)] += 1
         coloured = [rng.random() < 0.5 for _ in things]
-        palette = rng.sample(COLOURS, kinds)
+        palette = rng.sample(g["colours"], kinds)
         colours = [palette[k] if coloured[k] else None for k in range(kinds)]
         owner: Dict[int, str] = {}
         used: Dict[int, int] = {}
@@ -397,10 +436,10 @@ def _combined_prompt(rng: random.Random, size: int) -> tuple:
         ok = True
         for k, t in enumerate(things):
             allowed = [c for c in range(9) if owner.get(c, t) == t]
-            if sum(MAX_IN_CELL - used.get(c, 0) for c in allowed) < counts[k]:
+            if sum(most - used.get(c, 0) for c in allowed) < counts[k]:
                 ok = False
                 break
-            for c in _draw_cells(rng, counts[k], allowed, used):
+            for c in _draw_cells(rng, counts[k], allowed, used, most):
                 owner[c] = t
                 truth.append(_inst(t, colours[k], c % 3, c // 3))
         if not ok:
@@ -413,38 +452,74 @@ def _combined_prompt(rng: random.Random, size: int) -> tuple:
         n_of = dict(zip(things, counts))
         items = []
         for t, n, c in zip(things, counts, colours):
-            head = f"{c} {_named(t, n)}" if c else _named(t, n)
+            head = f"{c} {_named(t, n, pl)}" if c else _named(t, n, pl)
             items.append(f"{article(head)} {head}" if n == 1 else f"{NUMBER_WORDS[n - 1]} {head}")
         listed = ", ".join(items[:-1]) + " and " + items[-1]
         said, places, relations = [], [], []
         for f in chosen:
             if f[0] == "side":
                 _, t, side = f
-                said.append(f"the {_named(t, n_of[t])} {_is_are(n_of[t])} on the {side}")
+                said.append(f"the {_named(t, n_of[t], pl)} {_is_are(n_of[t])} on the {side}")
                 places.append({"thing": t, "axis": SIDES[side][0], "value": SIDES[side][1]})
             else:
                 _, a, rel, b = f
-                said.append(f"the {_named(a, n_of[a])} {_is_are(n_of[a])} {RELATION_WORDS[rel]} the {_named(b, n_of[b])}")
+                said.append(f"the {_named(a, n_of[a], pl)} {_is_are(n_of[a])} {RELATION_WORDS[rel]} "
+                            f"the {_named(b, n_of[b], pl)}")
                 relations.append({"a": a, "rel": rel, "b": b})
         text = f"A realistic photo of {listed}; {' and '.join(said)}."
         asks = [{"thing": t, "count": n, "colour": c} for t, n, c in zip(things, counts, colours)]
         return ("combined", text, asks, places, relations, [], truth)
 
 
-def _combined_prompts(rng: random.Random) -> List[tuple]:
-    return [_combined_prompt(rng, size) for size in COMBINED_SIZES for _ in range(PER_FAMILY // len(COMBINED_SIZES))]
+def _combined_prompts(rng: random.Random, g: dict = _DEFAULT_SPEC) -> List[tuple]:
+    return [_combined_prompt(rng, size, g) for size in COMBINED_SIZES for _ in range(PER_FAMILY // len(COMBINED_SIZES))]
 
 
-def make_prompts(seed: int = 0) -> List[dict]:
-    """The 600 prompts with known answers, 100 a family, in the order of FAMILIES; ids '<family>_<3 digits>'."""
+def make_prompts(seed: int = 0, things: Optional[Sequence[str]] = None, colours: Optional[Sequence[str]] = None,
+                 plurals: Optional[Dict[str, str]] = None, max_in_cell: Optional[int] = None,
+                 vocabulary: str = "") -> List[dict]:
+    """The 600 prompts with known answers, 100 a family, in the order of FAMILIES; ids '<family>_<3 digits>'.
+
+    By default the generator's own lists (ten things for count, absent, colour and place, thirty for relation and
+    combined, eleven colours, at most MAX_IN_CELL instances a cell). ``things``: one list for every family (with its
+    ``plurals`` table); ``colours``: the colours drawn; ``max_in_cell``: the most instances a cell in a true layout;
+    ``vocabulary``: a name of VOCABULARIES stored with every prompt (the listed things its answers are read with). With
+    fewer than ten things, count gives every (thing, number) pair an equal share of the 100 prompts and one more to each
+    of the first pairs (absent likewise a thing), so each family still has 100."""
+    g = _spec(things, colours, plurals, max_in_cell)
     rng = random.Random(int(seed))
     out = []
     for family, maker in (("count", _count_prompts), ("absent", _absent_prompts), ("colour", _colour_prompts),
                           ("place", _place_prompts), ("relation", _relation_prompts), ("combined", _combined_prompts)):
-        made = maker(rng)
+        made = maker(rng, g)
         assert len(made) == PER_FAMILY, (family, len(made))
         for i, (fam, text, asks, places, relations, absent, truth) in enumerate(made):
-            out.append(_prompt(f"{family}_{i:03d}", fam, text, asks, places, relations, absent, truth))
+            p = _prompt(f"{family}_{i:03d}", fam, text, asks, places, relations, absent, truth)
+            if vocabulary:
+                p["vocabulary"] = vocabulary
+            out.append(p)
+    return out
+
+
+# ------------------------------------------------------------------ the toy bed's captions
+# the nine things and nine colours of the toy scenes (the order of ``scenes.THINGS`` and ``scenes.COLORS``)
+BED_THINGS = ("disc", "ring", "crescent", "square", "triangle", "diamond", "plus", "cross", "star")
+BED_COLOURS = ("red", "orange", "yellow", "green", "blue", "purple", "pink", "brown", "black")
+BED_PLURALS = {"disc": "discs", "ring": "rings", "crescent": "crescents", "square": "squares", "triangle": "triangles",
+               "diamond": "diamonds", "plus": "pluses", "cross": "crosses", "star": "stars"}
+# the listed things an answer is read with: a prompt's ``vocabulary`` names one; without one, PLURALS (every thing of the
+# default lists and of the worked examples). The bed's: its nine things and the worked examples' eight
+VOCABULARIES = {"bed": dict(BED_PLURALS, **{t: PLURALS[t] for t in THINGS_EXAMPLES})}
+
+
+def bed_prompts(seed: int = 0) -> List[dict]:
+    """The 600 captions of the toy scenes: the six families in the generator's wordings with the bed's nine things and
+    nine colours, at most one instance a cell in every true layout (asserted), read with the bed's vocabulary."""
+    out = make_prompts(seed, BED_THINGS, BED_COLOURS, BED_PLURALS, max_in_cell=1, vocabulary="bed")
+    for p in out:
+        cells = [(i["col"], i["row"]) for i in p["truth"]]
+        assert len(set(cells)) == len(cells) <= 9, (p["id"], "a true layout of the bed holds one instance a cell")
+        assert all(i["thing"] in BED_THINGS and (i["colour"] is None or i["colour"] in BED_COLOURS) for i in p["truth"])
     return out
 
 
@@ -1143,6 +1218,18 @@ def copied(reading: dict) -> Optional[int]:
     return int(all(tuple(i["box"]) in known for i in reading["instances"]))
 
 
+def relabel(reading: dict, plurals: Dict[str, str]) -> dict:
+    """A copy of a box or cell reading whose instances (and lenient instances) name their thing by ``plurals`` (the
+    listed things and their plurals), from their labels. The chain forms name things by word, not by label: refused."""
+    if reading.get("form") in ("chain", "chain_full"):
+        raise ValueError("a chain reading names its things by word; it is not read with another vocabulary")
+    out = dict(reading)
+    for key in ("instances", "lenient"):
+        if out.get(key) is not None:
+            out[key] = [dict(i, thing=thing_of(i["label"], plurals)) for i in out[key]]
+    return out
+
+
 def score(prompt: dict, reading: dict, form: Optional[str] = None) -> dict:
     """Every score of the prompt's family (0 or 1; None where a score does not apply), address_right, the failure kinds
     present, and per asked instance whether it is in error (instance_errors of instances_asked). An unparsed answer
@@ -1150,6 +1237,8 @@ def score(prompt: dict, reading: dict, form: Optional[str] = None) -> dict:
     family = prompt["family"]
     applies = APPLIES[family]
     asked = sum(int(a["count"]) for a in prompt["asks"])
+    if prompt.get("vocabulary"):           # the prompt's own listed things (the toy bed's captions)
+        reading = relabel(reading, VOCABULARIES[prompt["vocabulary"]])
     out = {"id": prompt["id"], "family": family, "form": form or reading.get("form"), "text_key": text_key(prompt["text"]),
            "copied": copied(reading)}
     if not reading.get("parsed"):
@@ -1586,3 +1675,102 @@ def compare(rows_a: Sequence[dict], rows_b: Sequence[dict], key: str = "address_
     se = math.sqrt(sum((d - m) ** 2 for d in diffs) / (n - 1)) / math.sqrt(n) if n > 1 else None
     tie = None if se is None else (abs(m) < 2 * se or (m == 0 and se == 0))
     return {"mean": m, "se": se, "n": n, "tie": tie}
+
+
+# ------------------------------------------------------------------ from a written layout to the bed's requests
+COLOUR_SEED = 9000
+DROPS = ("not a thing of the bed", "no address", "cell taken by the same thing", "cell taken by another thing")
+COLOUR_DRAWS = ("no colour", "a colour not of the bed", "several colours")
+
+
+def bed_requests(reading: dict, index: int, seed: int = COLOUR_SEED) -> dict:
+    """The requests a written layout hands to the toy collective (at most one a cell), from a cell-form reading of a
+    bed caption, by fixed rules in the order the instances are written: an instance whose thing is none of the bed's
+    nine is dropped; one with no address is dropped; one whose cell an earlier instance already holds is dropped (the
+    first written keeps the cell); a kept instance whose colours are exactly one of the bed's nine keeps it, any other
+    (none, a colour not of the bed, several colours) gets one drawn by ``random.Random(seed + index)`` (one draw of
+    the nine a kept instance that needs one, in the written order); a stated colour is never replaced.
+    -> {"parsed", "requests": [{"line", "thing", "colour", "col", "row", "colour_drawn", "colour_why"}],
+        "dropped": [{"line", "label", "why"}]}; an unparsed reading hands nothing (parsed False)."""
+    r = relabel(reading, VOCABULARIES["bed"]) if reading.get("parsed") else reading
+    if not r.get("parsed"):
+        return {"parsed": False, "requests": [], "dropped": []}
+    rng = random.Random(int(seed) + int(index))
+    owner: Dict[tuple, str] = {}
+    requests, dropped = [], []
+    for k, i in enumerate(r["instances"]):
+        if i["thing"] not in BED_THINGS:
+            dropped.append({"line": k, "label": i["label"], "why": DROPS[0]})
+            continue
+        if i["col"] is None or i["row"] is None:
+            dropped.append({"line": k, "label": i["label"], "why": DROPS[1]})
+            continue
+        cell = (i["col"], i["row"])
+        if cell in owner:
+            dropped.append({"line": k, "label": i["label"], "why": DROPS[2] if owner[cell] == i["thing"] else DROPS[3]})
+            continue
+        owner[cell] = i["thing"]
+        cols = i["colours"]
+        if len(cols) == 1 and cols[0] in BED_COLOURS:
+            colour, why = cols[0], None
+        else:
+            colour = BED_COLOURS[rng.randrange(len(BED_COLOURS))]
+            why = COLOUR_DRAWS[0] if not cols else COLOUR_DRAWS[2] if len(cols) > 1 else COLOUR_DRAWS[1]
+        requests.append({"line": k, "thing": i["thing"], "colour": colour, "col": i["col"], "row": i["row"],
+                         "colour_drawn": why is not None, "colour_why": why})
+    return {"parsed": True, "requests": requests, "dropped": dropped}
+
+
+def requests_reading(requests: Sequence[dict]) -> dict:
+    """The requests as a reading for the scorer: a drawn colour counts as no stated colour."""
+    insts = [_instance(q["thing"], [] if q.get("colour_drawn") else [q["colour"]], col=q["col"], row=q["row"])
+             for q in requests]
+    return _reading("requests", True, None, insts, None)
+
+
+def picture_reading(judged: Sequence[Sequence]) -> dict:
+    """The picture's layout as a reading: ``judged`` holds, for the nine cells in cell order (3 row + column), the
+    judge's (thing index or None for nothing, colour index); one instance a cell not read as nothing."""
+    if len(judged) != 9:
+        raise ValueError("a picture has nine cells")
+    insts = []
+    for c, (t, k) in enumerate(judged):
+        if t is None:
+            continue
+        insts.append(_instance(BED_THINGS[int(t)], [BED_COLOURS[int(k)]], col=c % 3, row=c // 3))
+    return _reading("picture", True, None, insts, None)
+
+
+def request_cells(requests: Sequence[dict]) -> List[list]:
+    """The requests in cell order: for each of the nine cells (thing index, colour index), or (None, None) when empty."""
+    out = [[None, None] for _ in range(9)]
+    for q in requests:
+        out[3 * q["row"] + q["col"]] = [BED_THINGS.index(q["thing"]), BED_COLOURS.index(q["colour"])]
+    return out
+
+
+def caption_reads(prompt: dict, index: int, answer: str) -> dict:
+    """The reads of a bed caption that need no picture, from a cell-form answer read by the table-tolerant read: W
+    (written right: the family's address right of the written layout), the requests handed on and the instances
+    dropped (``bed_requests``), H (handed right: the family's address right of the requests, a drawn colour counting as
+    no stated colour; 0 when the answer does not parse), and the per-instance error of the written layout."""
+    reading = read_table(answer)
+    s = score(prompt, reading, "cell")
+    hand = bed_requests(reading, index)
+    h = score(prompt, requests_reading(hand["requests"]), "cell")["address_right"] if hand["parsed"] else 0
+    return {"id": prompt["id"], "family": prompt["family"], "index": int(index), "parsed": int(bool(reading["parsed"])),
+            "W": int(s["address_right"]), "H": int(h), "requests": hand["requests"], "dropped": hand["dropped"],
+            "instance_errors": s["instance_errors"], "instances_asked": s["instances_asked"], "kinds": s["kinds"]}
+
+
+def picture_reads(prompt: dict, reads: dict, judged: Optional[Sequence[Sequence]]) -> dict:
+    """C (drawn as written: all nine cells of the picture as the requests say, things, empties and colours) and P
+    (picture right: the family's address right of the picture's layout) for a caption whose ``caption_reads`` are
+    ``reads``; ``judged`` None (no picture: the answer did not parse) gives C = P = 0."""
+    if judged is None or not reads["parsed"]:
+        return {"C": 0, "P": 0}
+    want = request_cells(reads["requests"])
+    c = all((w[0] is None and j[0] is None) or (w[0] is not None and j[0] == w[0] and j[1] == w[1])
+            for w, j in zip(want, judged))
+    p = score(prompt, picture_reading(judged), "cell")["address_right"]
+    return {"C": int(c), "P": int(p)}

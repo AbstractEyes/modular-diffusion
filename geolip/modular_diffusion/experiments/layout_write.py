@@ -30,8 +30,14 @@ read by ``layout.chain_full_read``: the chain lines joined with the question lin
 (``layout.ASK_CHAIN_TEXT``); ``spec`` (only with ``writer=parser``: the parser's records are the answer). The other
 chain forms are read by ``layout.chain_read``.
 
+THE TOY BED'S CAPTIONS (``captions=bed``, the cell form only, no real captions): the 600 prompts are
+``layout.bed_prompts`` (the six families with the toy scenes' nine things and nine colours, one instance a cell in every
+true layout), asked with the same ask and worked examples, scored with the bed's listed things; the controls run on
+them. ``fake:truth`` writes each caption's own layout, ``fake:shuffled`` the layout of another caption of its family (a
+fixed derangement).
+
 Arguments (key=value): variant, writer, adapter, adapter_revision (a tag or commit of an adapter given as a hub id),
-revision, form, examples, first_n, real (a JSON file: a list of
+revision, form, examples, first_n, captions, real (a JSON file: a list of
 captions, or of {"id", "text"}), seed (the prompts' generator), repeat_n (control d: the first prompts asked again, in
 whole batches, the first repeat_n answers compared), device, dtype (empty: float32; fp16 or bf16), batch,
 max_new_tokens, system, local_only (1: nothing is downloaded), threads, a, b, out.
@@ -75,7 +81,8 @@ READ_FORM = {"box": "box", "cell": "cell", "chain_records": "chain", "chain_full
 RECORD_FORMS = ("chain_records", "chain_full_records")
 FAKE_MODES = ("truth", "broken", "empty", "shuffled", "table")
 DEPTH = "medium"
-DEFAULTS = dict(variant="write", writer="", adapter="", adapter_revision="", revision="", form="box", examples=1, first_n=0, real="", seed=0,
+CAPTIONS = ("", "bed")         # the prompts of a cell: the generator's 600 (""), or the toy bed's 600 captions
+DEFAULTS = dict(variant="write", writer="", adapter="", adapter_revision="", revision="", form="box", examples=1, first_n=0, real="", seed=0, captions="",
                 repeat_n=20, device="cpu", dtype="", batch=8, max_new_tokens=512, system="", local_only=1, threads=4,
                 a="", b="", out="")
 CONTROL_B_FAMILIES = ("count", "colour", "relation", "combined")
@@ -84,6 +91,14 @@ CONTROL_B_LIMIT = 0.2
 CONTROL_B_BANDS = {"relation": (0.2, 0.6), "place": (0.03, 0.22)}
 CONTROL_B_RANDOM = tuple(CONTROL_B_BANDS)
 RANDOM_SEED = 1000
+
+
+def prompt_list(a: dict) -> List[dict]:
+    """The 600 prompts with known answers of a cell: the generator's (``captions`` empty) or the toy bed's captions
+    (``captions=bed``: ``layout.bed_prompts``), from the generator seeded ``seed``."""
+    if a.get("captions", "") not in CAPTIONS:
+        raise ValueError(f"captions is empty or bed, not {a.get('captions')!r}")
+    return layout.bed_prompts(int(a["seed"])) if a.get("captions") == "bed" else layout.make_prompts(int(a["seed"]))
 
 
 def cell_name(writer_tag: str, form: str, examples) -> str:
@@ -377,7 +392,7 @@ def _controls(a: dict, form: str, prompts: List[dict], readings: List[dict], ans
     ex_set = layout.example_set(a["examples"]) if rf in ("box", "cell") else 0
     examples = layout.example_prompts(max(1, ex_set))
     if rf in ("box", "cell"):
-        full = layout.make_prompts(int(a["seed"])) + examples
+        full = prompt_list(a) + examples
         bad = [p["id"] for p in full if layout.score(p, layout.read(rf, layout.render(rf, p["truth"])), rf)
                ["address_right"] != 1]
         out["a"] = {"prompts": len(full), "failures": bad[:20], "failed": len(bad), "holds": not bad}
@@ -419,7 +434,7 @@ def _controls(a: dict, form: str, prompts: List[dict], readings: List[dict], ans
     out["d"] = repeat or {"holds": None}
     # (e) the table-tolerant read changes nothing it should not (the cell form only)
     if rf == "cell":
-        out["e"] = layout.tolerant_check(layout.make_prompts(int(a["seed"])) + examples)
+        out["e"] = layout.tolerant_check(prompt_list(a) + examples)
     else:
         out["e"] = {"holds": None, "note": "the table-tolerant read is a read of the cell form"}
     return out
@@ -434,7 +449,9 @@ def _run_write(a: dict, log: Callable[[str], None], t0: float) -> dict:
     out = a["out"]
     ex_set = layout.example_set(a["examples"]) if form in ("box", "cell") else 0
     examples = bool(ex_set)
-    prompts = _select(layout.make_prompts(int(a["seed"])), int(a["first_n"]))
+    if a["captions"] == "bed" and (form != "cell" or a["real"]):
+        raise ValueError("captions=bed runs the cell form on the toy bed's captions only (no real captions)")
+    prompts = _select(prompt_list(a), int(a["first_n"]))
     if a["real"]:
         real = _real_prompts(a["real"])
         prompts += real[: int(a["first_n"])] if int(a["first_n"]) > 0 else real
@@ -485,7 +502,8 @@ def _run_write(a: dict, log: Callable[[str], None], t0: float) -> dict:
         controls["e"]["answers_changed"] = sum(int(r["table"]["address_right"] != r["address_right"])
                                                for r in rows if r.get("family") in layout.FAMILIES)
     result = {"experiment": EXPERIMENT, "variant": "write", "args": {k: a[k] for k in sorted(a)}, "writer": writer.name,
-              "form": form, "read_form": rf, "examples": examples, "example_set": ex_set, "prompts": len(prompts),
+              "form": form, "read_form": rf, "examples": examples, "example_set": ex_set, "captions": a["captions"],
+              "prompts": len(prompts),
               "real_prompts": sum(p["family"] == "real" for p in prompts), "summary": summary,
               "fallback_text": {"n": len(fb), "ids": [r["id"] for r in fb][:50],
                                 "address_right": layout.rate([r.get("address_right") for r in fb
