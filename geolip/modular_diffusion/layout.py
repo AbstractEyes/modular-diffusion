@@ -48,6 +48,17 @@ combined = all. A rate is a mean with the standard error sqrt(p (1 - p) / n) ove
 all kept and counted as disagreeing); two writers are compared text by text (``compare``): the mean difference, its
 standard error sd / sqrt(n), and a tie when |mean| < 2 se.
 
+THE WORKED EXAMPLES (``example_prompts``, ``ask``): the set 1 is six examples, one of each family; the set 2 is the
+six followed by three more of the combined kind (``EXAMPLES_ADDED``, on the same eight example-only things); the set 0
+is none. The asks of the sets 0 and 1 are the same text as before the set 2 existed.
+
+THE TABLE-TOLERANT READ of the cell form (``read_table``, ``table_score``): a Markdown table's dressing is taken off
+first (``untable``: a code-fence line dropped, three or more backticks and an optional info string without a
+backtick; one bar at each end of a line taken off when it has both; a header line of the column words dropped; a separator line of dashes, bars, colons and spaces dropped), then the strict cell grammar
+reads what remains. A scored cell-form row carries its scores under this read in a nested ``table`` object, and the
+summary carries the same summary of them under ``table``. Its control (``tolerant_check``): on the generator's layouts
+it equals the strict read, and on those layouts dressed as a table it reads them right wherever the strict read fails.
+
 THE WHOLE-ROW CHAIN FORM ("chain_full", ``chain_full_read``): the chain reader joined with the records stated by the
 answer's ``question: <key> -> <value> [record|chain|unknown]`` lines. COPIED (``copied``, box readings only; it judges
 nothing): every written box equals a box the box form writes for one of the six worked examples.
@@ -155,6 +166,25 @@ EXAMPLES = (
      "and the clock is on the top.",
      [("kite", "green", 0, 1), ("kite", "green", 0, 2), ("sheep", "white", 2, 1), ("clock", None, 1, 0)]),
 )
+# three more worked examples of the combined kind, written after the six in the nine-example set: (text, layout as
+# (thing, colour, column, row) in the order of its answer lines, its placements, its relations); their things are the
+# examples' own eight
+EXAMPLES_ADDED = (
+    ("A realistic photo of a blue vase, two umbrellas and a bench; the vase is above the bench and the umbrellas are on "
+     "the right.",
+     [("vase", "blue", 1, 0), ("umbrella", None, 2, 0), ("umbrella", None, 2, 1), ("bench", None, 1, 2)],
+     [{"thing": "umbrella", "axis": "col", "value": 2}], [{"a": "vase", "rel": "above", "b": "bench"}]),
+    ("A realistic photo of two suitcases and a yellow banana; the banana is to the left of the suitcases.",
+     [("suitcase", None, 2, 0), ("suitcase", None, 2, 2), ("banana", "yellow", 0, 1)],
+     [], [{"a": "banana", "rel": "left of", "b": "suitcase"}]),
+    ("A realistic photo of two black sheep, two red kites and a clock; the kites are on the top and the sheep are below "
+     "the clock.",
+     [("sheep", "black", 0, 2), ("sheep", "black", 2, 2), ("kite", "red", 0, 0), ("kite", "red", 2, 0),
+      ("clock", None, 1, 0)],
+     [{"thing": "kite", "axis": "row", "value": 0}], [{"a": "sheep", "rel": "below", "b": "clock"}]),
+)
+# the example sets an ask can carry: 0 none, 1 the six, 2 the six followed by the three added ones
+EXAMPLE_SETS = (0, 1, 2)
 
 
 # ------------------------------------------------------------------ words
@@ -418,8 +448,42 @@ def make_prompts(seed: int = 0) -> List[dict]:
     return out
 
 
-def example_prompts() -> List[dict]:
-    """The six worked examples (their things occur in no test prompt), with their layouts as ``truth``."""
+def _asks_of(layout_: Sequence[tuple]) -> List[dict]:
+    asks: List[dict] = []
+    for t, c, _, _ in layout_:
+        for a in asks:
+            if a["thing"] == t:
+                a["count"] += 1
+                break
+        else:
+            asks.append({"thing": t, "count": 1, "colour": c})
+    return asks
+
+
+def example_set(examples) -> int:
+    """The example set of an ``examples`` setting: False / 0 none, True / 1 the six, 2 the nine."""
+    n = int(examples)
+    if n not in EXAMPLE_SETS:
+        raise ValueError(f"examples is one of {EXAMPLE_SETS} (none, the six, the nine), not {examples!r}")
+    return n
+
+
+def example_prompts(examples=1) -> List[dict]:
+    """The worked examples (their things occur in no test prompt), with their layouts as ``truth``: ``examples`` 1 the
+    six (one of each family), 2 the six followed by the three added combined ones (ids example_7 to example_9), 0
+    none."""
+    n = example_set(examples)
+    if n == 0:
+        return []
+    out = _example_six()
+    if n == 2:
+        for k, (text, layout_, places, relations) in enumerate(EXAMPLES_ADDED, start=len(EXAMPLES) + 1):
+            truth = [_inst(t, c, col, row) for t, c, col, row in layout_]
+            out.append(_prompt(f"example_{k}", "combined", text, _asks_of(layout_), places, relations, (), truth))
+    return out
+
+
+def _example_six() -> List[dict]:
     out = []
     for k, (family, text, layout) in enumerate(EXAMPLES, start=1):
         truth = [_inst(t, c, col, row) for t, c, col, row in layout]
@@ -505,16 +569,15 @@ def render_chain(instances: Sequence[dict]) -> str:
     return "\n".join(lines)
 
 
-def ask(form: str, text: str, examples: bool = True) -> str:
-    """The ask of a form for a prompt text: box and cell, the ask, a blank line, the six worked examples (when
-    ``examples``), then 'Description: <text>' and 'Answer:'; chain_text, the text sentence (no examples)."""
+def ask(form: str, text: str, examples=True) -> str:
+    """The ask of a form for a prompt text: box and cell, the ask, a blank line, the worked examples of the set
+    ``examples`` (True / 1 the six, 2 the nine, False / 0 none), then 'Description: <text>' and 'Answer:'; chain_text,
+    the text sentence (no examples)."""
     if form == "chain_text":
         return ASK_CHAIN_TEXT.replace("{prompt}", text)
     if form not in ("box", "cell"):
         raise ValueError(f"ask writes the forms box, cell and chain_text, not {form!r}")
-    blocks = []
-    if examples:
-        blocks = [f"Description: {p['text']}\nAnswer:\n{render(form, p['truth'])}" for p in example_prompts()]
+    blocks = [f"Description: {p['text']}\nAnswer:\n{render(form, p['truth'])}" for p in example_prompts(examples)]
     blocks.append(f"Description: {text}\nAnswer:")
     return ASKS[form] + "\n\n" + "\n\n".join(blocks)
 
@@ -658,6 +721,93 @@ def _read_cell(answer: str) -> dict:
             return _reading("cell", False, "empty label", None, lenient)
         out.append(_cell_instance(fields))
     return _reading("cell", True, None, out, lenient)
+
+
+# ------------------------------------------------------------------ the table-tolerant read of the cell form
+TABLE_HEADER_WORDS = ("name", "thing", "object", "color", "colour", "column", "col", "row")
+TABLE_FENCE = re.compile(r"`{3,}[^`]*")                # a line that is only a code fence: three or more backticks,
+                                                         # then an optional info string that holds no backtick
+TABLE_SEPARATOR = re.compile(r"[\s|:\-]*-[\s|:\-]*")   # only dashes, bars, colons and spaces, at least one dash
+TABLE_DROPS = ("fence", "bars", "header", "separator")
+
+
+def untable(answer: str) -> tuple:
+    """A Markdown table's dressing taken off a cell-form answer, line by line, in four steps: (1) a line that is only a
+    code fence (three or more backticks, then an optional info string that holds no backtick, such as ``markdown``,
+    `` text`` or ``c++``) is dropped; (2) one bar at the start and one at the
+    end of a line are taken off when the line has both; (3) a header line is dropped: three or more fields, every field
+    one of TABLE_HEADER_WORDS (any case); (4) a separator line is dropped: only dashes, bars, colons and spaces, with at
+    least one dash. White space around a line is ignored in each test; nothing else is changed. -> (the remaining text,
+    {"fence", "bars", "header", "separator"}: how many lines each step took or changed)."""
+    counts = {k: 0 for k in TABLE_DROPS}
+    kept = []
+    for ln in str(answer).splitlines():
+        s = ln.strip()
+        if TABLE_FENCE.fullmatch(s):
+            counts["fence"] += 1
+            continue
+        if len(s) >= 2 and s.startswith("|") and s.endswith("|"):
+            s = s[1:-1]
+            counts["bars"] += 1
+            ln = s
+        fields = [f.strip().lower() for f in s.split("|")]
+        if len(fields) >= 3 and all(f in TABLE_HEADER_WORDS for f in fields):
+            counts["header"] += 1
+            continue
+        if TABLE_SEPARATOR.fullmatch(s):
+            counts["separator"] += 1
+            continue
+        kept.append(ln)
+    return "\n".join(kept), counts
+
+
+def read_table(answer: str) -> dict:
+    """The table-tolerant read of a cell-form answer: ``untable`` first, then the strict cell grammar on the lines that
+    remain (a broken row still fails PARSED; an answer with no line left is read as broken). The reading carries
+    ``table_drops`` (``untable``'s counts)."""
+    text, counts = untable(answer)
+    r = _read_cell(text)
+    r["table_drops"] = counts
+    return r
+
+
+TABLE_FIELDS = SCORES + ("address_right", "kinds", "instance_errors", "instances_asked", "lenient_address_right")
+TABLE_REAL_FIELDS = ("parsed", "placed", "no_conflict", "written_things_in_caption")
+
+
+def table_score(prompt: dict, answer: str) -> dict:
+    """Every score of a prompt under the table-tolerant read of a cell-form answer (the fields of TABLE_FIELDS), with
+    ``drops`` (``untable``'s counts); for a real caption (family "real") the fields of ``score_real``."""
+    r = read_table(answer)
+    if prompt.get("family") == "real":
+        out = dict(score_real(prompt["text"], r))
+    else:
+        s = score(prompt, r, "cell")
+        out = {k: s.get(k) for k in TABLE_FIELDS}
+    out["drops"] = dict(r["table_drops"])
+    return out
+
+
+def table_rows(rows: Sequence[dict]) -> List[dict]:
+    """The rows that carry a table-tolerant read (a dict under ``table``), each with its scores replaced by those of the
+    tolerant read (and no ``table`` field), so the summaries and comparisons apply to them as they are."""
+    out = []
+    for r in rows:
+        t = r.get("table")
+        if not isinstance(t, dict):
+            continue
+        x = {k: v for k, v in r.items() if k != "table"}
+        x.update({k: v for k, v in t.items() if k != "drops"})
+        x["table_drops"] = t.get("drops")
+        out.append(x)
+    return out
+
+
+def dress_table(text: str) -> str:
+    """A cell-form answer dressed by code as a Markdown table: inside a code fence, a header line, a separator line, and
+    a bar at each end of every row (``none`` included)."""
+    rows = [f"| {ln} |" for ln in text.splitlines() if ln.strip()]
+    return "\n".join(["```", "| name | color | column | row |", "|---|---|---|---|"] + rows + ["```"])
 
 
 def records_reading(spec: dict) -> dict:
@@ -1275,6 +1425,32 @@ def broken_check(form: str) -> List[dict]:
     return out
 
 
+TOLERANT_SAME = SCORES + ("address_right", "kinds", "instance_errors")
+
+
+def tolerant_check(prompts: Sequence[dict]) -> dict:
+    """The table-tolerant read's control, in two halves: (1) on each prompt's own layout written in the strict cell form
+    it gives the same scores as the strict read (every score, address_right, the kinds, the instance errors); (2) on that
+    layout dressed by code as a Markdown table (``dress_table``) it reads ADDRESS RIGHT 1 on every prompt where the strict
+    read of the dressed answer fails PARSED."""
+    differ, unparsed, missed = [], 0, []
+    for p in prompts:
+        plain = render("cell", p["truth"])
+        a = score(p, read("cell", plain), "cell")
+        b = score(p, read_table(plain), "cell")
+        if any(a.get(k) != b.get(k) for k in TOLERANT_SAME):
+            differ.append(p["id"])
+        dressed = dress_table(plain)
+        if not read("cell", dressed)["parsed"]:
+            unparsed += 1
+            if score(p, read_table(dressed), "cell")["address_right"] != 1:
+                missed.append(p["id"])
+    strict = {"prompts": len(prompts), "differ": len(differ), "ids": differ[:20], "holds": not differ}
+    dressed_ = {"prompts": len(prompts), "strict_unparsed": unparsed, "tolerant_not_right": len(missed),
+                "ids": missed[:20], "holds": not missed and unparsed > 0}
+    return {"strict_equal": strict, "dressed": dressed_, "holds": strict["holds"] and dressed_["holds"]}
+
+
 # ------------------------------------------------------------------ summaries
 def rate(values: Sequence[int]) -> dict:
     vals = [v for v in values if v is not None]
@@ -1369,6 +1545,12 @@ def summarize(rows: Sequence[dict]) -> dict:
     if real:
         out["real"] = {k: rate([r.get(k) for r in real])
                        for k in ("parsed", "placed", "no_conflict", "written_things_in_caption")}
+    tol = table_rows(rows)
+    out["table"] = summarize(tol) if tol else None     # the same summary under the table-tolerant read (cell form)
+    if tol:
+        drops = [r.get("table_drops") or {} for r in tol if r.get("family") in FAMILIES + ("real",)]
+        out["table"]["answers_with"] = {k: sum(1 for d in drops if d.get(k)) for k in TABLE_DROPS}
+        out["table"]["answers"] = len(drops)
     return out
 
 

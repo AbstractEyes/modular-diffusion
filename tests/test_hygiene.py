@@ -107,7 +107,7 @@ NEW_FILES = ["geolip/modular_diffusion/staged.py", "geolip/modular_diffusion/for
              "tests/test_token_frame.py", "tests/test_scene_reads.py",
              "geolip/modular_diffusion/collective.py", "geolip/modular_diffusion/scene_judge.py",
              "geolip/modular_diffusion/experiments/toy_collective.py", "tests/test_collective.py",
-             "tests/test_scene_judge.py", "tests/test_toy_collective.py"]
+             "tests/test_scene_judge.py", "tests/test_toy_collective.py", "tests/test_layout_tolerant.py"]
 MORE_WORDS = r"(?i)\bE\d\d\b|\bmd0|\bmr_|\bmind\b|prototype night"
 
 

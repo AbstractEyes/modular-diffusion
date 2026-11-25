@@ -13,7 +13,8 @@
 |               | six families, and every score                                                                      |
 
 WRITERS (``writer=``): ``fake:<mode>`` (no model: ``truth`` the right answer in the cell's form, ``broken``,
-``empty``, ``shuffled`` the right answer of another prompt of the family), ``parser`` (no model: the records of
+``empty``, ``shuffled`` the right answer of another prompt of the family, ``table`` the right answer in the cell
+form dressed as a Markdown table by ``layout.dress_table``, for the cell form only),``parser`` (no model: the records of
 ``thought_seeds.textspec.spec_from_text`` on the prompt, read as a layout; needs the thought-image-seeds package), or a
 local folder or hub id of a ``transformers`` picture-and-text chat model used with text only (``ChatWriter``: one user
 turn, greedy, thinking off when the chat template has that switch, left padding in batches, only the new tokens
@@ -21,7 +22,8 @@ decoded; ``adapter``: a LoRA folder or hub id merged into the weights; ``system`
 for the trained system text of the qwen-symbolic-thinking package, or ``file:<path>``).
 
 FORMS (``form=``): ``box`` and ``cell`` (the asks of ``layout.ASKS``, with the six worked examples when
-``examples=1``); ``chain_records`` (the trained text-only ask of ``qwen_symbolic_thinking.prompts.spec_short`` at the
+``examples=1``, the nine of ``layout.example_prompts(2)`` when ``examples=2``, none when ``examples=0``);
+``chain_records`` (the trained text-only ask of ``qwen_symbolic_thinking.prompts.spec_short`` at the
 depth "medium" on the parser's records of the prompt; a prompt from which the parser reads no record is asked in the
 chain_text form and counted apart); ``chain_full_records`` (the same with the trained whole-row ask ``spec_full``,
 read by ``layout.chain_full_read``: the chain lines joined with the question lines); ``chain_text``
@@ -45,8 +47,13 @@ address_right under 0.2 on count, colour, relation and combined, and the right t
 between 0.2 and 0.6 on relation (one statement, 1 in 3 by chance) and between 0.03 and 0.22 on place (two statements,
 1 in 9); (c) every broken answer of ``layout.BROKEN`` for the form gives its own failure kind (a missing bracket or
 field fails PARSED; a number out of range or a word that is no place is read and gives no address); (d) the first
-``repeat_n`` prompts asked again give the same text. Rates count each distinct prompt text once (``layout.distinct``);
-box cells also report COPIED (``layout.copied``), which judges nothing.
+``repeat_n`` prompts asked again give the same text; (e) in the cell form, the table-tolerant read
+(``layout.tolerant_check``) equals the strict read on the generator's layouts and reads them right when they are
+dressed as a Markdown table. Control (a) covers the worked examples of the cell's set (the six, and the three added
+ones with ``examples=2``). Rates count each distinct prompt text once (``layout.distinct``); box cells also report
+COPIED (``layout.copied``), which judges nothing. A cell-form row carries its scores under the table-tolerant read in
+``table`` (``layout.table_score``), the summary carries their summary under ``table``, and ``write_compare`` compares
+them under ``table`` too.
 """
 from __future__ import annotations
 
@@ -66,7 +73,7 @@ FORMS = ("box", "cell", "chain_records", "chain_full_records", "chain_text", "sp
 READ_FORM = {"box": "box", "cell": "cell", "chain_records": "chain", "chain_full_records": "chain_full",
              "chain_text": "chain", "spec": "spec"}
 RECORD_FORMS = ("chain_records", "chain_full_records")
-FAKE_MODES = ("truth", "broken", "empty", "shuffled")
+FAKE_MODES = ("truth", "broken", "empty", "shuffled", "table")
 DEPTH = "medium"
 DEFAULTS = dict(variant="write", writer="", adapter="", adapter_revision="", revision="", form="box", examples=1, first_n=0, real="", seed=0,
                 repeat_n=20, device="cpu", dtype="", batch=8, max_new_tokens=512, system="", local_only=1, threads=4,
@@ -79,9 +86,9 @@ CONTROL_B_RANDOM = tuple(CONTROL_B_BANDS)
 RANDOM_SEED = 1000
 
 
-def cell_name(writer_tag: str, form: str, examples: bool) -> str:
-    """A cell's folder name: <writer tag>_<form>_<ex1|ex0>."""
-    return f"{writer_tag}_{form}_{'ex1' if examples else 'ex0'}"
+def cell_name(writer_tag: str, form: str, examples) -> str:
+    """A cell's folder name: <writer tag>_<form>_<ex0|ex1|ex2> (the example set: none, the six, the nine)."""
+    return f"{writer_tag}_{form}_ex{layout.example_set(examples)}"
 
 
 # ------------------------------------------------------------------ writers
@@ -91,7 +98,10 @@ class FakeWriter:
     def __init__(self, mode: str, form: str, prompts: Dict[str, dict], others: Optional[Dict[str, dict]] = None):
         if mode not in FAKE_MODES:
             raise ValueError(f"a fake writer's mode is one of {FAKE_MODES}, not {mode!r}")
-        self.mode, self.form, self.prompts, self.others = mode, form, prompts, others or {}
+        if mode == "table" and form != "cell":
+            raise ValueError(f"fake:table dresses a cell-form answer as a Markdown table; it writes the form cell, "
+                             f"not {form!r}")
+        self.mode,self.form, self.prompts, self.others = mode, form, prompts, others or {}
         self.batch = 1
         self.name = f"fake:{mode}"
 
@@ -103,6 +113,8 @@ class FakeWriter:
         for a in asks:
             if self.mode == "truth":
                 out.append(self._truth(self.prompts.get(a)))
+            elif self.mode == "table":
+                out.append(layout.dress_table(self._truth(self.prompts.get(a))))
             elif self.mode == "shuffled":
                 out.append(self._truth(self.others.get(a)))
             elif self.mode == "broken":
@@ -280,7 +292,7 @@ def _select(prompts: List[dict], first_n: int) -> List[dict]:
     return out
 
 
-def _asks(form: str, examples: bool, prompts: List[dict]) -> List[dict]:
+def _asks(form: str, examples: int, prompts: List[dict]) -> List[dict]:
     """[{"ask", "fallback_text"}] a prompt."""
     out = []
     for p in prompts:
@@ -360,9 +372,12 @@ def _controls(a: dict, form: str, prompts: List[dict], readings: List[dict], ans
     syn_idx = [k for k, p in enumerate(prompts) if p["family"] in layout.FAMILIES]
     syn = [prompts[k] for k in syn_idx]
     out: Dict[str, dict] = {}
-    # (a) the scorer's own answers, over the whole generated list in this form
+    # (a) the scorer's own answers, over the whole generated list in this form and the worked examples (the six, and the
+    # three added ones when the cell's asks carry them)
+    ex_set = layout.example_set(a["examples"]) if rf in ("box", "cell") else 0
+    examples = layout.example_prompts(max(1, ex_set))
     if rf in ("box", "cell"):
-        full = layout.make_prompts(int(a["seed"])) + layout.example_prompts()
+        full = layout.make_prompts(int(a["seed"])) + examples
         bad = [p["id"] for p in full if layout.score(p, layout.read(rf, layout.render(rf, p["truth"])), rf)
                ["address_right"] != 1]
         out["a"] = {"prompts": len(full), "failures": bad[:20], "failed": len(bad), "holds": not bad}
@@ -402,6 +417,11 @@ def _controls(a: dict, form: str, prompts: List[dict], readings: List[dict], ans
     else:
         out["c"] = {"holds": None, "note": "the spec form is code"}
     out["d"] = repeat or {"holds": None}
+    # (e) the table-tolerant read changes nothing it should not (the cell form only)
+    if rf == "cell":
+        out["e"] = layout.tolerant_check(layout.make_prompts(int(a["seed"])) + examples)
+    else:
+        out["e"] = {"holds": None, "note": "the table-tolerant read is a read of the cell form"}
     return out
 
 
@@ -412,16 +432,17 @@ def _run_write(a: dict, log: Callable[[str], None], t0: float) -> dict:
     if not a["writer"]:
         raise ValueError("writer= is required (fake:<mode>, parser, or a model folder or hub id)")
     out = a["out"]
-    examples = bool(int(a["examples"])) and form in ("box", "cell")
+    ex_set = layout.example_set(a["examples"]) if form in ("box", "cell") else 0
+    examples = bool(ex_set)
     prompts = _select(layout.make_prompts(int(a["seed"])), int(a["first_n"]))
     if a["real"]:
         real = _real_prompts(a["real"])
         prompts += real[: int(a["first_n"])] if int(a["first_n"]) > 0 else real
-    asks = _asks(form, examples, prompts)
+    asks = _asks(form, ex_set, prompts)
     tw = time.time()
     writer = _writer(a, form, prompts, asks)
     load_s = time.time() - tw
-    log(f"LAYOUT write: writer {writer.name}; form {form}; examples {int(examples)}; {len(prompts)} prompts; "
+    log(f"LAYOUT write: writer {writer.name}; form {form}; examples {ex_set}; {len(prompts)} prompts; "
         f"package {__version__}; loaded in {load_s:.1f} s")
     tg = time.time()
     answers: List[str] = []
@@ -442,6 +463,7 @@ def _run_write(a: dict, log: Callable[[str], None], t0: float) -> dict:
             row = layout.score(p, r, rf)
             row["published"] = layout.published(p, r)
         row["fallback_text"] = x["fallback_text"]
+        row["table"] = layout.table_score(p, ans) if rf == "cell" else None     # the table-tolerant read beside
         rows.append(row)
     # control (d): the first repeat_n prompts asked again in whole batches; the first repeat_n answers compared
     repeat = None
@@ -458,15 +480,19 @@ def _run_write(a: dict, log: Callable[[str], None], t0: float) -> dict:
     _write_jsonl(os.path.join(out, "rows.jsonl"), rows)
     summary = layout.summarize(rows)
     fb = [r for r in rows if r.get("fallback_text")]
+    controls = _controls(a, form, prompts, readings, answers, repeat)
+    if rf == "cell":                  # the cell's own answers whose address_right the tolerant read changes (no judge)
+        controls["e"]["answers_changed"] = sum(int(r["table"]["address_right"] != r["address_right"])
+                                               for r in rows if r.get("family") in layout.FAMILIES)
     result = {"experiment": EXPERIMENT, "variant": "write", "args": {k: a[k] for k in sorted(a)}, "writer": writer.name,
-              "form": form, "read_form": rf, "examples": examples, "prompts": len(prompts),
+              "form": form, "read_form": rf, "examples": examples, "example_set": ex_set, "prompts": len(prompts),
               "real_prompts": sum(p["family"] == "real" for p in prompts), "summary": summary,
               "fallback_text": {"n": len(fb), "ids": [r["id"] for r in fb][:50],
                                 "address_right": layout.rate([r.get("address_right") for r in fb
                                                               if r.get("family") != "real"])},
-              "controls": _controls(a, form, prompts, readings, answers, repeat),
+              "controls": controls,
               "asks": {"box": layout.ASK_BOX, "cell": layout.ASK_CELL, "chain_text": layout.ASK_CHAIN_TEXT,
-                       "examples": [p["text"] for p in layout.example_prompts()], "depth": DEPTH},
+                       "examples": [p["text"] for p in layout.example_prompts(max(1, ex_set))], "depth": DEPTH},
               "system": _resolve_system(a["system"]) if not a["writer"].startswith(("fake:", "parser")) else None,
               "merge": getattr(writer, "merge", None), "versions": _versions(),
               "seconds_loading": load_s, "seconds_writing": gen_s,
@@ -500,8 +526,20 @@ def _tables(result: dict) -> str:
         sc = blk["scores"]
         rows.append([fam, blk["n"], sc["address_right"]["mean"], sc["address_right"]["se"]]
                     + [sc[k]["mean"] for k in layout.SCORES] + [blk["per_instance_error"]["rate"]])
-    text = (f"# layout_write: {result['writer']}, form {result['form']}, examples {int(result['examples'])}\n\n"
+    ex = result.get("example_set", int(result["examples"]))
+    text = (f"# layout_write: {result['writer']}, form {result['form']}, examples {ex}\n\n"
             "## the scores (mean over the prompts; se = sqrt(p (1 - p) / n))\n\n" + _table(head, rows))
+    t = s.get("table")
+    if t:
+        trows = []
+        for fam, blk in list(t["families"].items()) + [("all six", t["all"])]:
+            sc = blk["scores"]
+            trows.append([fam, blk["n"], sc["address_right"]["mean"], sc["address_right"]["se"]]
+                         + [sc[k]["mean"] for k in layout.SCORES] + [blk["per_instance_error"]["rate"]])
+        text += ("\n## the same scores under the table-tolerant read (a Markdown table's dressing taken off first)\n\n"
+                 + _table(head, trows)
+                 + "\nanswers with a dropped or changed line: "
+                 + ", ".join(f"{k} {v}" for k, v in t["answers_with"].items()) + f" (of {t['answers']})\n")
     kinds = s["all"]["kinds"]
     text += ("\n## the kinds of failure (prompts)\n\n" + _table(["kind", "prompts"], [[k, v] for k, v in kinds.items()])
              + f"\nunparsed: {s['all']['unparsed']}; recovered by the lenient read: {s['all']['lenient_recovered']}; "
@@ -519,7 +557,8 @@ def _tables(result: dict) -> str:
         text += "\n## the real captions\n\n" + _table(["score", "mean", "se", "n"],
                                                      [[k, v["mean"], v["se"], v["n"]] for k, v in s["real"].items()])
     c = result["controls"]
-    text += "\n## the controls\n\n" + _table(["control", "holds"], [[k, c[k].get("holds")] for k in ("a", "b", "c", "d")])
+    text += "\n## the controls\n\n" + _table(["control", "holds"], [[k, c[k].get("holds")] for k in ("a", "b", "c", "d", "e")
+                                                                    if k in c])
     text += (f"\nseconds: {result['seconds']:.1f} (writing {result['seconds_writing']:.1f}); answers a second: "
              f"{_f(result['answers_a_second'])}\n")
     return text
@@ -551,13 +590,24 @@ def _run_compare(a: dict, log, t0: float) -> dict:
         rbb = [dict(r, family="count") for r in rb if r.get("family") == "real"]
         real = {k: layout.compare(rr, rbb, k, "count") for k in ("parsed", "placed", "no_conflict",
                                                                     "written_things_in_caption")}
+    # the same comparisons under the table-tolerant read, when both cells carry it (the cell form)
+    ta, tb = layout.table_rows(ra), layout.table_rows(rb)
+    table = None
+    if ta and tb:
+        table = {key: {f: layout.compare(ta, tb, key, None if f == "all" else f) for f in fams}
+                 for key in ("address_right",) + layout.SCORES}
     result = {"experiment": EXPERIMENT, "variant": "write_compare", "args": {k: a[k] for k in sorted(a)},
-              "a": a["a"], "b": a["b"], "scores": scores, "real": real, "version": __version__,
+              "a": a["a"], "b": a["b"], "scores": scores, "table": table, "real": real, "version": __version__,
               "seconds": time.time() - t0}
     rows = [[f, scores["address_right"][f]["mean"], scores["address_right"][f]["se"], scores["address_right"][f]["n"],
              scores["address_right"][f]["tie"]] for f in fams]
     text = (f"# layout_write: {a['a']} against {a['b']} (a - b, prompt by prompt)\n\n## address right\n\n"
             + _table(["family", "mean difference", "se", "n", "tie"], rows))
+    if table:
+        rows = [[f, table["address_right"][f]["mean"], table["address_right"][f]["se"], table["address_right"][f]["n"],
+                 table["address_right"][f]["tie"]] for f in fams]
+        text += ("\n## address right under the table-tolerant read\n\n"
+                 + _table(["family", "mean difference", "se", "n", "tie"], rows))
     for key in layout.SCORES:
         x = scores[key]["all"]
         text += f"\n{key} over the six: {_f(x['mean'])} (se {_f(x['se'])}, n {x['n']}, tie {_f(x['tie'])})"
@@ -608,10 +658,14 @@ def summarize(root: str) -> str:
         row += [fam.get(f, {}).get("scores", {}).get("address_right", {}).get("mean") for f in layout.FAMILIES]
         row += [s["all"]["scores"]["address_right"]["mean"], s["all"]["scores"]["parsed"]["mean"],
                 s["all"]["per_instance_error"]["rate"]]
-        row += [r["controls"][k].get("holds") for k in ("a", "b", "c", "d")]
+        t = s.get("table")
+        row += [t["families"].get("combined", {}).get("scores", {}).get("address_right", {}).get("mean") if t else None,
+                t["all"]["scores"]["address_right"]["mean"] if t else None]
+        row += [r["controls"].get(k, {}).get("holds") for k in ("a", "b", "c", "d", "e")]
         rows.append(row)
-    return _table(["cell"] + list(layout.FAMILIES) + ["all six", "parsed", "per-instance error", "a", "b", "c", "d"],
-                  rows)
+    return _table(["cell"] + list(layout.FAMILIES) + ["all six", "parsed", "per-instance error",
+                                                      "combined, table read", "all six, table read",
+                                                      "a", "b", "c", "d", "e"], rows)
 
 
 if __name__ == "__main__" and not in_notebook():
