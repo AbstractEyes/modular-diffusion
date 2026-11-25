@@ -41,6 +41,30 @@ trained on mix scenes at the engine's shape, embedding / rotary read; ``model_st
 the lists, rendered by the bed). The parts are found under ``parts`` (searched for folders named by ``engine_tag`` with
 ``part_steps``, the row's read form and ``part_cells``); the judge is the folder ``judge``.
 
+EXCHANGING NAMED PARTS (``swap``, the rows R1 and R1r in the variants compose and draw): ``swap=8:<folder>,0:newborn``
+serves each named class by another finished engine, named by its folder under ``parts`` (its engine.json must say an
+addressed thing part of that class, the job's bed and the row's read form; its seed, steps and shape are free), or by an
+untrained part of the job's seed and shape (``newborn``); every other part is the one the job's arguments name. The job
+then draws the same lists (or captions) from the same start noise twice, with the exchanged collective and with the
+unexchanged one, and stores ``exact``: the largest absolute difference of the two final pictures outside the cells whose
+request is an exchanged class, clipped to 0..1 as the variant exact compares them (``largest_outside``) and before the
+clamp (``largest_outside_unclamped``), the number of cells compared, and the share of the exchanged classes' cells where
+the two pictures differ at all; ``holds`` = both largest differences are exactly 0.0; ``real`` = some exchanged cell
+exists and some differs (a draw job with nothing drawn reads None for both). The exchanged collective's reads stay where they are without ``swap``; the unexchanged one's
+are stored beside them (compose: ``unswapped``, per n; draw: ``judged_unswapped``, ``C_unswapped`` and ``P_unswapped``
+in every caption's record and ``tables_unswapped``). Both reads of a compose job also keep, per list, the thing read of
+each cell (``thing_right_cells``: 1 right, 0 wrong, -1 no request) and the nine reads (``cell_reads``, as ``judged``). ``engines`` names every engine that served: its
+folder, the class it serves (or the base), its steps, shape, trained numbers and seconds, whether it descended, the
+SHA-256 of the weights file read (``weights_sha256``; None for a newborn part), and whether it serves the exchanged
+collective only (``exchanged``).
+
+SEVERAL JUDGES (compose and draw): ``judge`` may name several judge folders separated by commas (their base names must
+differ). The first fills every key a single judge fills; each further judge reads the same pictures (nothing is sampled
+again) and its reads are stored beside, under its folder's base name: compose ``by_judge`` (per n, the reads the row
+stores), draw ``judged_by`` in every caption's record and ``tables_by``; with ``swap`` also the unexchanged
+collective's (``unswapped_by_judge``; ``judged_unswapped_by``, ``tables_unswapped_by``). ``judges`` lists the base
+names in order. With one folder the result is the same as before.
+
 THE LISTS: ``scenes.request_lists(n, count)`` for n in ``ns`` (seed 5000 + n), start noise ``collective.start_noise``
 seeded 7000 + n. ``lists=center`` / ``lists=others`` (the address never trained): 500 one-thing lists (seed 5100 /
 5101: classes [500], colors [500], and for ``others`` the cell [500] uniform on the eight cells other than the center,
@@ -78,8 +102,11 @@ DEFAULTS = dict(variant="parts", kind="addressed_thing", classes="0-8", bed="F",
                 sample_steps=50, part_steps=3000, part_cells="", model_steps=30000, model_dim=128, model_heads=2,
                 model_depth=3, lists="", twin_seed=1, sheet=1, judge_steps=2000, judge_batch=256,
                 e="0.05,0.10,0.20", wrong_ns="2,4,6", leak_ns="2,4,9", leak_ts="0.15,0.45,0.85", leak_scenes=256,
-                exact_lists=64, answers="", role="", stored="", real_row="", wrong_rows="", sheet_n=16,
+                exact_lists=64, answers="", role="", stored="", real_row="", wrong_rows="", sheet_n=16, swap="",
                 device="cpu", det="on", threads=4, out="")
+SWAP_ROWS = ("R1", "R1r")
+SWAP_VARIANTS = ("compose", "draw")
+NEWBORN = "newborn"
 LIST_SEED, NOISE_SEED = 5000, 7000
 CENTER_SEED, OTHERS_SEED = 5100, 5101
 CENTER = 4
@@ -162,6 +189,162 @@ class Parts:
                           "train_seconds": tj.get("train_seconds")})
         return C.load_engine(path, average=True, device=a["device"])
 
+    def named(self, cls: int, folder: str, read: str):
+        """The finished engine whose folder is ``folder``, to serve the class ``cls`` of an addressed collective of the
+        read form ``read`` (a ValueError naming the pair when it is not found or does not match)."""
+        a = self.a
+        pair = f"{int(cls)}:{folder}"
+        if folder not in self.index:
+            raise ValueError(f"swap {pair}: no finished engine named {folder} under {a['parts']}")
+        path = self.index[folder]
+        with open(os.path.join(path, "engine.json"), encoding="utf-8") as fh:
+            info = json.load(fh)
+        wrong = []
+        if info.get("kind") != "addressed_thing":
+            wrong.append(f"its kind is {info.get('kind')!r}, not 'addressed_thing'")
+        if info.get("cls") is None or int(info["cls"]) != int(cls):
+            wrong.append(f"its class is {info.get('cls')}, not {int(cls)}")
+        if info.get("bed") != a["bed"]:
+            wrong.append(f"its bed is {info.get('bed')!r}, not the job's {a['bed']!r}")
+        if (info.get("settings") or {}).get("read", "embedding") != read:
+            wrong.append(f"its read form is {(info.get('settings') or {}).get('read')!r}, not the row's {read!r}")
+        if wrong:
+            raise ValueError(f"swap {pair}: " + "; ".join(wrong))
+        with open(os.path.join(path, C.TRAIN_JSON), encoding="utf-8") as fh:
+            tj = json.load(fh)
+        self.used.append({"tag": folder, "descended": bool(tj.get("descended")), "newborn_read": tj.get("newborn_read"),
+                          "last_read": tj.get("last_read"), "trained": tj.get("trained"),
+                          "train_seconds": tj.get("train_seconds")})
+        return C.load_engine(path, average=True, device=a["device"])
+
+    def describe(self, entry: dict, serves, exchanged: bool) -> dict:
+        """A used engine's entry with what its own files say: the class it serves (or "base"), its seed, steps, shape
+        and trained numbers, and whether it serves the exchanged collective only."""
+        with open(os.path.join(self.index[entry["tag"]], "engine.json"), encoding="utf-8") as fh:
+            info = json.load(fh)
+        s = info.get("settings") or {}
+        return dict(entry, serves=serves, exchanged=bool(exchanged), newborn=False, seed=info.get("seed"),
+                    steps=info.get("steps"), shape=[s.get("dim"), s.get("heads"), s.get("depth")],
+                    read=s.get("read", "embedding"), trained=info.get("trained", entry.get("trained")),
+                    weights_sha256=weights_sha256(self.index[entry["tag"]]))
+
+
+def weights_sha256(folder: str) -> str:
+    """The SHA-256 of the weights file ``collective.load_engine`` reads for the served numbers: the averaged weights
+    (engine_avg.safetensors) when the folder holds them, else engine.safetensors."""
+    import hashlib
+    path = os.path.join(folder, "engine_avg.safetensors")
+    if not os.path.isfile(path):
+        path = os.path.join(folder, "engine.safetensors")
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def judge_name(folder: str) -> str:
+    """A judge's name in a result: the base name of its folder."""
+    return os.path.basename(os.path.normpath(folder))
+
+
+def judge_folders(text: str) -> List[str]:
+    """'<folder>' or '<folder>,<folder>,...' -> the judge folders in order (two with one base name: a ValueError)."""
+    folders = [x.strip() for x in str(text or "").split(",") if x.strip()]
+    names = [judge_name(f) for f in folders]
+    twice = sorted({n for n in names if names.count(n) > 1})
+    if twice:
+        raise ValueError(f"judge: two judge folders with the same base name {twice[0]!r}")
+    return folders
+
+
+def parse_swap(text: str) -> Dict[int, str]:
+    """'8:<engine folder>,0:newborn' -> {class: engine folder or "newborn"}; '' -> {}."""
+    out: Dict[int, str] = {}
+    for item in [x.strip() for x in str(text or "").split(",") if x.strip()]:
+        if ":" not in item:
+            raise ValueError(f"swap: {item!r} is not a class:engine pair")
+        k, eng = (x.strip() for x in item.split(":", 1))
+        if not k.isdigit() or not 0 <= int(k) <= 8:
+            raise ValueError(f"swap: the class of {item!r} is not one of 0 to 8")
+        if not eng:
+            raise ValueError(f"swap: {item!r} names no engine")
+        if int(k) in out:
+            raise ValueError(f"swap: the class {int(k)} is named twice")
+        out[int(k)] = eng
+    return out
+
+
+def swap_rows(row: str, parts: Parts, swap: Dict[int, str]):
+    """-> (the exchanged collective's answer, the unexchanged one's, a description, the engines that served). The
+    unexchanged collective is the row as the job's arguments name it; the exchanged one shares its engines except for
+    the classes of ``swap``."""
+    if row not in SWAP_ROWS:
+        raise ValueError(f"swap applies to the addressed collective (the rows {', '.join(SWAP_ROWS)}), not the row {row}")
+    a = parts.a
+    cells = parse_cells(a["part_cells"])
+    read = "rotary" if row == "R1r" else "embedding"
+    n0 = len(parts.used)
+    things = {k: parts.get("addressed_thing", k, read=read, cells=cells) for k in range(9)}
+    base = parts.get("addressed_base", None, read=read)
+    plain = parts.used[n0:]
+    engines = [parts.describe(u, k if k < 9 else "base", False) for k, u in enumerate(plain)]
+    exchanged = dict(things)
+    for k, folder in sorted(swap.items()):
+        if folder == NEWBORN:
+            exchanged[k] = parts.get("addressed_thing", k, read=read, newborn=True)
+            engines.append({"tag": NEWBORN, "serves": k, "exchanged": True, "newborn": True, "seed": int(a["seed"]),
+                            "steps": 0, "shape": [int(a["dim"]), int(a["heads"]), int(a["depth"])], "read": read,
+                            "trained": C.param_count(exchanged[k]), "descended": None, "newborn_read": None,
+                            "last_read": None, "train_seconds": 0.0, "weights_sha256": None})
+        else:
+            exchanged[k] = parts.named(k, folder, read)
+            engines.append(parts.describe(parts.used[-1], k, True))
+    col_x = C.Collective(exchanged, base, addressed=True)
+    col_u = C.Collective(things, base, addressed=True)
+    desc = f"{row}: addressed parts, the gate ({read} read), classes {sorted(swap)} exchanged"
+    return ((lambda z, t, c, k: col_x.answer(z, t, c, k, "gate")), (lambda z, t, c, k: col_u.answer(z, t, c, k, "gate")),
+            desc, engines)
+
+
+def exchange_exact(xa: torch.Tensor, xb: torch.Tensor, cells: torch.Tensor, classes: Sequence[int],
+                   raw_a: Optional[torch.Tensor] = None, raw_b: Optional[torch.Tensor] = None) -> dict:
+    """Two batches of pictures of the same lists: the largest |xa - xb| over the cells whose request is not one of
+    ``classes``, the number of those cells, and how many cells of ``classes`` differ at all; with ``raw_a``, ``raw_b``
+    (the same pictures before the clamp to 0..1) also the largest difference outside before the clamp."""
+    inside = torch.zeros_like(cells, dtype=torch.bool)
+    for k in classes:
+        inside |= cells == int(k)
+
+    def largest(a_, b_):
+        d_ = S.cell_crops((a_ - b_).abs())                             # [B, 9, C, 16, 16]
+        out_v = d_[~inside.to(d_.device)]
+        return d_, (float(out_v.max()) if out_v.numel() else 0.0)
+
+    d, lo = largest(xa, xb)
+    per_cell = d.flatten(2).amax(dim=-1)                               # [B, 9]
+    out = {"largest_outside": lo, "cells_compared": int((~inside).sum()), "exchanged_cells": int(inside.sum()),
+           "exchanged_cells_differing": int((per_cell[inside.to(d.device)] > 0).sum())}
+    if raw_a is not None and raw_b is not None:
+        out["largest_outside_unclamped"] = largest(raw_a, raw_b)[1]
+    return out
+
+
+def exact_summary(parts_: Sequence[dict]) -> dict:
+    """The exactness reads of several batches pooled: the largest difference outside (after and before the clamp), the
+    cells compared, the share of the exchanged classes' cells that differ (None when the lists hold none); ``holds``
+    (both largest differences exactly 0.0) and ``real`` (some exchanged cell exists and some differs)."""
+    largest = max((p["largest_outside"] for p in parts_), default=0.0)
+    raw = [p.get("largest_outside_unclamped") for p in parts_]
+    largest_raw = None if any(v is None for v in raw) else max(raw, default=0.0)
+    ex = sum(p["exchanged_cells"] for p in parts_)
+    dif = sum(p["exchanged_cells_differing"] for p in parts_)
+    return {"compared": "the final pictures, cell by cell, clipped to 0..1 and before the clamp",
+            "largest_outside": largest, "largest_outside_unclamped": largest_raw,
+            "cells_compared": sum(p["cells_compared"] for p in parts_), "exchanged_cells": ex,
+            "exchanged_cells_differing": dif, "inside_share": dif / ex if ex else None,
+            "holds": bool(largest == 0.0 and largest_raw == 0.0), "real": bool(ex > 0 and dif > 0)}
+
 
 def build_row(row: str, parts: Parts, newborn: bool = False, twin: Optional[Dict[int, int]] = None,
               without: Sequence[int] = ()):
@@ -231,7 +414,9 @@ def real_pixels(cells, colors, bed: str, seed: int) -> torch.Tensor:
     return pix
 
 
-def judge_reads(judge, pixels: torch.Tensor, cells, colors) -> dict:
+def judge_reads(judge, pixels: torch.Tensor, cells, colors, cell_rights: bool = False) -> dict:
+    """The judge's reads of made scenes; ``cell_rights``: also, per list, each cell's thing read (1 right, 0 wrong,
+    -1 no request) and its nine reads ([thing, colour], or [None, None] for a cell read as empty)."""
     pt, pc = SJ.predict(judge, S.to_model(pixels))
     s = SR.score_cells(pt, pc, cells, colors)
     req = s["requested"].double()
@@ -244,6 +429,11 @@ def judge_reads(judge, pixels: torch.Tensor, cells, colors) -> dict:
     summ["per_list"] = {"scene_right": [int(x) for x in s["scene_right"].tolist()],
                         "scene_right_colors": [int(x) for x in s["scene_right_colors"].tolist()],
                         "cell_rate": per_cell, "n_right": [int(x) for x in s["n_right"].tolist()]}
+    if cell_rights:
+        right = torch.where(reqb, s["thing_right"].long(), torch.full_like(s["thing_right"].long(), -1))
+        summ["per_list"]["thing_right_cells"] = right.tolist()
+        summ["per_list"]["cell_reads"] = [[[None, None] if int(t) == SR.NOTHING else [int(t), int(c)]
+                                           for t, c in zip(tr, cr)] for tr, cr in zip(pt.tolist(), pc.tolist())]
     return summ
 
 
@@ -329,16 +519,25 @@ def _sample_lists(answer, lists: dict, a: dict) -> torch.Tensor:
 def _run_compose(a: dict, log) -> dict:
     row = a["row"]
     parts = Parts(a)
-    judge = SJ.load_judge(a["judge"], a["device"]) if a["judge"] else None
-    if judge is None:
+    folders = judge_folders(a["judge"])
+    if not folders:
         raise ValueError("compose needs judge=<the judge's folder>")
-    answer, desc = (None, "REAL: real scenes of the lists") if row == "REAL" else build_row(row, parts)
-    by_n, sheets = {}, {}
+    judge = SJ.load_judge(folders[0], a["device"])
+    more = [(judge_name(f), SJ.load_judge(f, a["device"])) for f in folders[1:]]
+    by_judge = {name: {} for name, _ in more}
+    unswapped_by = {name: {} for name, _ in more}
+    swap = parse_swap(a["swap"])
+    if swap:
+        answer, answer_u, desc, engines = swap_rows(row, parts, swap)
+    else:
+        answer, desc = (None, "REAL: real scenes of the lists") if row == "REAL" else build_row(row, parts)
+    by_n, sheets, unswapped, exact = {}, {}, {}, {}
     for n, L in lists_for(a).items():
         t0 = time.time()
         real = real_pixels(L["cells"], L["colors"], a["bed"], L["noise_seed"])
-        pix = real if row == "REAL" else made_pixels(_sample_lists(answer, L, a))
-        rd = judge_reads(judge, pix, L["cells"], L["colors"])
+        z = None if row == "REAL" else _sample_lists(answer, L, a)
+        pix = real if row == "REAL" else made_pixels(z)
+        rd = judge_reads(judge, pix, L["cells"], L["colors"], cell_rights=bool(swap))
         rd.update(picture_reads(pix, L["cells"], L["colors"], a["bed"], real))
         rd["seconds"] = time.time() - t0
         by_n[str(n)] = rd
@@ -346,11 +545,39 @@ def _run_compose(a: dict, log) -> dict:
             sheets[n] = pix[:8]
         log(f"{row} n={n}: cell rate {rd['cell_rate']['mean']:.3f}, scene right {rd['scene_right']['mean']:.3f}, "
             f"ghosts {rd['ghosts']['mean'] if rd['ghosts']['mean'] is not None else '-'}; {rd['seconds']:.0f} s")
+        for name, jm in more:                    # a further judge reads the same pictures
+            by_judge[name][str(n)] = dict(judge_reads(jm, pix, L["cells"], L["colors"], cell_rights=bool(swap)),
+                                          **picture_reads(pix, L["cells"], L["colors"], a["bed"], real))
+        if swap:
+            t1 = time.time()
+            z_u = _sample_lists(answer_u, L, a)
+            pix_u = made_pixels(z_u)
+            ru = judge_reads(judge, pix_u, L["cells"], L["colors"], cell_rights=True)
+            ru.update(picture_reads(pix_u, L["cells"], L["colors"], a["bed"], real))
+            ru["seconds"] = time.time() - t1
+            unswapped[str(n)] = ru
+            for name, jm in more:
+                unswapped_by[name][str(n)] = dict(judge_reads(jm, pix_u, L["cells"], L["colors"], cell_rights=True),
+                                                  **picture_reads(pix_u, L["cells"], L["colors"], a["bed"], real))
+            exact[str(n)] = exchange_exact(pix, pix_u, L["cells"], sorted(swap), S.to_pixels(z), S.to_pixels(z_u))
+            log(f"{row} n={n} unexchanged: cell rate {ru['cell_rate']['mean']:.3f}, scene right "
+                f"{ru['scene_right']['mean']:.3f}; largest difference outside the exchanged cells "
+                f"{exact[str(n)]['largest_outside']}; {ru['seconds']:.0f} s")
     if int(a["sheet"]):
         write_sheet(os.path.join(a["out"], "sheet.jpg"), [sheets[k] for k in sorted(sheets)])
     bad = [u["tag"] for u in parts.used if not u["descended"]]
-    return {"row": row, "description": desc, "by_n": by_n, "engines": parts.used, "not_descended": bad,
-            "inconclusive": bool(bad), "lists": a["lists"] or "request_lists", "count": int(a["count"])}
+    out = {"row": row, "description": desc, "by_n": by_n, "engines": parts.used, "not_descended": bad,
+           "inconclusive": bool(bad), "lists": a["lists"] or "request_lists", "count": int(a["count"])}
+    if swap:
+        out.update(engines=engines, swap={str(k): v for k, v in sorted(swap.items())}, unswapped=unswapped,
+                   exact=dict(exact_summary(list(exact.values())), by_n=exact))
+        log(f"exchange exact: {out['exact']['holds']} (largest difference outside {out['exact']['largest_outside']}, "
+            f"{out['exact']['cells_compared']} cells compared; exchanged cells that differ {out['exact']['inside_share']})")
+    if more:
+        out.update(judges=[judge_name(f) for f in folders], by_judge=by_judge)
+        if swap:
+            out["unswapped_by_judge"] = unswapped_by
+    return out
 
 
 def _gate_identities(lists: Dict[int, dict]) -> dict:
@@ -593,9 +820,10 @@ def write_caption_sheet(path: str, items: Sequence[tuple]) -> None:
             sheet.paste(Image.fromarray(arr).resize((side, side), Image.NEAREST), (x + (width - side) // 2, y))
         else:
             draw.text((x + 8, y + side // 2), "no picture: the answer does not parse", fill=(0, 0, 0), font=font)
-        lines = textwrap.wrap(caption, 42)[:5] + [ln[:42] for ln in str(written).splitlines()[:6]]
-        for k, ln in enumerate(lines):
-            draw.text((x + 4, y + side + 2 + 12 * k), ln, fill=(0, 0, 0) if k < 5 else (40, 40, 160), font=font)
+        said = textwrap.wrap(caption, 42)[:5]                 # the caption's lines in black, the written layout's in blue
+        lines = [(ln, (0, 0, 0)) for ln in said] + [(ln[:42], (40, 40, 160)) for ln in str(written).splitlines()[:6]]
+        for k, (ln, colour) in enumerate(lines):
+            draw.text((x + 4, y + side + 2 + 12 * k), ln, fill=colour, font=font)
     sheet.save(path, quality=92)
 
 
@@ -624,44 +852,105 @@ def _run_draw(a: dict, log) -> dict:
         records.append(r)
     drawn = [r for r in records if r["parsed"]]
     log(f"DRAW: {len(records)} captions of {a['answers']}; {len(drawn)} with a picture; engines of seed {a['seed']}")
+    swap = parse_swap(a["swap"])
+    if swap and a["row"] != "R1":
+        raise ValueError(f"the variant draw draws the row R1, so swap goes with row=R1, not row={a['row']}")
+    folders = judge_folders(a["judge"])
+    more: Dict[str, tuple] = {}                  # a further judge's name: (its reads of the pictures, of the unexchanged)
     t0 = time.time()
-    pix = None
+    pix = pix_u = None
+    exact = []
     if drawn:
         cells = torch.tensor([[-1 if c[0] is None else c[0] for c in layout.request_cells(r["requests"])] for r in drawn])
         colors = torch.tensor([[-1 if c[1] is None else c[1] for c in layout.request_cells(r["requests"])] for r in drawn])
         parts = Parts(a)
-        answer, _ = build_row("R1", parts)
-        z = C.sample(answer, cells, colors, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]),
-                     noise=caption_noise(drawn))
+        if swap:
+            answer, answer_u, _, described = swap_rows("R1", parts, swap)
+        else:
+            answer, _ = build_row("R1", parts)
+        noise = caption_noise(drawn)
+        z = C.sample(answer, cells, colors, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]), noise=noise)
         pix = made_pixels(z)
-        judge = SJ.load_judge(a["judge"], a["device"])
+        judge = SJ.load_judge(folders[0], a["device"])
         pt, pc = SJ.predict(judge, S.to_model(pix))
-        engines = parts.used
+        for f in folders[1:]:                    # a further judge reads the same pictures
+            jm = SJ.load_judge(f, a["device"])
+            more[judge_name(f)] = SJ.predict(jm, S.to_model(pix)), None
+        if swap:
+            z_u = C.sample(answer_u, cells, colors, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]), noise=noise)
+            pix_u = made_pixels(z_u)
+            pt_u, pc_u = SJ.predict(judge, S.to_model(pix_u))
+            exact.append(exchange_exact(pix, pix_u, cells, sorted(swap), S.to_pixels(z), S.to_pixels(z_u)))
+            for f in folders[1:]:
+                jm = SJ.load_judge(f, a["device"])
+                more[judge_name(f)] = more[judge_name(f)][0], SJ.predict(jm, S.to_model(pix_u))
+        engines = described if swap else parts.used
+        bad = [u["tag"] for u in parts.used if not u["descended"]]
+    elif swap:                                   # nothing drawn: the pairs are still checked; nothing to compare
+        parts = Parts(a)
+        _, _, _, engines = swap_rows("R1", parts, swap)
+        bad = [u["tag"] for u in parts.used if not u["descended"]]
     else:
-        engines = []
+        engines, bad = [], []
     sample_s = time.time() - t0
+
+    def judged_of(p_t, p_c, j):
+        return [[None, None] if int(p_t[j, c]) == SR.NOTHING else [int(p_t[j, c]), int(p_c[j, c])] for c in range(9)]
+
     j = 0
     by_id = {}
+    cp_by: Dict[str, list] = {name: [] for name in more}       # a further judge's C and P of every caption
+    cp_unswapped_by: Dict[str, list] = {name: [] for name in more}
     for r in records:
+        prompt = prompts[index[r["id"]]]
         if r["parsed"]:
-            judged = [[None, None] if int(pt[j, c]) == SR.NOTHING else [int(pt[j, c]), int(pc[j, c])] for c in range(9)]
+            judged = judged_of(pt, pc, j)
+            judged_u = judged_of(pt_u, pc_u, j) if swap else None
             by_id[r["id"]] = j
-            j += 1
         else:
-            judged = None
+            judged = judged_u = None
         r["judged"] = judged
-        r.update(layout.picture_reads(prompts[index[r["id"]]], r, judged))
+        r.update(layout.picture_reads(prompt, r, judged))
+        if swap:
+            r["judged_unswapped"] = judged_u
+            ru = layout.picture_reads(prompt, r, judged_u)
+            r["C_unswapped"], r["P_unswapped"] = ru["C"], ru["P"]
+        if more:
+            r["judged_by"] = {name: judged_of(*m_[0], j) if r["parsed"] else None for name, m_ in more.items()}
+            for name in more:
+                cp_by[name].append(layout.picture_reads(prompt, r, r["judged_by"][name]))
+            if swap:
+                r["judged_unswapped_by"] = {name: judged_of(*m_[1], j) if r["parsed"] else None
+                                            for name, m_ in more.items()}
+                for name in more:
+                    cp_unswapped_by[name].append(layout.picture_reads(prompt, r, r["judged_unswapped_by"][name]))
+        if r["parsed"]:
+            j += 1
     tables = drawn_tables(records)
     first = [r for r in records if r["family"] == "combined"][:int(a["sheet_n"])]
     if int(a["sheet"]) and first:
         write_caption_sheet(os.path.join(a["out"], "sheet.jpg"),
                             [(pix[by_id[r["id"]]] if r["id"] in by_id else None, r["text"], r["answer"]) for r in first])
-    bad = [u["tag"] for u in engines if not u["descended"]]
-    return {"role": a["role"], "answers": os.path.basename(os.path.normpath(a["answers"])),
-            "writer": res.get("writer"), "example_set": res.get("example_set"), "captions": len(records),
-            "drawn": len(drawn), "records": records, "tables": tables, "engines": engines, "not_descended": bad,
-            "inconclusive": bool(bad), "sample_seconds": sample_s,
-            "pictures_sha256": pictures_sha256(pix) if pix is not None else None}
+    out = {"role": a["role"], "answers": os.path.basename(os.path.normpath(a["answers"])),
+           "writer": res.get("writer"), "example_set": res.get("example_set"), "captions": len(records),
+           "drawn": len(drawn), "records": records, "tables": tables, "engines": engines, "not_descended": bad,
+           "inconclusive": bool(bad), "sample_seconds": sample_s,
+           "pictures_sha256": pictures_sha256(pix) if pix is not None else None}
+    if swap:
+        ex_read = exact_summary(exact) if exact else dict(exact_summary([]), holds=None, real=None,
+                                                          largest_outside=None, largest_outside_unclamped=None)
+        out.update(swap={str(k): v for k, v in sorted(swap.items())}, exact=ex_read,
+                   tables_unswapped=drawn_tables([dict(r, C=r["C_unswapped"], P=r["P_unswapped"]) for r in records]),
+                   pictures_sha256_unswapped=pictures_sha256(pix_u) if pix_u is not None else None)
+        log(f"exchange exact: {out['exact']['holds']} (largest difference outside {out['exact']['largest_outside']}, "
+            f"{out['exact']['cells_compared']} cells compared; exchanged cells that differ {out['exact']['inside_share']})")
+    if more:
+        out.update(judges=[judge_name(f) for f in folders],
+                   tables_by={name: drawn_tables([dict(r, **cp) for r, cp in zip(records, cp_by[name])]) for name in more})
+        if swap:
+            out["tables_unswapped_by"] = {name: drawn_tables([dict(r, **cp) for r, cp in zip(records, cp_unswapped_by[name])])
+                                          for name in more}
+    return out
 
 
 def _stored(folder: str) -> Optional[dict]:
@@ -786,6 +1075,11 @@ def _text(result: dict) -> str:
         if "wrong" in result:
             body["wrong"] = [{k: x[k] for k in ("n", "e", "scene_right", "corruptions")} for x in result["wrong"]]
         lines.append("```\n" + json.dumps(body, indent=1, default=str)[:20000] + "\n```")
+    if result.get("swap"):
+        x = result["exact"]
+        lines.append(f"\nexchanged: {', '.join(f'{k} -> {v}' for k, v in result['swap'].items())}; outside the exchanged "
+                     f"cells the largest difference is {x['largest_outside']} over {x['cells_compared']} cells (exact: "
+                     f"{_f(x['holds'])}); exchanged cells that differ: {_f(x['inside_share'])}")
     lines.append(f"\nseconds: {result['seconds']:.1f}; package {result['version']}")
     return "\n".join(lines) + "\n"
 
@@ -798,6 +1092,14 @@ def main(argv=(), **overrides) -> dict:
         raise ValueError(f"unknown variant {a['variant']!r}; known: {list(VARIANTS)}")
     if a["row"] not in ROWS:
         raise ValueError(f"the rows are {ROWS}, not {a['row']!r}")
+    if len(judge_folders(a["judge"])) > 1 and a["variant"] not in SWAP_VARIANTS:
+        raise ValueError(f"several judges apply to the variants {', '.join(SWAP_VARIANTS)}, not {a['variant']}")
+    if parse_swap(a["swap"]):
+        if a["variant"] not in SWAP_VARIANTS:
+            raise ValueError(f"swap applies to the variants {', '.join(SWAP_VARIANTS)}, not {a['variant']}")
+        if a["row"] not in SWAP_ROWS:
+            raise ValueError(f"swap applies to the addressed collective (the rows {', '.join(SWAP_ROWS)}), "
+                             f"not the row {a['row']}")
     os.makedirs(a["out"], exist_ok=True)
     log_path = os.path.join(a["out"], "log.txt")
 
