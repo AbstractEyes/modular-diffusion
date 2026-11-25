@@ -45,7 +45,9 @@ Arguments (key=value): variant, teacher, repo, revision, tiny, shape (a name ful
 <layers>/<mid|nomid>/<stages>), band (clean / middle / noisy; for exchange the band whose part is replaced), rho (the
 whole-range share of the band's training law), steps, batch, lr, lam_out, lam_data, drop (the empty-prompt share), text
 (0: an engine that ignores the prompt), seed, init (inherit / random), read_every, keep_checkpoint (0: checkpoint.pt is
-removed once the job has finished), data (a folder of latent shards, read by ``capture.data.LatentBatches``), out,
+removed once the job has finished), micro (band_engine: above 0 and under batch, a step's rows go through the
+forwards and the backward in groups of that many rows, gradients added, one optimizer step: the same update in less
+memory; not a setting a checkpoint is checked against; 0: the whole batch at once), data (a folder of latent shards, read by ``capture.data.LatentBatches``), out,
 device, dtype (fp32 / bf16 / fp16: the teacher's numbers; an engine's are float32), autocast (auto / none / bf16 /
 fp16), save_every, log_every, average_decay, probe_n, probe_per_band, probe_seed, probe_data, probe_first, probe_rows,
 chunk, sample_steps, guidance, group, parts (for assembly, exchange, chain_read and pictures: one part a band, comma separated, for
@@ -101,7 +103,7 @@ DEFAULTS = dict(variant="band_engine", teacher="", repo="runwayml/stable-diffusi
                 probe_data="", probe_first=0, probe_rows=0, chunk=16, init="inherit", read_every=0, keep_checkpoint=1,
                 sample_steps=50, guidance=7.5, group=16, parts="", other="", threads=4, det="",
                 pic_data="", pic_first=0, pic_n=0, noise_seed=2000, source="parts", part_dtype="", judge="inception",
-                clip="", sheet_n=16, decode_batch=8, a="", b="", paired=1, blocks=10, first_n=0)
+                clip="", sheet_n=16, decode_batch=8, a="", b="", paired=1, blocks=10, first_n=0, micro=0)
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 PART_DTYPES = {"": None, "fp16": torch.float16, "bf16": torch.bfloat16}
 BORN = "born:"
@@ -117,6 +119,8 @@ def main(argv=(), **overrides) -> dict:
         raise ValueError(f"init is inherit or random, not {a['init']!r}")
     if int(a["read_every"]) < 0 or int(a["group"]) < 0 or int(a["chunk"]) < 0:
         raise ValueError("read_every, group and chunk are at least 0")
+    if int(a["micro"]) < 0:
+        raise ValueError("micro is 0 (the whole batch in one forward) or a positive number of rows")
     if a["variant"] in ("assembly", "exchange", "chain_read") and not a["parts"]:
         raise ValueError(f"the {a['variant']} variant needs parts=")
     if a["variant"] == "chain_read" and int(a["sample_steps"]) < 1:
@@ -337,10 +341,12 @@ def _run(a: dict, det) -> dict:
                                drop=float(a["drop"]), text=bool(a["text"]), average_decay=float(a["average_decay"]),
                                save_every=int(a["save_every"]), log_every=int(a["log_every"]),
                                autocast=a["autocast"], log=log, init=init, every=every,
-                               on_every=on_every if every else None, keep_checkpoint=bool(int(a["keep_checkpoint"])))
+                               on_every=on_every if every else None, keep_checkpoint=bool(int(a["keep_checkpoint"])),
+                               micro=int(a["micro"]))
         avg = tr["average"].eval()
         result["train"] = {"step": tr["step"], "finished": tr["finished"], "first": tr["log"][:1],
-                           "last": tr["log"][-1:], "init": init, "seconds_a_step": tr.get("seconds_a_step"),
+                           "last": tr["log"][-1:], "init": init, "micro": int(tr.get("micro", 0)),
+                           "seconds_a_step": tr.get("seconds_a_step"),
                            "trained": tr.get("trained"), "restored": bool(tr.get("restored", False)),
                            "checkpoint_kept": os.path.isfile(os.path.join(out, "checkpoint.pt"))}
         if every:
