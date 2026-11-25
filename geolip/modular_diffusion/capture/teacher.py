@@ -9,6 +9,14 @@ a local diffusers folder. Nothing here downloads: every load passes ``local_file
 ``tiny_teacher(seed)`` makes a teacher of the same kind with random numbers and no files (a tiny U-Net with the
 teacher's block types and layer counts, a tiny text encoder, a character tokenizer), for the tests; with ``vae=True`` it
 carries ``tiny_vae(seed)``, a tiny random image decoder (16 x 16 latents to 32 x 32 pictures).
+
+A SOURCE of another kind with the same U-Net layout (a flow-matching fine-tune that predicts a velocity on a continuous
+time) is loaded by the same call with its own U-Net folder:
+
+    source = load_teacher(sd15_folder, unet=unet_folder, kind="flow", shift=2.5)     # unguided side: zero states
+
+Its process (``capture.process``), its unguided side and its latent-scale ratio ``kappa`` travel with it; the reads,
+the sampler and the pictures take them from the source.
 """
 from __future__ import annotations
 
@@ -19,9 +27,12 @@ from typing import Optional, Sequence
 import torch
 from torch import Tensor, nn
 
+from .process import EpsProcess, Process, make_process
 from .schedule import BETA_END, BETA_START, STEPS, sd15_alphas_cumprod
 
 TOKENS = 77
+UNGUIDED = ("empty", "zeros")
+UNGUIDED_DEFAULT = {"eps": "empty", "flow": "zeros"}       # a flow source was trained with zero states as its unguided
 
 SD15_DOWN = ("CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D")
 SD15_UP = ("UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D")
@@ -73,11 +84,20 @@ class TinyTextEncoder(nn.Module):
 
 
 class Teacher:
-    """The frozen teacher. ``unet`` is a diffusers ``UNet2DConditionModel``; ``alphas_cumprod`` the schedule of
-    ``schedule`` (float64); ``tokenize`` gives [B, 77] ids, ``text_states`` [B, 77, D] states."""
+    """The frozen teacher (a source). ``unet`` is a diffusers ``UNet2DConditionModel``; ``alphas_cumprod`` the schedule
+    of ``schedule`` (float64); ``tokenize`` gives [B, 77] ids, ``text_states`` [B, 77, D] states.
+
+    A source also carries:
+        process     how it noises, answers and steps (``process.Process``; the noise-predicting ``eps`` by default)
+        unguided    the unguided side of guidance: ``empty`` (the empty prompt's states) or ``zeros`` (zero states of the
+                    same shape); ``unguided_states(batch)`` is what every guided path is given
+        kappa       the ratio of the source's clean-latent scale to the standard one (1.0 by default): clean latents given
+                    to the source are multiplied by it (``source_latents``), its samples divided by it before decoding
+                    (``picture_latents``)"""
 
     def __init__(self, unet: nn.Module, text_encoder: nn.Module, tokenizer, vae: Optional[nn.Module] = None,
-                 device="cpu", dtype: torch.dtype = torch.float32):
+                 device="cpu", dtype: torch.dtype = torch.float32, process: Optional[Process] = None,
+                 unguided: Optional[str] = None, kappa: float = 1.0):
         self.unet = _freeze(unet)
         self.text_encoder = _freeze(text_encoder)
         self.tokenizer = tokenizer
@@ -86,6 +106,38 @@ class Teacher:
         self.dtype = dtype
         self.alphas_cumprod = sd15_alphas_cumprod()
         self.context_dim = int(unet.config.cross_attention_dim)
+        self.process = process if process is not None else EpsProcess(self.alphas_cumprod)
+        unguided = unguided or UNGUIDED_DEFAULT[self.process.kind]
+        if unguided not in UNGUIDED:
+            raise ValueError(f"the unguided side is one of {list(UNGUIDED)}, not {unguided!r}")
+        self.unguided = unguided
+        self.kappa = float(kappa)
+        if not self.kappa > 0.0:
+            raise ValueError(f"kappa is a positive number, not {kappa}")
+
+    @property
+    def kind(self) -> str:
+        return self.process.kind
+
+    def unguided_states(self, batch: int) -> Tensor:
+        """The unguided side's states for ``batch`` rows: the empty prompt's, or zeros of the same shape."""
+        if self.unguided == "empty":
+            return self.empty_states(batch)
+        return torch.zeros(int(batch), TOKENS, self.context_dim, device=self.device, dtype=self.dtype)
+
+    def source_latents(self, x0: Tensor) -> Tensor:
+        """Clean latents of the standard scale as this source reads them: multiplied by kappa (unchanged at 1.0)."""
+        return x0 if self.kappa == 1.0 else x0 * self.kappa
+
+    def picture_latents(self, z: Tensor) -> Tensor:
+        """This source's samples on the standard scale, for decoding: divided by kappa (unchanged at 1.0)."""
+        return z if self.kappa == 1.0 else z / self.kappa
+
+    def record(self) -> dict:
+        """The source's process, unguided side and kappa, for a result file."""
+        rec = dict(self.process.record())
+        rec.update({"unguided": self.unguided, "kappa": self.kappa})
+        return rec
 
     def tokenize(self, prompts: Sequence[str]) -> Tensor:
         prompts = [str(p) for p in prompts]
@@ -162,13 +214,18 @@ def tiny_vae(seed: int = 0):
     return _freeze(vae)
 
 
-def tiny_teacher(seed: int = 0, vae: bool = False) -> Teacher:
+def tiny_teacher(seed: int = 0, vae: bool = False, kind: str = "eps", shift: Optional[float] = None,
+                 unguided: Optional[str] = None, kappa: float = 1.0, unet_seed: Optional[int] = None) -> Teacher:
     """A teacher with random numbers and no files: ``tiny_unet`` (every tensor nonzero), ``TinyTextEncoder``, a
-    character tokenizer; with ``vae`` also ``tiny_vae(seed)`` as its image decoder. CPU, float32."""
-    unet = tiny_unet(seed)
-    _perturb(unet, seed)
+    character tokenizer; with ``vae`` also ``tiny_vae(seed)`` as its image decoder. CPU, float32. ``kind``, ``shift``,
+    ``unguided`` and ``kappa`` as ``load_teacher``'s; ``unet_seed`` (the seed by default) draws the U-Net alone, so two
+    sources can share the text encoder and the image decoder and differ in their U-Nets only."""
+    useed = int(seed) if unet_seed is None else int(unet_seed)
+    unet = tiny_unet(useed)
+    _perturb(unet, useed)
+    process = make_process(kind, shift)
     return Teacher(unet, TinyTextEncoder(TINY["cross_attention_dim"], seed=seed), CharTokenizer(),
-                   tiny_vae(seed) if vae else None)
+                   tiny_vae(seed) if vae else None, process=process, unguided=unguided, kappa=kappa)
 
 
 def _hub_cache(cache_dir: Optional[str]) -> str:
@@ -218,13 +275,47 @@ def check_schedule(path: str) -> None:
         raise ValueError("the teacher predicts the noise (prediction_type epsilon)")
 
 
-def load_teacher(path: str, device="cpu", dtype: torch.dtype = torch.float32, vae: bool = False) -> Teacher:
+def load_unet_folder(folder: str):
+    """A U-Net from a folder of its own (a diffusers ``config.json`` and ``diffusion_pytorch_model.safetensors``),
+    read from safetensors only, local files only, float32 on the CPU."""
+    from diffusers import UNet2DConditionModel
+    if not (os.path.isfile(os.path.join(folder, "config.json"))
+            and os.path.isfile(os.path.join(folder, "diffusion_pytorch_model.safetensors"))):
+        raise FileNotFoundError(f"a U-Net folder holds config.json and diffusion_pytorch_model.safetensors: {folder}")
+    return UNet2DConditionModel.from_pretrained(folder, local_files_only=True, use_safetensors=True)
+
+
+def with_unet(source: Teacher, folder: str) -> Teacher:
+    """The source with its U-Net replaced by the one of ``folder`` (``load_unet_folder``), on the source's device and in
+    its precision; everything else kept (for a tiny teacher's text encoder beside a U-Net written to a folder)."""
+    unet = _owned(load_unet_folder(folder).to(device=source.device, dtype=source.dtype))
+    if int(unet.config.cross_attention_dim) != source.context_dim:
+        raise ValueError(f"the U-Net of {folder} reads states of width {unet.config.cross_attention_dim}, the source's "
+                         f"text encoder gives {source.context_dim}")
+    source.unet = _freeze(unet)
+    return source
+
+
+def load_teacher(path: str, device="cpu", dtype: torch.dtype = torch.float32, vae: bool = False,
+                 unet: Optional[str] = None, kind: str = "eps", shift: Optional[float] = None,
+                 unguided: Optional[str] = None, kappa: float = 1.0) -> Teacher:
     """The teacher from a local diffusers folder (unet/, text_encoder/, tokenizer/, scheduler/, and vae/ when asked),
-    frozen, on ``device`` in ``dtype``. Never downloads."""
+    frozen, on ``device`` in ``dtype``. Never downloads.
+
+    Another source of the same U-Net layout: ``unet`` names a folder of its own U-Net (a diffusers ``config.json`` and
+    ``diffusion_pytorch_model.safetensors``, read from safetensors only), while the text encoder, the tokenizer and the
+    image decoder still come from ``path``. ``kind`` is ``eps`` (the noise; the folder's scheduler is checked) or
+    ``flow`` (the velocity on a continuous time; ``shift`` required); ``unguided`` is ``empty`` or ``zeros`` (by
+    default ``empty`` for eps, ``zeros`` for flow); ``kappa`` the source's latent-scale ratio."""
     from diffusers import AutoencoderKL, UNet2DConditionModel
     from transformers import CLIPTextModel, CLIPTokenizer
-    check_schedule(path)
-    unet = UNet2DConditionModel.from_pretrained(path, subfolder="unet", local_files_only=True)
+    process = make_process(kind, shift)
+    if process.kind == "eps":
+        check_schedule(path)
+    if unet:
+        unet = load_unet_folder(unet)
+    else:
+        unet = UNet2DConditionModel.from_pretrained(path, subfolder="unet", local_files_only=True)
     text = CLIPTextModel.from_pretrained(path, subfolder="text_encoder", local_files_only=True)
     tok = CLIPTokenizer.from_pretrained(path, subfolder="tokenizer", local_files_only=True)
     v = AutoencoderKL.from_pretrained(path, subfolder="vae", local_files_only=True) if vae else None
@@ -232,7 +323,7 @@ def load_teacher(path: str, device="cpu", dtype: torch.dtype = torch.float32, va
     text = _owned(text.to(device=device, dtype=dtype))
     if v is not None:
         v = _owned(v.to(device=device, dtype=dtype))
-    return Teacher(unet, text, tok, v, device, dtype)
+    return Teacher(unet, text, tok, v, device, dtype, process=process, unguided=unguided, kappa=kappa)
 
 
 def _owned(module: nn.Module) -> nn.Module:

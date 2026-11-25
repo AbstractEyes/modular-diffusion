@@ -54,6 +54,14 @@ engine), ``born:<shape>`` (the shape's engine with every number inherited from t
 prompt) or ``born:<shape>:notext`` (the same without the prompt); ``<shape>`` is a name or the text form such as
 2222/nomid/3), other (for exchange: a part in the same forms), threads, det (empty, warn or on).
 
+The source (every variant but picture_compare): unet (a folder of the source's own U-Net, a diffusers config.json and
+diffusion_pytorch_model.safetensors; the text encoder, tokenizer and image decoder stay the teacher folder's), kind
+(eps: the noise on whole steps; flow: the velocity on a continuous time, sampled by Euler steps on its shifted grid),
+shift (a flow source's), unguided (empty or zeros; by default the kind's own), kappa (the source's latent-scale ratio:
+held-out clean latents given to it are multiplied by kappa, its pictures' latents divided by it before decoding),
+unet_seed (tiny=1: the seed of the tiny U-Net alone). A flow source does not train a band engine (band_engine refuses
+it). Every read is then made under the source's own process and unguided side.
+
 For pictures: pic_data (a folder of latent shards; with tiny=1 it may be empty, and random rows are used), pic_first,
 pic_n (the rows pic_first .. pic_first + pic_n - 1 in FILE order: their token ids are the prompts, their clean latents
 the pictures the prompts describe), noise_seed (the sampler's start noise, group j from noise_seed + 100003 j), source
@@ -102,6 +110,11 @@ DEFAULTS = dict(variant="band_engine", teacher="", repo="runwayml/stable-diffusi
                 sample_steps=50, guidance=7.5, group=16, parts="", other="", threads=4, det="",
                 pic_data="", pic_first=0, pic_n=0, noise_seed=2000, source="parts", part_dtype="", judge="inception",
                 clip="", sheet_n=16, decode_batch=8, a="", b="", paired=1, blocks=10, first_n=0)
+# The source's arguments (shared by the capture experiments): its own U-Net folder (empty: the teacher folder's), its
+# kind (eps or flow), the shift of a flow source, its unguided side (empty: the kind's own, empty for eps, zeros for
+# flow), its latent-scale ratio kappa, and for tiny=1 the seed of its U-Net (-1: the job's seed).
+SOURCE_DEFAULTS = dict(unet="", kind="eps", shift="", unguided="", kappa=1.0, unet_seed=-1)
+DEFAULTS.update(SOURCE_DEFAULTS)
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 PART_DTYPES = {"": None, "fp16": torch.float16, "bf16": torch.bfloat16}
 BORN = "born:"
@@ -125,6 +138,10 @@ def main(argv=(), **overrides) -> dict:
         raise ValueError("the exchange variant needs other= (a band engine's job folder or teacher)")
     if a["part_dtype"] not in PART_DTYPES:
         raise ValueError(f"part_dtype is empty, fp16 or bf16, not {a['part_dtype']!r}")
+    source_options(a)
+    if a["variant"] == "band_engine" and a["kind"] != "eps":
+        raise ValueError(f"a band engine is trained from a noise-predicting teacher only (kind=eps); a {a['kind']} "
+                         "source's capture loss is not defined in this library")
     if a["variant"] == "pictures":
         if a["source"] not in SOURCES:
             raise ValueError(f"source is parts or rows, not {a['source']!r}")
@@ -153,16 +170,50 @@ def random_source(seed: int, latent_shape, vocab: int = 1000) -> Callable:
     return source
 
 
+def source_options(a: dict) -> dict:
+    """The source's keywords of ``load_teacher`` / ``tiny_teacher`` from the job's arguments (``SOURCE_DEFAULTS``)."""
+    from ..capture.process import KINDS
+    from ..capture.teacher import UNGUIDED
+    if a["kind"] not in KINDS:
+        raise ValueError(f"kind is one of {list(KINDS)}, not {a['kind']!r}")
+    if a["unguided"] and a["unguided"] not in UNGUIDED:
+        raise ValueError(f"unguided is empty or one of {list(UNGUIDED)}, not {a['unguided']!r}")
+    if a["kind"] == "flow" and not str(a["shift"]).strip():
+        raise ValueError("a flow source needs shift= (the shift it was trained at)")
+    if a["kind"] == "eps" and str(a["shift"]).strip():
+        raise ValueError("shift= belongs to a flow source")
+    return dict(kind=a["kind"], shift=float(a["shift"]) if str(a["shift"]).strip() else None,
+                unguided=a["unguided"] or None, kappa=float(a["kappa"]))
+
+
+def load_source(a: dict, vae: bool = False, seed: int = 0, tiny_seed: Optional[int] = None):
+    """(the source, where it came from) from the job's arguments: the tiny random teacher (``tiny_seed``, the job's
+    seed by default; its U-Net from ``unet_seed`` when that is 0 or more), or the teacher folder with ``unet`` as its
+    own U-Net folder when given; with the source's kind, shift, unguided side and kappa."""
+    from ..capture.teacher import find_snapshot, load_teacher, tiny_teacher, with_unet
+    opts = source_options(a)
+    if a["tiny"]:
+        ts = int(seed) if tiny_seed is None else int(tiny_seed)
+        us = int(a["unet_seed"]) if int(a["unet_seed"]) >= 0 else None
+        source = tiny_teacher(ts, vae=vae, unet_seed=us, **opts).to(a["device"], DTYPES[a["dtype"]])
+        where = "tiny random teacher" + ("" if us is None and opts["kind"] == "eps" else
+                                         f" (U-Net seed {ts if us is None else us}, {opts['kind']})")
+        if a["unet"]:                                     # a tiny U-Net written to a folder, beside the tiny encoder
+            source = with_unet(source, a["unet"])
+            where = f"tiny random teacher with the U-Net of {a['unet']} ({opts['kind']})"
+    else:
+        where = a["teacher"] or find_snapshot(a["repo"], a["revision"] or None)
+        source = load_teacher(where, device=a["device"], dtype=DTYPES[a["dtype"]], vae=vae, unet=a["unet"] or None,
+                              **opts)
+        if a["unet"]:
+            where = f"{where} with the U-Net of {a['unet']}"
+    return source, where
+
+
 def _teacher(a: dict, vae: bool = False):
     """The teacher and where it came from; with ``vae`` it carries its image decoder, kept in float32 whatever
     ``dtype`` is (cast after the teacher's own move, so nothing casts it back)."""
-    from ..capture.teacher import find_snapshot, load_teacher, tiny_teacher
-    if a["tiny"]:
-        teacher = tiny_teacher(int(a["seed"]), vae=vae).to(a["device"], DTYPES[a["dtype"]])
-        where = "tiny random teacher"
-    else:
-        where = a["teacher"] or find_snapshot(a["repo"], a["revision"] or None)
-        teacher = load_teacher(where, device=a["device"], dtype=DTYPES[a["dtype"]], vae=vae)
+    teacher, where = load_source(a, vae=vae, seed=int(a["seed"]))
     if vae:
         teacher.vae.float()
     return teacher, where
@@ -184,8 +235,8 @@ def _source(a: dict, teacher):
 
 def _probe(a: dict, teacher):
     from ..capture.reads import make_probe
-    common = dict(seed=int(a["probe_seed"]), per_band=int(a["probe_per_band"]), empty=teacher.empty_states(1),
-                  alphas_cumprod=teacher.alphas_cumprod, batch=int(a["chunk"]))
+    common = dict(seed=int(a["probe_seed"]), per_band=int(a["probe_per_band"]), empty=teacher.unguided_states(1),
+                  alphas_cumprod=teacher.alphas_cumprod, batch=int(a["chunk"]), process=teacher.process)
     if a["probe_data"]:
         from ..capture.data import rows_in_order
         if int(a["probe_rows"]) < 1:
@@ -195,7 +246,7 @@ def _probe(a: dict, teacher):
         if tuple(x0.shape[1:]) != want:
             raise ValueError(f"the probe rows' latents are {tuple(x0.shape[1:])}; the teacher's are {want}")
         states = teacher.text_states(ids)
-        return make_probe(states, x0=x0, **common)
+        return make_probe(states, x0=teacher.source_latents(x0), **common)
     n = int(a["probe_n"])
     prompts = [PROBE_PROMPTS[i % len(PROBE_PROMPTS)] for i in range(n)]
     states = teacher.text_states(teacher.tokenize(prompts))
@@ -291,7 +342,7 @@ def _run(a: dict, det) -> dict:
     result = {"experiment": EXPERIMENT, "variant": a["variant"], "teacher": where,
               "args": {k: a[k] for k in sorted(a) if not (k == "det" and not a[k])}, "torch": torch.__version__,
               "version": __version__, "probe_steps": {b: [int(t) for t in probe.steps[b]] for b in BANDS},
-              "probe": _probe_record(a, probe)}
+              "probe": _probe_record(a, probe), "process": teacher.record()}
     curve_text = ""
     if a["variant"] == "born":
         from ..capture.engine import build_engine
@@ -484,20 +535,21 @@ def _run_pictures(a: dict, det, log, t0: float) -> dict:
     n = int(x0.shape[0])
     result = _head(a, where)
     result.update({"n": n, "source": a["source"], "parts": a["parts"] if a["source"] == "parts" else "",
-                   "part_dtype": a["part_dtype"]})
+                   "part_dtype": a["part_dtype"], "process": teacher.record()})
     t1 = time.time()
     if a["source"] == "parts":
         loaded: Dict[str, object] = {}
         parts = _parts(a, teacher, loaded)
         cast_engines(loaded, a["part_dtype"])
         states = teacher.text_states(ids)
-        z = pictures.sample_latents(Assembly(parts), states, teacher.empty_states(1), int(a["noise_seed"]),
+        z = pictures.sample_latents(Assembly(parts), states, teacher.unguided_states(1), int(a["noise_seed"]),
                                     group=int(a["group"]), steps=int(a["sample_steps"]),
                                     guidance=float(a["guidance"]), latent_shape=_latent_shape(teacher),
-                                    alphas_cumprod=teacher.alphas_cumprod, log=log)
+                                    alphas_cumprod=teacher.alphas_cumprod, log=log, process=teacher.process)
+        z = teacher.picture_latents(z)          # the source's samples on the standard scale (unchanged at kappa 1)
         del parts, loaded
     else:
-        z = x0
+        z = x0                                  # the rows' own latents are on the standard scale
     t2 = time.time()
     pics = pictures.decode(teacher.vae, z, batch=int(a["decode_batch"]))
     t3 = time.time()

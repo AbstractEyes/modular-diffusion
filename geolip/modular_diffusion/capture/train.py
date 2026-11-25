@@ -168,6 +168,10 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
     the averaged parameters), "log" (one dict per step), "step", "finished", "seconds", "settings", "reads" (the
     values ``on_every`` returned, with their steps), "seconds_a_step" (the median over the job's steps), "trained"
     (the trained parameter count)}; a finished job read back from its files also holds "restored": True."""
+    kind = getattr(getattr(teacher, "process", None), "kind", "eps")
+    if kind != "eps":
+        raise ValueError(f"a band engine is trained from a noise-predicting teacher only; this source is of the kind "
+                         f"{kind!r}, whose capture loss is not defined in this library")
     shape = shape_from(shape)
     band = BANDS[band_index(band)]
     steps, batch = int(steps), int(batch)

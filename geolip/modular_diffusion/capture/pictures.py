@@ -72,9 +72,13 @@ def decode(vae, z: Tensor, batch: int = 8) -> Tensor:
 @torch.no_grad()
 def sample_latents(model, states: Tensor, empty: Optional[Tensor], noise_seed: int, *, group: int, steps: int = 50,
                    guidance: float = 7.5, latent_shape: Optional[Sequence[int]] = None,
-                   alphas_cumprod: Optional[Tensor] = None, log: Optional[Callable[[str], None]] = None) -> Tensor:
+                   alphas_cumprod: Optional[Tensor] = None, log: Optional[Callable[[str], None]] = None,
+                   process=None) -> Tensor:
     """float32 [N, C, h, w] on the CPU: the sampler's final latents of every row of ``states``, ``group`` rows at a
-    time (0: one group), group j from the noise of ``group_seed(noise_seed, j)`` (see the module's text). The seed of
+    time (0: one group), group j from the noise of ``group_seed(noise_seed, j)`` (see the module's text); ``process``:
+    the source's sampler (``capture.process``; None: DDIM on ``alphas_cumprod``), ``empty`` its unguided side's states.
+    The latents are the source's own: a source with a latent-scale ratio is decoded from
+    ``source.picture_latents(z)``. The seed of
     group j depends only on j, so row i starts from the same noise whatever the number of rows, as long as the group
     size is the same: a job of fewer rows is a prefix of a job of more (exactly so when every group of the shorter job
     is whole; a short last group puts fewer rows through a forward, which may change the last digits)."""
@@ -86,7 +90,7 @@ def sample_latents(model, states: Tensor, empty: Optional[Tensor], noise_seed: i
         t0 = time.time()
         z = initial_noise(group_seed(noise_seed, j), n, shape)
         out.append(sample(model, states[first:first + n], empty, int(noise_seed), steps, guidance, latent_shape=shape,
-                          alphas_cumprod=alphas_cumprod, z=z).float().cpu())
+                          alphas_cumprod=alphas_cumprod, z=z, process=process).float().cpu())
         done += n
         if log:
             log(f"sampled rows {done:,} of {n_rows:,} ({time.time() - t0:.1f} s for this group)")

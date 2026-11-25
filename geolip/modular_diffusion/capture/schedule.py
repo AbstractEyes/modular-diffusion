@@ -83,6 +83,15 @@ def band_weights(t: Steps) -> Tensor:
     return frame.projective(band_owners(), band_coordinate(t))
 
 
+def band_weights_at(s: Union[float, Sequence[float], Tensor]) -> Tensor:
+    """[B, 3] float64: the weights of the bands at real coordinates s in [0, 1] (a source on a continuous time), from
+    the same owners and gate as ``band_weights``; on s = t / 1000 of a whole step they are ``band_weights(t)``."""
+    x = (s if isinstance(s, Tensor) else torch.as_tensor(s, dtype=torch.float64)).reshape(-1).double().cpu()
+    if x.numel() and (float(x.min()) < 0.0 or float(x.max()) > 1.0):
+        raise ValueError("a band coordinate lies in [0, 1]")
+    return frame.projective(band_owners(), x)
+
+
 def band_weight(t: Steps, band: Union[str, int]) -> Tensor:
     """[B] float64: one band's weight at the steps t."""
     return band_weights(t)[:, band_index(band)]

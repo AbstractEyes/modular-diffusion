@@ -6,7 +6,9 @@ noise range (a band). An assembly blends the parts of the three bands by fixed w
 asked only where its band is.
 
     schedule    the teacher's noise schedule and the three bands, served by the library's address gate (``frame``)
-    teacher     the frozen teacher (a local diffusers folder; never downloaded) and a tiny random one for tests
+    process     how a source noises, answers and steps: the teacher's noise prediction (eps) or a flow source's velocity
+    teacher     the frozen teacher (a local diffusers folder; never downloaded) and a tiny random one for tests; a source of
+                another kind with its own U-Net folder
     shapes      engine shapes: how many layers each stage keeps, the middle block, three or four stages
     engine      an engine built from the teacher by paired block removal, its numbers inherited exactly
     loss        the capture loss: squared error to the teacher's answer, and optionally to the noise

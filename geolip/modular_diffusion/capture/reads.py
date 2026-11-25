@@ -35,6 +35,11 @@ all rows in one batch) and the noise depends only on the probe's seed, the group
 sampled with the same probe and group size start every row from the same noise. The same rows with ANOTHER group size
 get other noise (not promised to match). With guidance a forward holds 2 x group rows.
 
+A SOURCE OF ANOTHER KIND (a flow source, ``capture.process``): its probe carries its process, so the probe's input at
+a step is that source's noised input ((1 - s) x0 + s eps at s = t / 1000, on the same whole steps), its sampling reads
+use its sampler, and its ``empty`` holds its unguided side's states; the answers compared are the source's own (a
+velocity). A read compares answers of the same kind only.
+
 Every read returns a plain dict of numbers (and names), ready for ``write_json`` and ``table``.
 """
 from __future__ import annotations
@@ -51,9 +56,10 @@ import torch
 from torch import Tensor
 
 from . import BANDS
-from .assemble import Assembly, ddim_timesteps, guided, initial_noise, sample
+from .assemble import Assembly, guided, initial_noise, sample
 from .engine import UNetPart, as_part, build_engine, param_count
-from .schedule import add_noise, band_index, band_steps, band_weights, sd15_alphas_cumprod
+from .process import EpsProcess, Process
+from .schedule import STEPS, add_noise, band_index, band_steps, band_weights, band_weights_at, sd15_alphas_cumprod
 from .shapes import Shape, shape_from
 
 
@@ -64,14 +70,21 @@ class Probe:
     eps: Tensor                        # [N, 4, h, w] the noise
     steps: Dict[str, Tensor]           # band -> its probe steps
     alphas_cumprod: Tensor
-    empty: Optional[Tensor] = None     # [N or 1, 77, D] the empty prompt's states (for sampling reads)
+    empty: Optional[Tensor] = None     # [N or 1, 77, D] the unguided side's states (for sampling reads)
     seed: int = 0
     batch: int = 0                     # rows a forward in the reads (0: all the probe's rows at once)
+    process: Optional[Process] = None  # the source's process (None: the teacher's noise schedule, alphas_cumprod)
 
     def z(self, t: int) -> Tensor:
-        """z_t of every probe row at the step t."""
+        """z_t of every probe row at the step t (the source's noised input)."""
+        if self.process is not None:
+            return self.process.noised(self.x0, self.eps, int(t))
         tt = torch.full((self.x0.shape[0],), int(t), dtype=torch.long)
         return add_noise(self.x0, self.eps, tt, self.alphas_cumprod)
+
+    def sampler_process(self) -> Process:
+        """The process the probe's sampling reads use."""
+        return self.process if self.process is not None else EpsProcess(self.alphas_cumprod.double().cpu())
 
 
 def even_steps(band: Union[str, int], n: int) -> Tensor:
@@ -85,10 +98,13 @@ def even_steps(band: Union[str, int], n: int) -> Tensor:
 
 def make_probe(states: Tensor, seed: int = 0, x0: Optional[Tensor] = None, per_band: int = 4,
                latent_shape: Sequence[int] = (4, 64, 64), empty: Optional[Tensor] = None,
-               alphas_cumprod: Optional[Tensor] = None, batch: int = 0) -> Probe:
+               alphas_cumprod: Optional[Tensor] = None, batch: int = 0, process: Optional[Process] = None) -> Probe:
     """A probe from prompt states [N, 77, D]: the clean latents ``x0`` (or standard normal ones of ``latent_shape``
     from the seed), the noise from the seed, ``per_band`` even steps of each band. ``batch``: how many rows the reads
-    put through a part at once (0: all of them); the teacher's answers and a part's are cut the same way."""
+    put through a part at once (0: all of them); the teacher's answers and a part's are cut the same way. ``process``:
+    the source's process (``capture.process``; None: the teacher's noise schedule); the probe's steps are the same
+    whole numbers for every kind (fed to the U-Net as they are; s = t / 1000). ``x0`` is used as given: a source with
+    another latent scale is given ``source.source_latents(x0)``."""
     n = states.shape[0]
     g = torch.Generator().manual_seed(int(seed))
     if x0 is None:
@@ -99,7 +115,7 @@ def make_probe(states: Tensor, seed: int = 0, x0: Optional[Tensor] = None, per_b
     eps = torch.randn(tuple(x0.shape), generator=g).to(device=states.device, dtype=torch.float32)
     ac = (alphas_cumprod if alphas_cumprod is not None else sd15_alphas_cumprod()).double()
     steps = {b: even_steps(b, per_band) for b in BANDS}
-    return Probe(states, x0, eps, steps, ac, empty, int(seed), int(batch))
+    return Probe(states, x0, eps, steps, ac, empty, int(seed), int(batch), process)
 
 
 def _answer(part, z: Tensor, t: int, states: Tensor, batch: int = 0) -> Tensor:
@@ -174,7 +190,7 @@ def sample_probe(model, probe: Probe, sample_steps: int = 50, guidance: float = 
     for j, (first, n) in enumerate(sample_groups(probe.states.shape[0], group)):
         z = initial_noise(group_seed(s, j), n, shape)
         out.append(sample(model, probe.states[first:first + n], probe.empty, s, sample_steps, guidance,
-                          latent_shape=shape, alphas_cumprod=probe.alphas_cumprod, z=z))
+                          latent_shape=shape, alphas_cumprod=probe.alphas_cumprod, z=z, process=probe.process))
     return torch.cat(out)
 
 
@@ -245,7 +261,8 @@ def chain_errors(driver, asked, probe: Probe, sample_steps: int = 50, guidance: 
         raise ValueError("the chain read samples, so the probe needs its empty prompt's states")
     s = probe.seed if seed is None else int(seed)
     shape = tuple(probe.x0.shape[1:])
-    ts = ddim_timesteps(sample_steps)
+    process = probe.sampler_process()
+    ts = process.grid(sample_steps)
     index = {t: k for k, t in enumerate(ts)}
     n = probe.states.shape[0]
     e = torch.zeros(len(ts), n, dtype=torch.float64)
@@ -256,20 +273,24 @@ def chain_errors(driver, asked, probe: Probe, sample_steps: int = 50, guidance: 
         empty = probe.empty.to(device=states.device, dtype=states.dtype)      # as the sampler casts it
 
         def watch(t, z, eps, first=first, rows=rows, states=states, empty=empty):
-            tt = torch.full((rows,), int(t), dtype=torch.long, device=z.device)
+            tt = process.fed(rows, t, z.device)
             other_eps = guided(other, z, tt, states, empty, guidance)
             d = (eps.double() - other_eps.double()).pow(2).reshape(rows, -1).mean(dim=1)
-            e[index[int(t)], first:first + rows] = d.cpu()
+            e[index[t], first:first + rows] = d.cpu()
 
         z = initial_noise(group_seed(s, j), rows, shape)
         finals.append(sample(driver, states, probe.empty, s, sample_steps, guidance, latent_shape=shape,
-                             alphas_cumprod=probe.alphas_cumprod, z=z, on_step=watch))
+                             alphas_cumprod=probe.alphas_cumprod, z=z, on_step=watch, process=probe.process))
     return e, torch.cat(finals)
 
 
 def band_errors(e: Tensor, steps: Sequence[int]) -> Dict[str, Tensor]:
-    """{band: [N] float64}: E_i(b) = sum_t w_b(t) e_i(t) / sum_t w_b(t) over the given steps (the rows of ``e``)."""
-    w = band_weights(list(steps))                           # [steps, 3] float64
+    """{band: [N] float64}: E_i(b) = sum_t w_b(t) e_i(t) / sum_t w_b(t) over the given steps (the rows of ``e``; whole
+    steps, or the real times of a source on a continuous time, read at s = t / 1000)."""
+    if all(isinstance(t, int) for t in steps):
+        w = band_weights(list(steps))                       # [steps, 3] float64
+    else:
+        w = band_weights_at(torch.tensor([float(t) for t in steps], dtype=torch.float64) / STEPS)
     out = {}
     for b in BANDS:
         wb = w[:, band_index(b)]
@@ -298,7 +319,7 @@ def chain_read(model, teacher, probe: Probe, sample_steps: int = 50, guidance: f
     per-row band errors, the mean squared difference of the two chains' final latents and both chains' content
     hashes (``latent_hash``)."""
     t0 = time.time()
-    steps = ddim_timesteps(sample_steps)
+    steps = probe.sampler_process().grid(sample_steps)
     e_own, z_own = chain_errors(model, teacher, probe, sample_steps, guidance, group, seed)
     e_teacher, z_teacher = chain_errors(teacher, model, probe, sample_steps, guidance, group, seed)
     own, tea = band_errors(e_own, steps), band_errors(e_teacher, steps)

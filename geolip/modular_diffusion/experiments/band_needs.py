@@ -38,6 +38,11 @@ forward), counted exactly: in r3 a part of the assembly runs on a sampler step o
 zero, and guidance doubles the rows. After every unit: units done, minutes spent, minutes left (from the measured
 seconds per row-forward of the units of the same kind).
 
+THE SOURCE: by default the teacher itself; ``unet``, ``kind``, ``shift``, ``unguided``, ``kappa`` and ``unet_seed`` (the
+capture experiment's source arguments) read another source of the same U-Net layout, for example a flow source, under
+its own process: its probe inputs are its noised inputs on the same steps, its prompt read uses its sampler and its
+unguided side, its probe rows are multiplied by kappa.
+
 Arguments (key=value): variant, teacher, repo, revision, tiny, data, out, device, seeds, rows (probe rows a seed for the
 born reads), per_band (probe steps a band), prompts (rows a seed for the prompt read), group (prompts a sampling
 batch), chunk (probe rows a forward), steps (sampler steps), guidance, dtype (fp32 / bf16 / fp16), sample_dtype,
@@ -61,6 +66,7 @@ import torch
 from .. import __version__
 from ..config import in_notebook, parse
 from ..determinism import mode as det_mode
+from .capture import SOURCE_DEFAULTS
 
 EXPERIMENT = "band_needs"
 VARIANTS = ("reads", "timing")
@@ -70,6 +76,7 @@ DEFAULTS = dict(variant="reads", teacher="", repo="runwayml/stable-diffusion-v1-
                 data="", out="", device="cpu", seeds="0,1", rows=64, per_band=4, prompts=128, group=32, chunk=16,
                 steps=50, guidance=7.5, dtype="fp32", sample_dtype="fp16", cost_batch=16, cost_repeats=3,
                 do="r1,r2,r3,r4", threads=4, det="")
+DEFAULTS.update(SOURCE_DEFAULTS)              # the source's arguments, as the capture experiment's
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
@@ -102,14 +109,18 @@ def group_sizes(prompts: int, group: int) -> List[int]:
 
 
 # ------------------------------------------------------------------ the exact row-forward counts
-def r3_slot_steps(steps: int) -> Dict[str, int]:
+def r3_slot_steps(steps: int, process=None) -> Dict[str, int]:
     """Per band, how many (sampler step, live part) pairs the assembly runs in ONE sampling with that band's prompt
     changed: on each step the changed band's part runs where its weight is above zero, and the teacher (serving the
-    other two bands as one part) where their summed weight is above zero."""
+    other two bands as one part) where their summed weight is above zero. ``process``: the source's sampler (None: the
+    teacher's DDIM)."""
     from ..capture import BANDS
     from ..capture.assemble import ddim_timesteps
-    from ..capture.schedule import band_weights
-    w = band_weights(ddim_timesteps(int(steps)))
+    from ..capture.schedule import STEPS, band_weights, band_weights_at
+    if process is None or process.kind == "eps":
+        w = band_weights(ddim_timesteps(int(steps)))
+    else:
+        w = band_weights_at(torch.tensor(process.grid(int(steps)), dtype=torch.float64) / STEPS)
     out = {}
     for i, b in enumerate(BANDS):
         others = [j for j in range(len(BANDS)) if j != i]
@@ -118,10 +129,11 @@ def r3_slot_steps(steps: int) -> Dict[str, int]:
 
 
 def row_forwards(seeds: int, rows: int, per_band: int, prompts: int, group: int, steps: int, guidance: float,
-                 cost_batch: int, cost_repeats: int, do: Sequence[str] = READS) -> dict:
+                 cost_batch: int, cost_repeats: int, do: Sequence[str] = READS, process=None) -> dict:
     """The exact row-forwards (one row through one U-Net forward) of every unit of the job, by read: the born reads
     with their controls (teacher, engines near the teacher's size: the full copy and the six single changes, reduced
-    engines: base, small, tiny and the random base), r4, r3; and the engine builds."""
+    engines: base, small, tiny and the random base), r4, r3; and the engine builds. ``process``: the source's sampler
+    for r3 (None: the teacher's DDIM)."""
     from ..capture import BANDS
     from ..capture.reads import even_steps
     seeds, rows = int(seeds), int(rows)
@@ -141,7 +153,7 @@ def row_forwards(seeds: int, rows: int, per_band: int, prompts: int, group: int,
         units["r4"] = dict(kind="r4", teacher=10 * each, engine_full=7 * each, engine_reduced=3 * each, builds=10)
     if "r3" in do:
         factor = 1 if float(guidance) == 1.0 else 2
-        slots = sum(2 * v for v in r3_slot_steps(steps).values())       # empty and shuffled, in each band
+        slots = sum(2 * v for v in r3_slot_steps(steps, process).values())    # empty and shuffled, in each band
         for k in range(seeds):
             for g, b in enumerate(group_sizes(prompts, group)):
                 plain = (3 if g == 0 else 2) * int(steps)                   # the reference, everywhere, the repeat
@@ -215,6 +227,8 @@ class _Job:
         self.device = torch.device(a["device"])
         self._teacher = None
         self._rows = None
+        from .capture import source_options
+        self.source = source_options(a)
         if a["tiny"]:
             self.where = "tiny random teacher"
         else:
@@ -223,14 +237,18 @@ class _Job:
 
     def teacher(self):
         if self._teacher is None:
-            from ..capture.teacher import load_teacher, tiny_teacher
-            dtype = DTYPES[self.a["dtype"]]
-            if self.a["tiny"]:
-                self._teacher = tiny_teacher(0).to(self.device, dtype)
-            else:
-                self._teacher = load_teacher(self.where, device=self.device, dtype=dtype)
-            self.log(f"teacher loaded: {self.where} on {self.device} in {self.a['dtype']}")
+            from .capture import load_source
+            folder = self.a["teacher"] if self.a["tiny"] else self.where
+            self._teacher, _ = load_source(dict(self.a, teacher=folder), seed=0)
+            self.log(f"teacher loaded: {self.where}" + (f" with the U-Net of {self.a['unet']}" if self.a["unet"] else "")
+                     + ("" if self._teacher.kind == "eps" else f" ({self._teacher.record()})")
+                     + f" on {self.device} in {self.a['dtype']}")
         return self._teacher
+
+    def process(self):
+        """The source's process without loading it (for the job's counts)."""
+        from ..capture.process import make_process
+        return make_process(self.source["kind"], self.source["shift"])
 
     def data(self, folder: str, need: int):
         from ..capture.data import LatentBatches, read_index
@@ -274,8 +292,8 @@ def _probe(job: _Job, k: int, seed: int):
     teacher = job.teacher()
     lat, ids = job.rows(k * int(a["prompts"]), int(a["rows"]))
     states = teacher.text_states(ids)
-    return make_probe(states, seed=1000 + int(seed), x0=lat, per_band=int(a["per_band"]),
-                      alphas_cumprod=teacher.alphas_cumprod, batch=int(a["chunk"]))
+    return make_probe(states, seed=1000 + int(seed), x0=teacher.source_latents(lat), per_band=int(a["per_band"]),
+                      alphas_cumprod=teacher.alphas_cumprod, batch=int(a["chunk"]), process=teacher.process)
 
 
 def _controls(job: _Job, k: int, seed: int, log) -> dict:
@@ -398,6 +416,11 @@ def _run(a: dict, det, switches: dict) -> dict:
             "version": __version__, "diffusers": _version("diffusers"), "transformers": _version("transformers"),
             "device": str(device), "card": _card(device), "switches": switches, "teacher": job.where,
             "sample_dtype_used": sample_dtype}
+    if a["kind"] != "eps" or a["unet"]:
+        from ..capture.teacher import UNGUIDED_DEFAULT
+        p = job.process()
+        head["process"] = dict(p.record(), unguided=job.source["unguided"] or UNGUIDED_DEFAULT[p.kind],
+                               kappa=job.source["kappa"], unet=a["unet"])
     need = len(seeds) * int(a["prompts"])
     data = a["data"]
     if not data:
@@ -426,7 +449,7 @@ def _reads(a, job: _Job, seeds: List[int], sample_dtype: str, head: dict, log, d
     os.makedirs(parts_dir, exist_ok=True)
     do = _do(a["do"])
     count = row_forwards(len(seeds), a["rows"], a["per_band"], a["prompts"], a["group"], a["steps"], a["guidance"],
-                         a["cost_batch"], a["cost_repeats"], do)
+                         a["cost_batch"], a["cost_repeats"], do, job.process())
     # the units in their running order, each with its file name and its row-forwards
     plan = []
     for k, s in enumerate(seeds):
@@ -583,7 +606,7 @@ def _timing(a: dict, job: _Job, data: str, sample_dtype: str, head: dict, log, t
     teacher.to(dtype=DTYPES[sample_dtype])
     sec["teacher_sample_dtype_pair"] = _seconds(teacher, *inputs(pair, DTYPES[sample_dtype]))
     rf = row_forwards(len(seeds), a["rows"], a["per_band"], a["prompts"], a["group"], a["steps"], a["guidance"],
-                      a["cost_batch"], a["cost_repeats"])
+                      a["cost_batch"], a["cost_repeats"], READS, job.process())
     t_row = sec["teacher_dtype_chunk"] / chunk
     e_row = sec["base_chunk"] / chunk
     s_row = sec["teacher_sample_dtype_pair"] / pair

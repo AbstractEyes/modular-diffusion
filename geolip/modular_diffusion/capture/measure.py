@@ -17,6 +17,9 @@ of numbers with a list of ``rows`` for ``reads.table``.
 "Inside one band only" means through the band weights of the assembly: on a step the answer is the weighted sum of the
 teacher's answer with the true prompt (the other bands' weights) and with the changed prompt (the band's weight), so the
 change is served exactly where the band's weight is above zero and fades with it across the crossfades.
+
+A source of another kind (``capture.process``) is measured the same way under its own process: its sampler, its
+unguided side as the "empty" prompt (zero states for a flow source), its band weights at s = t / 1000.
 """
 from __future__ import annotations
 
@@ -123,14 +126,15 @@ def text_need(teacher, prompts: Sequence[str], seed: int = 0, steps: int = 50, g
     if n < 2:
         raise ValueError("text_need needs at least two prompts (one to shuffle into another)")
     states = teacher.text_states(ids)
-    empty = teacher.empty_states(n)
+    empty = teacher.unguided_states(n) if hasattr(teacher, "unguided_states") else teacher.empty_states(n)
     if bool((states.reshape(n, -1) == empty[:1].reshape(1, -1)).all(dim=1).any()):
         raise ValueError("a prompt's states equal the empty prompt's; text_need needs prompts that are not empty")
     shuffled = states.roll(1, dims=0)
     cfg = teacher.unet.config
     shape = tuple(latent_shape) if latent_shape is not None else (int(cfg.in_channels), int(cfg.sample_size),
                                                                    int(cfg.sample_size))
-    kw = dict(steps=int(steps), guidance=float(guidance), latent_shape=shape, alphas_cumprod=teacher.alphas_cumprod)
+    kw = dict(steps=int(steps), guidance=float(guidance), latent_shape=shape, alphas_cumprod=teacher.alphas_cumprod,
+              process=getattr(teacher, "process", None))
     ref = sample(teacher, states, empty, int(seed), **kw)
     again = _mse(sample(teacher, states, empty, int(seed), **kw), ref) if repeat else None
     everywhere = _mse(sample(teacher, empty, empty, int(seed), **kw), ref)
