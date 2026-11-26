@@ -9,7 +9,7 @@ training.
 |----------------|----------------------------------------------------------------------------------------------------|
 | scale          | ``pic_n`` prompts of ``pic_data`` sampled by the source's own sampler, unguided (guidance 1) and at  |
 |                | ``guidance``: the standard deviation of the final latents over all elements and by channel, beside |
-|                | the same of the rows' own clean latents; their ratio and the scale rule (below)                    |
+|                | the same of the rows' own clean latents; both ratios and the scale rule on the guided one (below)  |
 | group_exchange | the source (the REFERENCE) with one named group of its U-Net replaced by the donor's tensors, read  |
 |                | against the reference's own answer on every stretch's probe steps, under the reference's process;  |
 |                | the controls ``none`` (nothing replaced) and ``all`` (every group replaced: the donor itself)      |
@@ -38,9 +38,12 @@ after each read (each restored tensor checked equal to its saved copy); at the e
 against its own answers (it must read exactly 0). Control ``all`` holds whether the exchanged model's answers equal
 the donor's own answers element by element (the same tensors in the same layout).
 
-THE SCALE RULE: kappa = std(the unguided samples) / std(the rows' clean latents). If 0.9 <= kappa <= 1.1 the source
-uses the standard scale (kappa := 1); otherwise clean latents given to it are multiplied by kappa and its samples
-divided by kappa before decoding (the source argument ``kappa``).
+THE SCALE RULE reads the guided samples: kappa = std(the samples at ``guidance``) / std(the rows' clean latents) (the
+result's ``ratio_guided``; its ``rule_side`` is "guided"). An unguided sample loses spread in every model (Stable
+Diffusion 1.5's own unguided samples read 0.80 of its rows' spread, its guided ones 0.97), so the unguided ratio is
+recorded beside it (``ratio_unguided``) and not used. If 0.9 <= kappa <= 1.1 the source uses the standard scale
+(kappa := 1); otherwise clean latents given to it are multiplied by kappa and its samples divided by kappa before
+decoding (the source argument ``kappa``).
 
 THE DISTANCE of a group: ||W_donor - W_ref|| / ||W_ref|| and cos(W_donor, W_ref) over the group's tensors flattened
 together, in float64, read tensor by tensor from the files (never a whole U-Net in memory for this).
@@ -438,16 +441,16 @@ def _scale(a: dict, log) -> dict:
             + ", ".join(f"{v:.4g}" for v in out[name]["by_channel"]))
     rows_std = _std(x0)
     log(f"scale: the rows' clean latents std {rows_std['all']:.5g}")
-    kappa = out["unguided"]["all"] / rows_std["all"]
-    rule = scale_rule(kappa)
+    unguided_ratio = out["unguided"]["all"] / rows_std["all"]
     guided_ratio = out["guided"]["all"] / rows_std["all"]
-    rows = [{"latents": "samples, unguided", "std": out["unguided"]["all"], "ratio": kappa},
+    rule = scale_rule(guided_ratio)                       # the rule reads the guided samples (the module's text)
+    rows = [{"latents": "samples, unguided", "std": out["unguided"]["all"], "ratio": unguided_ratio},
             {"latents": f"samples, guidance {float(a['guidance']):g}", "std": out["guided"]["all"], "ratio": guided_ratio},
             {"latents": "the rows' clean latents", "std": rows_std["all"], "ratio": 1.0}]
     return {"source": where, "process": source.record(), "n": int(x0.shape[0]), "rows_first": int(file_rows[0]),
-            "samples": out, "rows_latents": rows_std, "ratio_unguided": kappa, "ratio_guided": guided_ratio,
-            "guided_inside_band": SCALE_BAND[0] <= guided_ratio <= SCALE_BAND[1], **rule, "rows": rows,
-            "columns": ["latents", "std", "ratio"], "sample_steps": int(a["sample_steps"])}
+            "samples": out, "rows_latents": rows_std, "ratio_unguided": unguided_ratio, "ratio_guided": guided_ratio,
+            "guided_inside_band": SCALE_BAND[0] <= guided_ratio <= SCALE_BAND[1], **rule, "rule_side": "guided",
+            "rows": rows, "columns": ["latents", "std", "ratio"], "sample_steps": int(a["sample_steps"])}
 
 
 def second_flow_sampler(unet, states: Tensor, z: Tensor, steps: int, shift: float, guidance: float,

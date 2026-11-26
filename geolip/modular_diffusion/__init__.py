@@ -6,4 +6,4 @@ Conventions used throughout the package:
     target = image - noise                      the velocity the model predicts
 """
 
-__version__ = "0.17.1"
+__version__ = "0.17.2"

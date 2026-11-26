@@ -1,7 +1,7 @@
 """The lineage reads on tiny sources: the named groups cover the U-Net; the group exchange with its controls (a source
 against its own copy, nothing exchanged, everything exchanged, a random donor) and the restore after each exchange;
 the weight distance against a direct computation; a child against its parent by stretch and slice; the latent scale
-and its rule; the sampler check; the new files read clean."""
+and its rule (on the guided ratio); the sampler check; the new files read clean."""
 import math
 import os
 import re
@@ -128,9 +128,39 @@ def test_the_scale_and_its_rule(tmp_path):
     assert lineage.scale_rule(0.95)["kappa_to_use"] == 1.0 and lineage.scale_rule(1.1)["rule"] == "standard"
     assert lineage.scale_rule(0.18) == {"kappa": 0.18, "rule": "scaled", "kappa_to_use": 0.18}
     r = lineage.main(variant="scale", pic_n=4, group=2, sample_steps=3, out=str(tmp_path / "k"), **FLOW)
-    assert r["kappa"] == pytest.approx(r["samples"]["unguided"]["all"] / r["rows_latents"]["all"], rel=1e-12)
+    rows = r["rows_latents"]["all"]
+    assert r["ratio_unguided"] == pytest.approx(r["samples"]["unguided"]["all"] / rows, rel=1e-12)
+    assert r["kappa"] == r["ratio_guided"] == pytest.approx(r["samples"]["guided"]["all"] / rows, rel=1e-12)
+    assert r["rule_side"] == "guided"
+    assert {k: r[k] for k in ("kappa", "rule", "kappa_to_use")} == lineage.scale_rule(r["ratio_guided"])
     assert len(r["samples"]["guided"]["by_channel"]) == 4 and r["samples"]["unguided"]["guidance"] == 1.0
     assert r["rule"] in ("standard", "scaled")
+
+
+def _spread(stds):
+    """A stand-in for the sampler: final latents of a set standard deviation for each guidance (1: unguided)."""
+    def sample_latents(model, states, empty, noise_seed, *, group, steps=50, guidance=7.5, latent_shape=None,
+                       alphas_cumprod=None, log=None, process=None):
+        z = torch.randn((states.shape[0],) + tuple(latent_shape), generator=torch.Generator().manual_seed(3))
+        return z / float(z.double().std(unbiased=False)) * stds[float(guidance)]
+    return sample_latents
+
+
+def test_the_scale_rule_reads_the_guided_ratio(tmp_path, monkeypatch):
+    from geolip.modular_diffusion.capture import pictures
+    args = dict(variant="scale", pic_n=4, group=2, sample_steps=3, **FLOW)          # guidance 4 (the default)
+    monkeypatch.setattr(pictures, "sample_latents", _spread({1.0: 1.0, 4.0: 1.0}))
+    rows = lineage.main(out=str(tmp_path / "rows"), **args)["rows_latents"]["all"]
+    # the unguided and the guided ratio on different sides of the band 0.9 to 1.1, both ways round
+    for unguided, guided, rule, use in ((0.80, 0.97, "standard", 1.0), (0.95, 0.50, "scaled", 0.50)):
+        monkeypatch.setattr(pictures, "sample_latents", _spread({1.0: unguided * rows, 4.0: guided * rows}))
+        r = lineage.main(out=str(tmp_path / f"u{unguided}"), **args)
+        assert r["rows_latents"]["all"] == rows
+        assert r["ratio_unguided"] == pytest.approx(unguided, rel=1e-6)
+        assert r["ratio_guided"] == pytest.approx(guided, rel=1e-6)
+        assert r["rule_side"] == "guided" and r["kappa"] == r["ratio_guided"] and r["rule"] == rule
+        assert r["kappa_to_use"] == pytest.approx(use, rel=1e-6) and r["guided_inside_band"] == (rule == "standard")
+        assert lineage.scale_rule(r["ratio_unguided"])["rule"] != rule                # the unguided side rules otherwise
 
 
 def test_the_sampler_check(tmp_path):
