@@ -25,6 +25,11 @@
 | chain_read   | an assembly (``parts=``) against the teacher on the states of the sampler's chain: on its own chain |
 |              | (the assembly drives, the teacher is asked) and on the teacher's (the teacher drives, the assembly  |
 |              | is asked), per band the mean error on each chain and their ratio (``capture.reads.chain_read``)      |
+| steering     | one part (``part=``) against the teacher on one band's probe steps (``band``), each probe row       |
+|              | answered with its prompt and with the unguided side's states: the own error R, the steering error S |
+|              | of the prompt difference, the guided error G at ``guidance``, the prompt difference's size P, the   |
+|              | error on the unguided side U, per band and per step (``capture.reads.steering_read``); the part's   |
+|              | weights are recorded by their hashes                                                                 |
 
 The teacher is a local diffusers folder: ``teacher=<folder>``, or found in the local hub cache by ``repo`` and
 ``revision`` (nothing is ever downloaded). ``tiny=1`` uses a tiny random teacher and random batches instead (16 x 16
@@ -54,7 +59,18 @@ chunk, sample_steps, guidance, group, parts (for assembly, exchange, chain_read 
 example clean=runs/a,middle=teacher,noisy=born:tiny; a part is ``teacher``, a band engine's job folder (its averaged
 engine), ``born:<shape>`` (the shape's engine with every number inherited from the teacher, untrained, reading the
 prompt) or ``born:<shape>:notext`` (the same without the prompt); ``<shape>`` is a name or the text form such as
-2222/nomid/3), other (for exchange: a part in the same forms), threads, det (empty, warn or on).
+2222/nomid/3), other (for exchange: a part in the same forms), part (for steering: ``teacher``, a band engine's job
+folder, ``born:<shape>[:notext]`` or ``random:<shape>[:notext]``, the shape's engine with random numbers from the job's
+seed by ``engine.fresh_engine``), threads, det (empty, warn or on).
+
+THE STEERING READ (``variant=steering``): the probe is the one every variant builds from the probe arguments, so with
+a training's probe arguments it is that training's own-error read (``read_every``): the same rows, noise and steps, and
+the read's ``mse`` equals that read of the same part to the bit. The teacher answers each probe step twice (the rows'
+prompts and the unguided side) on the read's band only, and the part the same. result.json holds ``steering`` (the
+read), ``weights`` (what the part was: its kind teacher / job / born / random, and for a job folder its job name,
+shape, whether it reads the prompt and the SHA-256 of engine.safetensors and engine_avg.safetensors; for an engine the
+SHA-256 of its numbers, ``state_sha256``) and the seconds of the teacher's answers, of making the part and of its
+answers.
 
 The source (every variant but picture_compare): unet (a folder of the source's own U-Net, a diffusers config.json and
 diffusion_pytorch_model.safetensors; the text encoder, tokenizer and image decoder stay the teacher folder's), kind
@@ -97,7 +113,7 @@ from ..config import in_notebook, parse
 from ..determinism import mode as det_mode
 
 EXPERIMENT = "capture"
-VARIANTS = ("band_engine", "born", "assembly", "exchange", "pictures", "picture_compare", "chain_read")
+VARIANTS = ("band_engine", "born", "assembly", "exchange", "pictures", "picture_compare", "chain_read", "steering")
 PICTURE_VARIANTS = ("pictures", "picture_compare")
 SOURCES = ("parts", "rows")
 PROBE_PROMPTS = ("a photograph of a red house by a lake", "a bowl of fruit on a wooden table",
@@ -111,7 +127,7 @@ DEFAULTS = dict(variant="band_engine", teacher="", repo="runwayml/stable-diffusi
                 probe_data="", probe_first=0, probe_rows=0, chunk=16, init="inherit", read_every=0, keep_checkpoint=1,
                 sample_steps=50, guidance=7.5, group=16, parts="", other="", threads=4, det="",
                 pic_data="", pic_first=0, pic_n=0, noise_seed=2000, source="parts", part_dtype="", judge="inception",
-                clip="", sheet_n=16, decode_batch=8, a="", b="", paired=1, blocks=10, first_n=0, micro=0)
+                clip="", sheet_n=16, decode_batch=8, a="", b="", paired=1, blocks=10, first_n=0, micro=0, part="")
 # The source's arguments (shared by the capture experiments): its own U-Net folder (empty: the teacher folder's), its
 # kind (eps or flow), the shift of a flow source, its unguided side (empty: the kind's own, empty for eps, zeros for
 # flow), its latent-scale ratio kappa, and for tiny=1 the seed of its U-Net (-1: the job's seed).
@@ -120,6 +136,7 @@ DEFAULTS.update(SOURCE_DEFAULTS)
 DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 PART_DTYPES = {"": None, "fp16": torch.float16, "bf16": torch.bfloat16}
 BORN = "born:"
+RANDOM = "random:"
 
 
 def main(argv=(), **overrides) -> dict:
@@ -159,6 +176,8 @@ def main(argv=(), **overrides) -> dict:
             raise ValueError("sheet_n is at least 0 and decode_batch at least 1")
     if a["variant"] == "picture_compare" and not (a["a"] and a["b"]):
         raise ValueError("the picture_compare variant needs a= and b= (two pictures job folders)")
+    if a["variant"] == "steering":
+        _check_steering_part(a["part"])
     with det_mode(a["det"]) as det:
         return _run(a, det)
 
@@ -318,6 +337,118 @@ def _parts(a: dict, teacher, loaded: Optional[Dict[str, object]] = None) -> Dict
     return {b: _load_part(teacher, spec[b], loaded) for b in BANDS}
 
 
+def random_spec(where: str):
+    """(shape, text) of a part written ``random:<shape>`` (reads the prompt) or ``random:<shape>:notext``. ValueError
+    naming the two forms when it does not parse."""
+    from ..capture.shapes import Shape
+    forms = ("a random part is random:<shape> or random:<shape>:notext (a shape name or <layers>/<mid|nomid>/<stages>), "
+             f"not {where!r}")
+    body = where[len(RANDOM):]
+    text = True
+    if body.endswith(":notext"):
+        body, text = body[:-len(":notext")], False
+    if not body or ":" in body:
+        raise ValueError(forms)
+    try:
+        shape = Shape.parse(body)
+    except ValueError as e:
+        raise ValueError(f"{forms} ({e})") from None
+    return shape, text
+
+
+def _check_steering_part(where: str) -> None:
+    """ValueError, before anything is loaded, when the steering variant's part is not one of its forms."""
+    forms = "teacher, a band engine's job folder (holding engine.json), born:<shape> or random:<shape>"
+    if not where:
+        raise ValueError(f"the steering variant needs part= ({forms})")
+    if where.startswith(RANDOM):
+        random_spec(where)
+    elif where.startswith(BORN):
+        born_spec(where)
+    elif where != "teacher" and not os.path.isfile(os.path.join(where, "engine.json")):
+        raise ValueError(f"part={where!r} is not {forms}")
+
+
+def file_sha256(path: str) -> Optional[str]:
+    """The SHA-256 of a file's bytes (None when there is no such file)."""
+    import hashlib
+    if not os.path.isfile(path):
+        return None
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 24), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def state_sha256(module) -> str:
+    """The SHA-256 of a module's numbers: each entry of its state dict in name order, the name and then the tensor's
+    float32 bytes on the CPU (two engines with the same numbers give the same hash)."""
+    import hashlib
+    h = hashlib.sha256()
+    for name, v in sorted(module.state_dict().items()):
+        h.update(name.encode("utf-8") + b"\0")
+        h.update(v.detach().to(device="cpu", dtype=torch.float32).contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+def _steering_part(a: dict, teacher):
+    """(the part of the steering read, its record): the teacher; an engine with random numbers (``random:<shape>``,
+    ``engine.fresh_engine`` from the job's seed); a born engine (``born:<shape>``); or the averaged engine of a band
+    engine's job folder, recorded with the SHA-256 of its two weight files."""
+    from ..capture.engine import build_engine, fresh_engine, load_engine, param_count
+    where = a["part"]
+    if where == "teacher":
+        return teacher, {"kind": "teacher", "part": where}
+    if where.startswith(RANDOM):
+        shape, text = random_spec(where)
+        part = fresh_engine(teacher, shape, seed=int(a["seed"]), text=text).eval()
+        rec = {"kind": "random", "part": where, "shape": part.shape.name, "text": text, "seed": int(a["seed"])}
+    elif where.startswith(BORN):
+        shape, text = born_spec(where)
+        part = build_engine(teacher, shape, text=text).eval()
+        rec = {"kind": "born", "part": where, "shape": part.shape.name, "text": text}
+    else:
+        part = load_engine(teacher, where, average=True).eval()
+        rec = {"kind": "job", "part": where, "job": os.path.basename(where.rstrip("/\\")), "shape": part.shape.name,
+               "text": bool(part.text), "engine_sha256": file_sha256(os.path.join(where, "engine.safetensors")),
+               "engine_avg_sha256": file_sha256(os.path.join(where, "engine_avg.safetensors"))}
+    rec.update({"params": param_count(part), "state_sha256": state_sha256(part)})
+    return part, rec
+
+
+STEERING_COLUMNS = ["R", "S", "G", "P", "U", "mse"]
+
+
+def _run_steering(a: dict, det, log, t0: float) -> dict:
+    """The steering variant: the probe, the teacher's answers on the band (with the prompts and the unguided side), the
+    part, its read (``capture.reads.steering_read``)."""
+    from ..capture import BANDS, reads
+    from ..capture.schedule import band_index
+    teacher, where = _teacher(a)
+    log(f"CAPTURE steering: teacher {where}; torch {torch.__version__}; package {__version__}")
+    probe = _probe(a, teacher)
+    band = BANDS[band_index(a["band"])]
+    t1 = time.time()
+    ref = reads.steering_answers(teacher, probe, band)
+    t2 = time.time()
+    part, record = _steering_part(a, teacher)
+    t3 = time.time()
+    r = reads.steering_read(part, teacher, band, probe, guidance=float(a["guidance"]), reference=ref)
+    t4 = time.time()
+    result = _head(a, where)
+    result.update({"probe_steps": {b: [int(t) for t in probe.steps[b]] for b in BANDS}, "probe": _probe_record(a, probe),
+                   "process": teacher.record(), "band": band, "part": a["part"], "weights": record, "steering": r,
+                   "seconds_teacher": t2 - t1, "seconds_part_load": t3 - t2, "seconds_part": t4 - t3,
+                   "seconds": time.time() - t0})
+    rows = [dict({"band": band, "part": a["part"]}, **{k: r[k] for k in STEERING_COLUMNS})]
+    result["rows"] = rows                                # the read's row in the folder's summary (``summarize``)
+    per = [dict({"step": int(t)}, **{k: v[k] for k in STEERING_COLUMNS}) for t, v in r["per_step"].items()]
+    more = (f"\n## by probe step (G at guidance {r['guidance']:g}; {r['rows']} rows a step)\n\n"
+            + reads.table(per, ["step"] + STEERING_COLUMNS))
+    return _write_outputs(a, result, rows, ["band", "part"] + STEERING_COLUMNS, det, log, more=more)
+
+
 def _run(a: dict, det) -> dict:
     from ..capture import BANDS
     from ..capture import reads
@@ -338,6 +469,8 @@ def _run(a: dict, det) -> dict:
         return _run_compare(a, det, log, t0)
     if a["variant"] == "pictures":                       # the teacher with its image decoder, no probe
         return _run_pictures(a, det, log, t0)
+    if a["variant"] == "steering":                       # the teacher's answers on the read's band only
+        return _run_steering(a, det, log, t0)
     teacher, where = _teacher(a)
     log(f"CAPTURE {a['variant']}: teacher {where}; torch {torch.__version__}; package {__version__}")
     probe = _probe(a, teacher)
@@ -510,12 +643,12 @@ def _picture_rows(a: dict, teacher):
     return x0, ids, np.arange(first, first + n, dtype=np.int64)
 
 
-def _write_outputs(a: dict, result: dict, rows, columns, det, log) -> dict:
+def _write_outputs(a: dict, result: dict, rows, columns, det, log, more: str = "") -> dict:
     from ..capture import reads
     out = a["out"]
     det.record(result)
     reads.write_json(result, os.path.join(out, "result.json"))
-    text = f"# capture: {a['variant']}\n\n" + reads.table(rows, columns)
+    text = f"# capture: {a['variant']}\n\n" + reads.table(rows, columns) + more
     with open(os.path.join(out, "result.md"), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
     log(text.rstrip())

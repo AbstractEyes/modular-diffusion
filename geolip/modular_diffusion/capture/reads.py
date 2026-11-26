@@ -15,6 +15,27 @@ evenly over the band's step set. At a step t the probe's input is z_t = sqrt(a_t
     chain_read(model, teacher, probe, sample_steps, guidance, group)
                                               how far the model's guided answers are from the teacher's on the states
                                               of the sampler's chain, on the model's own chain and on the teacher's
+    steering_read(part, teacher, band, probe, guidance)
+                                              how far the part's prompt difference is from the teacher's on the band's
+                                              probe steps, beside its own error and its guided error
+
+THE STEERING READ: at a probe step t and row, the answers with the row's prompt, a(c), and with the unguided side's
+states, a(u) (the empty prompt's for a noise-predicting source; the probe's ``empty``), each for the part (E) and the
+teacher (T), on the same inputs; the PROMPT DIFFERENCE d = a(c) - a(u) and the GUIDED answer
+guided = a(u) + g (a(c) - a(u)), the sampler's own formula. With sums over the band's probe steps, the rows and the
+latent's entries, in float64 from the answers:
+
+    R = sum |E(c) - T(c)|^2 / sum |T(c)|^2              the own error, relative
+    S = sum |d_E - d_T|^2 / sum |d_T|^2                 the steering error
+    G = sum |guided_E - guided_T|^2 / sum |guided_T|^2  the guided error at the guidance g
+    P = sum |d_T|^2 / sum |T(c)|^2                      how large the prompt difference is in an answer
+    U = sum |E(u) - T(u)|^2 / sum |T(u)|^2              the error on the unguided side
+
+and the same per probe step. Since guided_E - guided_T = (E(u) - T(u)) + g (d_E - d_T), the guided error's sum is
+sum |E(u) - T(u)|^2 + 2 g sum <E(u) - T(u), d_E - d_T> + g^2 sum |d_E - d_T|^2 (the read keeps the three sums). The
+teacher read as a part reads exactly 0 on all of them; an engine that ignores the prompt has d_E = 0 and reads S = 1
+exactly. The per-element mean of |E(c) - T(c)|^2 (``mse``) is ``band_read``'s read of the part, to the bit: the training's
+own-error read on the same probe.
 
 THE CHAIN READ: two chains from the same start noise (the rule of ``sample_probe``). On the model's OWN chain the
 sampler is driven by the model and the teacher is asked at every step on the same state, with the same prompt states,
@@ -338,6 +359,85 @@ def chain_read(model, teacher, probe: Probe, sample_steps: int = 50, guidance: f
             "final_latent_change": float((z_own.double() - z_teacher.double()).pow(2).mean()),
             "own_final_hash": latent_hash(z_own), "teacher_final_hash": latent_hash(z_teacher),
             "seconds": time.time() - t0}
+
+
+def unguided_rows(probe: Probe) -> Tensor:
+    """The unguided side's states for every probe row [N, 77, D] (the probe's ``empty`` repeated, in the prompt states'
+    precision and on their device)."""
+    if probe.empty is None:
+        raise ValueError("this read needs the probe's unguided states (make_probe(..., empty=...))")
+    n = probe.states.shape[0]
+    e = probe.empty.to(device=probe.states.device, dtype=probe.states.dtype)
+    if e.shape[0] == n:
+        return e
+    if e.shape[0] != 1:
+        raise ValueError(f"the probe's unguided states hold {e.shape[0]} rows and its prompt states {n}")
+    return e.expand(n, -1, -1).contiguous()
+
+
+def steering_answers(part, probe: Probe, band: str) -> Dict[int, Tuple[Tensor, Tensor]]:
+    """{t: (the answer with each row's prompt, the answer with the unguided side's states)} on a band's probe steps,
+    ``probe.batch`` rows a forward (pass the teacher's as ``reference=`` to read many parts against them). The prompted
+    answers are ``teacher_answers``' own."""
+    band = BANDS[band_index(band)]
+    empty = unguided_rows(probe)
+    out = {}
+    for t in probe.steps[band]:
+        t = int(t)
+        z = probe.z(t)
+        out[t] = (_answer(part, z, t, probe.states, probe.batch), _answer(part, z, t, empty, probe.batch))
+    return out
+
+
+STEERING_SUMS = ("err_c", "ref_c", "err_u", "ref_u", "err_d", "ref_d", "err_g", "ref_g", "cross")
+
+
+def _over(a: float, b: float) -> Optional[float]:
+    return a / b if b != 0.0 else None
+
+
+def _steering_ratios(s: Dict[str, float]) -> dict:
+    return {"R": _over(s["err_c"], s["ref_c"]), "S": _over(s["err_d"], s["ref_d"]), "G": _over(s["err_g"], s["ref_g"]),
+            "P": _over(s["ref_d"], s["ref_c"]), "U": _over(s["err_u"], s["ref_u"])}
+
+
+def steering_read(part, teacher, band: str, probe: Probe, guidance: float = 7.5,
+                  reference: Optional[Dict[int, Tuple[Tensor, Tensor]]] = None) -> dict:
+    """The steering read of a part against the teacher on the band's probe steps (see the module's text): R, S, G at
+    ``guidance``, P and U over the band, the per-element own error ``mse`` (``band_read``'s), the sums they are made
+    of ("err_c", "ref_c": |E(c) - T(c)|^2, |T(c)|^2; "err_u", "ref_u": the unguided side; "err_d", "ref_d": |d_E - d_T|^2,
+    |d_T|^2; "err_g", "ref_g": the guided answers; "cross": <E(u) - T(u), d_E - d_T>), and all of them per step. A ratio
+    whose denominator is exactly 0 is None. ``reference``: the teacher's ``steering_answers`` (made here when None)."""
+    band = BANDS[band_index(band)]
+    g = float(guidance)
+    ref = reference if reference is not None else steering_answers(teacher, probe, band)
+    empty = unguided_rows(probe)
+    total = dict.fromkeys(STEERING_SUMS, 0.0)
+    per, count = {}, 0
+    for t in probe.steps[band]:
+        t = int(t)
+        z = probe.z(t)
+        ec = _answer(part, z, t, probe.states, probe.batch).double()
+        eu = _answer(part, z, t, empty, probe.batch).double()
+        tc, tu = ref[t][0].double(), ref[t][1].double()
+        err_c, err_u = ec - tc, eu - tu
+        d_e, d_t = ec - eu, tc - tu
+        err_d = d_e - d_t
+        g_t = tu + g * d_t
+        err_g = (eu + g * d_e) - g_t
+        s = {"err_c": float(err_c.pow(2).sum()), "ref_c": float(tc.pow(2).sum()), "err_u": float(err_u.pow(2).sum()),
+             "ref_u": float(tu.pow(2).sum()), "err_d": float(err_d.pow(2).sum()), "ref_d": float(d_t.pow(2).sum()),
+             "err_g": float(err_g.pow(2).sum()), "ref_g": float(g_t.pow(2).sum()), "cross": float((err_u * err_d).sum())}
+        n = err_c.numel()
+        per[str(t)] = dict(_steering_ratios(s), mse=s["err_c"] / n, sums=s)
+        for k in STEERING_SUMS:
+            total[k] += s[k]
+        count += n
+    out = {"band": band, "guidance": g, "steps": [int(t) for t in probe.steps[band]], "rows": int(probe.x0.shape[0]),
+           "elements": count}
+    out.update(_steering_ratios(total))
+    out.update({"mse": total["err_c"] / count, "sums": total, "per_step": per})
+    return out
 
 
 def off_band(part, teacher, band_served: str, band_trained: str, probe: Probe) -> dict:
