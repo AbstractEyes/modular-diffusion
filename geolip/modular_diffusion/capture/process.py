@@ -109,7 +109,11 @@ class EpsProcess(Process):
         tt = _row_times(t, z.shape[0], "cpu").long()
         if tt.numel() == 1 or bool((tt == tt[0]).all()):
             return self._x0(z, answer, float(ac[int(tt[0])]))
-        return torch.stack([self._x0(z[i:i + 1], answer[i:i + 1], float(ac[int(tt[i])]))[0] for i in range(z.shape[0])])
+        a = ac[tt]
+        view = (-1,) + (1,) * (z.dim() - 1)
+        s_a = a.sqrt().to(device=z.device, dtype=z.dtype).reshape(view)
+        s_1ma = (1.0 - a).sqrt().to(device=z.device, dtype=z.dtype).reshape(view)
+        return (z - s_1ma * answer) / s_a
 
     def grid(self, steps: int, offset: int = 1) -> List[float]:
         from .assemble import ddim_timesteps

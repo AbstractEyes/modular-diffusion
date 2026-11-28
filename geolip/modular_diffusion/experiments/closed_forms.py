@@ -211,7 +211,7 @@ def _run(a: dict, det) -> dict:
     final = None
     do_read = bool(int(a["read"]))
     torch.manual_seed(seed)
-    if a["source_model"] or variant in CLASS_HEAD_VARIANTS:
+    if (a["source_model"] and variant not in ("head_solved", "heads_staged_solved")) or variant in CLASS_HEAD_VARIANTS:
         result["as_source"] = source_read(a["source"], source_model, bed, heldout, device, log)
 
     if variant in CLASS_HEAD_VARIANTS:
@@ -247,9 +247,16 @@ def _run(a: dict, det) -> dict:
             key = stored_key(source_model)
             stored = src_res.get("loss_over_levels") if key is None else (
                 (src_res.get("averaged") or {}).get(key) or {}).get("loss_over_levels")
-        result["as_trained"] = {"loss_over_levels": first["loss_over_levels"], "by_level": _levels(first),
+        eq_stored = None if stored is None else first["loss_over_levels"] == stored
+        by_lvl = _levels(first)
+        if a["source_model"]:
+            result["as_source"] = {"folder": source_model, "loss_over_levels": first["loss_over_levels"],
+                                   "by_level": by_lvl, "stored_loss_over_levels": stored, "equals_stored": eq_stored}
+            log(f"AS SOURCE {source_model}: over ten levels {first['loss_over_levels']:.6f} (stored {stored}; "
+                f"equal {eq_stored})")
+        result["as_trained"] = {"loss_over_levels": first["loss_over_levels"], "by_level": by_lvl,
                                 "by_stage": by_stage(first, CUTS), "stored_loss_over_levels": stored,
-                                "equals_stored": None if stored is None else first["loss_over_levels"] == stored}
+                                "equals_stored": eq_stored}
         log(f"AS TRAINED {first['loss_over_levels']:.6f} (stored {stored})")
         t0 = time.time()
         if variant == "head_solved":

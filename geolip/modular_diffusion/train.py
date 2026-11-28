@@ -55,19 +55,31 @@ def step_generator(seed: int, step: int, device) -> torch.Generator:
 def equalize(model) -> None:
     """Scale every member's gradient to the upper median of the members' gradient norms (members with no gradient, or
     a norm under 1e-20, are left alone; nothing happens with fewer than two live members)."""
+    members = model.members
+    if len(members) < 2:
+        return
+    member_grads = [[p.grad for p in m.parameters() if p.grad is not None] for m in members]
+    sq_tensors = [torch.stack([g.pow(2).sum() for g in gs]).sum().sqrt() for gs in member_grads if gs]
+    if len(sq_tensors) < 2:
+        return
+    vals = torch.stack(sq_tensors).cpu().tolist()
     norms = []
-    for m in model.members:
-        sq = [p.grad.pow(2).sum() for p in m.parameters() if p.grad is not None]
-        norms.append(float(torch.stack(sq).sum().sqrt()) if sq else 0.0)
+    vi = 0
+    for gs in member_grads:
+        if gs:
+            norms.append(float(vals[vi]))
+            vi += 1
+        else:
+            norms.append(0.0)
     live = sorted(n for n in norms if n > 1e-20)
     if len(live) < 2:
         return
     median = live[len(live) // 2]
-    for m, n in zip(model.members, norms):
-        if n > 1e-20:
-            for p in m.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(median / n)
+    for gs, n in zip(member_grads, norms):
+        if n > 1e-20 and gs:
+            scale = median / n
+            if scale != 1.0:
+                torch._foreach_mul_(gs, scale)
 
 
 def set_trainable(model, spec: str, loaded: Optional[dict] = None) -> None:
@@ -355,7 +367,8 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
               average_start: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
               average_step: Optional[int] = None,
               trainable_params: Optional[Dict[str, Sequence[str]]] = None, optimizer_partial: bool = False,
-              trainable_rows: Optional[Dict[str, Dict[str, Sequence[int]]]] = None) -> dict:
+              trainable_rows: Optional[Dict[str, Dict[str, Sequence[int]]]] = None,
+              do_read: bool = True) -> dict:
     """Train the named units of a model (a Model or a Staged) with the recipe and read it.
 
     averages: decays d and named averages. For each, a float32 copy of every trainable parameter (on its device, no
@@ -413,7 +426,7 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
     for r in rows:
         r["param"].requires_grad_(True)
     t_range = (float(t_range[0]), float(t_range[1]))
-    frozen_before = {id(p): p.detach().clone() for p in model.parameters() if not p.requires_grad}
+    frozen_before = {id(p): p.detach().cpu().clone() for p in model.parameters() if not p.requires_grad}
     if expect_anchor_at_birth:
         gen = torch.Generator().manual_seed(seed)
         z = torch.randn((2,) + tuple(bed.field_shape), generator=gen).to(device)
@@ -452,7 +465,10 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
     fresh: Dict[str, set] = {}                         # carried averages: the parameters that start here
     if specs:
         live = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+        live_params = [p for _, p in live]
+        all_f32 = all(p.dtype == torch.float32 for p in live_params)
         averaged = {}
+        avg_lists: Dict[Any, list] = {}
         with torch.no_grad():
             for key, kind, value in specs:
                 if kind == "tail":
@@ -470,6 +486,7 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
                                      for n, p in live}
                 else:
                     averaged[key] = {n: p.detach().clone().float() for n, p in live}
+                avg_lists[key] = [averaged[key][n] for n, _ in live]
         updates = [0]
         n_steps = int(steps)
 
@@ -500,8 +517,13 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
                             d = dk_new if n in new_here else dk
                             state[n].copy_(d * state[n] + (1.0 - d) * p.detach().float())
                         continue
-                    for n, p in live:
-                        state[n].copy_(dk * state[n] + (1.0 - dk) * p.detach().float())    # the rule as written
+                    if all_f32 and live_params:
+                        sl = avg_lists[key]
+                        torch._foreach_mul_(sl, dk)
+                        torch._foreach_add_(sl, torch._foreach_mul(live_params, 1.0 - dk))
+                    else:
+                        for n, p in live:
+                            state[n].copy_(dk * state[n] + (1.0 - dk) * p.detach().float())    # the rule as written
             updates[0] += 1
 
     state_out: Optional[Dict[str, Any]] = {} if keep_state else None
@@ -537,8 +559,9 @@ def fit_units(model, bed, seed: int, *, steps: int, trainable: Union[str, Iterab
             if r["name"] in state and not torch.equal(state[r["name"]][keep], before[keep].to(state[r["name"]].dtype)):
                 raise AssertionError(f"an average's unlisted rows of {r['name']} differ from their values before the fit")
     peak = torch.cuda.max_memory_allocated() / 2 ** 20 if is_cuda else None
-    frozen_same = all(torch.equal(frozen_before[id(p)], p) for p in model.parameters() if id(p) in frozen_before)
-    res = read(model, bed, heldout, device)
+    frozen_same = all(torch.equal(frozen_before[id(p)], p.detach().cpu())
+                      for p in model.parameters() if id(p) in frozen_before)
+    res = read(model, bed, heldout, device) if do_read else {}
     res.update({"seed": seed, "steps": steps, "t_range": list(t_range), "t_sampling": t_sampling, "t_mix": float(t_mix),
                 "trainable": trainable if isinstance(trainable, str) else sorted(trainable), "trained_numbers": n_par,
                 "all_numbers": n_all, "train_seconds": seconds, "peak_memory_mib": peak, "curve": curve,
@@ -629,7 +652,7 @@ def fit(a: Dict[str, Any], bed, seed: int, log: Callable[[str], None]) -> dict:
     if a["init"]:
         loaded = compat.load_legacy_files(model, [p.format(seed=seed) for p in a["init"].split(",")], device)
     set_trainable(model, a["train"], loaded)
-    frozen_before = {k: v.detach().clone() for k, v in model.named_parameters() if not v.requires_grad}
+    frozen_before = {k: v.detach().cpu().clone() for k, v in model.named_parameters() if not v.requires_grad}
     if int(a["stage_zero"]) and model.stage_units and (loaded is None or loaded["stage_new"]):
         zc = torch.randn((4,) + tuple(bed.field_shape), device=device)
         tc = torch.tensor([0.1, 0.4, 0.7, 0.9], device=device)
@@ -686,7 +709,7 @@ def fit(a: Dict[str, Any], bed, seed: int, log: Callable[[str], None]) -> dict:
                         at_step=at_step if read_steps else None, t_mix=float(a["t_mix"]))
     train_s = time.time() - t0
     named = dict(model.named_parameters())
-    frozen_same = all(torch.equal(v, named[k]) for k, v in frozen_before.items())
+    frozen_same = all(torch.equal(v, named[k].detach().cpu()) for k, v in frozen_before.items())
     res = read(model, bed, a["heldout"], device)
     args = {k: a[k] for k in sorted(a) if not (k in RANGE_KEYS and a[k] == DEFAULTS[k])}
     res.update({"tag": tag, "seed": seed, "trained_numbers": n_par, "all_numbers": n_all, "train_seconds": train_s, "curve": curve,

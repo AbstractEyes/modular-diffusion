@@ -69,7 +69,7 @@ def head_equations(model, bed, seed: int, batches: int, batch: int = 128, cond_d
         gen = step_generator(seed, k, device)
         x, cls = bed.train_batch(batch, gen)
         zt, t, c, target = model.draw(x, cls, gen, cond, "uniform", (lo, hi))
-        parts, h, _, _ = model.components(zt, t, c)
+        parts, h, _, _ = model.components(zt, t, c, skip=[head.name])
         others = [v for key, v in parts.items() if key != label]
         rest = torch.stack(others).sum(dim=0) if others else torch.zeros_like(target)
         y = patchify(target - rest, model.patch).reshape(-1, p).double()
@@ -202,9 +202,9 @@ def part_equations(model, bed, seed: int, batches: int, names: Sequence[str], ba
     k1 = d + 1
     gs = [torch.zeros(len(g) * k1, len(g) * k1, dtype=torch.float64, device=device) for g in groups]
     rs = [torch.zeros(len(g) * k1, p, dtype=torch.float64, device=device) for g in groups]
-    yys = [0.0 for _ in groups]
-    rows = [0 for _ in groups]
-    part_rows = {n: 0 for n in names}
+    yys_t = torch.zeros(len(groups), dtype=torch.float64, device=device)
+    rows_t = torch.zeros(len(groups), dtype=torch.long, device=device)
+    part_rows_t = torch.zeros(len(names), dtype=torch.long, device=device)
     cond = float(cond_drop) if getattr(bed, "n_classes", 0) else 0.0
     lo, hi = (float(x) for x in t_range)
     with_symbols = symbol_gated(model)
@@ -219,24 +219,26 @@ def part_equations(model, bed, seed: int, batches: int, names: Sequence[str], ba
         b = target.shape[0]
         y_all = patchify(target - rest, model.patch).reshape(b, -1, p).double()
         f = units[0].head.norm(h).double()                                     # [B, N, d]
-        f1 = torch.cat([f, torch.ones(f.shape[0], f.shape[1], 1, dtype=f.dtype, device=f.device)], dim=2)
-        gates = [(u.gate(t, c, sym) if u.symbol_gate else u.gate(t, c)).double() for u in units]
         n_tok = f.shape[1]
-        for j, n in enumerate(names):
-            part_rows[n] += int((gates[j] > 0).sum()) * n_tok
+        f1 = torch.cat([f, torch.ones(b, n_tok, 1, dtype=f.dtype, device=f.device)], dim=2)
+        gates = torch.stack([(u.gate(t, c, sym) if u.symbol_gate else u.gate(t, c)).double() for u in units], dim=1)
+        part_rows_t += (gates > 0).sum(dim=0) * n_tok
+        # Per-sample normal equations shared across every group: avoids [B'*N, M*(d+1)] Kronecker allocation
+        a_mat = torch.bmm(f1.transpose(1, 2), f1)                              # [B, k1, k1]
+        b_mat = torch.bmm(f1.transpose(1, 2), y_all)                           # [B, k1, P]
+        yy_row = (y_all * y_all).sum(dim=(1, 2))                               # [B]
         for gi, g in enumerate(groups):
-            on = torch.zeros(b, dtype=torch.bool, device=device)
-            for j in g:
-                on |= gates[j] > 0
-            idx = torch.nonzero(on, as_tuple=False).squeeze(1)
-            if idx.numel() == 0:
-                continue
-            feats = torch.cat([gates[j][idx].view(-1, 1, 1) * f1[idx] for j in g], dim=2).reshape(-1, len(g) * k1)
-            y = y_all[idx].reshape(-1, p)
-            gs[gi] += feats.T @ feats
-            rs[gi] += feats.T @ y
-            yys[gi] += float((y * y).sum())
-            rows[gi] += int(feats.shape[0])
+            gm = gates[:, g]                                                   # [B, M]
+            on = (gm > 0).any(dim=1)
+            m = len(g)
+            w_pair = gm[:, :, None] * gm[:, None, :]                           # [B, M, M]
+            gs[gi] += torch.einsum("bij,bkl->ikjl", w_pair, a_mat).reshape(m * k1, m * k1)
+            rs[gi] += torch.einsum("bi,bkp->ikp", gm, b_mat).reshape(m * k1, p)
+            yys_t[gi] += (on.double() * yy_row).sum()
+            rows_t[gi] += on.sum() * n_tok
+    yys = [float(x) for x in yys_t.cpu().tolist()]
+    rows = [int(x) for x in rows_t.cpu().tolist()]
+    part_rows = {n: int(v) for n, v in zip(names, part_rows_t.cpu().tolist())}
     return {"names": names, "groups": [[names[j] for j in g] for g in groups], "G": [x.cpu() for x in gs],
             "R": [x.cpu() for x in rs], "yy": yys, "rows": rows, "part_rows": part_rows, "d": d, "P": p,
             "batches": int(batches), "batch": int(batch), "t_range": [lo, hi], "cond_drop": cond, "seed": int(seed)}
@@ -324,13 +326,18 @@ def install_parts(model, solution: Dict[str, Any], eq: Dict[str, Any]) -> Dict[s
     return out
 
 
+def _with_copied_head(model) -> Any:
+    from .model import Model
+    dev = _device_of(model)
+    units = [copy.deepcopy(u) if u is model.head else u for u in model.units]
+    return Model(model.build, units).to(dev)
+
+
 def stage_clusters(model, n: int) -> List[Any]:
-    """n clusters of a finished one-head model: copies that share every unit except the head (``staged.share``)."""
-    from .staged import share
+    """n clusters of a finished one-head model: copies that share every unit except the head."""
     if model.head is None:
         raise ValueError("the model has no head")
-    clusters = [model] + [copy.deepcopy(model) for _ in range(int(n) - 1)]
-    return share(clusters, [u.name for u in model.units if u is not model.head])
+    return [model] + [_with_copied_head(model) for _ in range(int(n) - 1)]
 
 
 def solve_stage_heads(model, bed, seed: int, batches: int, cuts: Sequence[float], soft: float,
@@ -343,8 +350,9 @@ def solve_stage_heads(model, bed, seed: int, batches: int, cuts: Sequence[float]
     cards). The model's own head is left as it was (cluster 0 is a copy)."""
     from .linker import export_build
     from .staged import Staged, write_staged
-    src = copy.deepcopy(model)
-    clusters = stage_clusters(src, len(train_ranges))
+    if model.head is None:
+        raise ValueError("the model has no head")
+    clusters = [_with_copied_head(model) for _ in range(len(train_ranges))]
     names = [f"stage_{s}" for s in range(len(clusters))]
     provs = []
     for s, (c, rng) in enumerate(zip(clusters, train_ranges)):

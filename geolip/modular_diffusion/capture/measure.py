@@ -49,7 +49,7 @@ def single_changes(shape: Shape = FULL) -> List[Tuple[str, Shape]]:
 
 @torch.no_grad()
 def removal_scores(teacher, probe, bands: Sequence[str] = BANDS, text: bool = True,
-                   log=print) -> dict:
+                   log=print, references: Optional[Dict[str, Dict[int, Tensor]]] = None) -> dict:
     """For each band, the born read of each single change of the teacher's shape (``single_changes``). The teacher's
     answers are computed once a band and every engine once, so the cost is six engine builds and, per band, the probe's
     forwards of the teacher and of the six engines. Returns {"rows": [{band, change, shape, mse, params, share}, ...],
@@ -58,7 +58,8 @@ def removal_scores(teacher, probe, bands: Sequence[str] = BANDS, text: bool = Tr
     from .reads import band_read, teacher_answers
     unet = teacher.unet
     total = param_count(unet)
-    refs = {b: teacher_answers(teacher, probe, b) for b in bands}
+    refs = {b: (references[b] if references is not None and b in references
+                else teacher_answers(teacher, probe, b)) for b in bands}
     rows: List[dict] = []
     table: Dict[str, Dict[str, float]] = {b: {} for b in bands}
     for change, shape in single_changes():
@@ -89,17 +90,51 @@ class PromptSwap(nn.Module):
         self.teacher = teacher
         self.true_states = true_states
         self.replacement = replacement
+        self._cache_key: Optional[Tuple[torch.device, torch.dtype]] = None
+        self._cached_ref: Optional[Tensor] = None
+        self._cached_rep: Optional[Tensor] = None
+
+    def _pair(self, device: torch.device, dtype: torch.dtype) -> Tuple[Tensor, Tensor]:
+        key = (device, dtype)
+        if self._cache_key != key:
+            self._cached_ref = self.true_states.to(device, dtype).reshape(self.true_states.shape[0], -1)
+            self._cached_rep = self.replacement.to(device, dtype)
+            self._cache_key = key
+        return self._cached_ref, self._cached_rep
 
     def swap(self, states: Tensor) -> Tensor:
-        flat = states.reshape(states.shape[0], -1)
-        ref = self.true_states.to(states.device, states.dtype).reshape(self.true_states.shape[0], -1)
-        same = (flat[:, None, :] == ref[None, :, :]).all(dim=2)          # [rows, prompts]
-        hit = same.any(dim=1)
+        r = states.shape[0]
+        n = self.true_states.shape[0]
+        flat = states.reshape(r, -1)
+        ref, rep = self._pair(states.device, states.dtype)
+        # Fast path for the standard guided() layout [empty; true_states]: O(N * D) instead of O(N^2 * D)
+        if r == 2 * n and n > 0:
+            if (bool((flat[n:] == ref).all())
+                    and bool((flat[:n] == flat[0:1]).all())
+                    and not bool((flat[0:1] == ref).all(dim=1).any())):
+                return torch.cat([states[:n], rep], dim=0)
+        elif r == n and n > 0 and bool((flat == ref).all()):
+            return rep
+        # Exact chunked fallback: bounded peak memory even for large batches
+        hit = torch.zeros(r, dtype=torch.bool, device=states.device)
+        which = torch.zeros(r, dtype=torch.long, device=states.device)
+        row_chunk = 4
+        ref_chunk = 8
+        for i in range(0, r, row_chunk):
+            fi = flat[i:i + row_chunk]
+            hi = hit[i:i + row_chunk]
+            wi = which[i:i + row_chunk]
+            for j in range(0, n, ref_chunk):
+                rj = ref[j:j + ref_chunk]
+                same = (fi[:, None, :] == rj[None, :, :]).all(dim=2)
+                found = same.any(dim=1)
+                new = found & ~hi
+                if bool(new.any()):
+                    wi[new] = j + same[new].float().argmax(dim=1)
+                    hi |= new
         if not bool(hit.any()):
             return states
-        which = same.float().argmax(dim=1)
-        rep = self.replacement.to(states.device, states.dtype)[which]
-        return torch.where(hit.view(-1, 1, 1), rep, states)
+        return torch.where(hit.view(-1, 1, 1), rep[which], states)
 
     def forward(self, z: Tensor, t: Tensor, states: Tensor) -> Tensor:
         return self.teacher.predict(z, t, self.swap(states))
@@ -137,7 +172,7 @@ def text_need(teacher, prompts: Sequence[str], seed: int = 0, steps: int = 50, g
               process=getattr(teacher, "process", None))
     ref = sample(teacher, states, empty, int(seed), **kw)
     again = _mse(sample(teacher, states, empty, int(seed), **kw), ref) if repeat else None
-    everywhere = _mse(sample(teacher, empty, empty, int(seed), **kw), ref)
+    everywhere = _mse(sample(teacher, empty, empty, int(seed), **dict(kw, guidance=1.0)), ref)
     rows: List[dict] = []
     table: Dict[str, Dict[str, float]] = {}
     for b in bands:
@@ -156,9 +191,11 @@ def text_need(teacher, prompts: Sequence[str], seed: int = 0, steps: int = 50, g
             "guidance": float(guidance), "seed": int(seed), "prompts": n}
 
 
-def cost(teacher, shape, batch: int = 1, size: Optional[int] = None, repeats: int = 3, step: int = 500) -> dict:
+def cost(teacher, shape, batch: int = 1, size: Optional[int] = None, repeats: int = 3, step: int = 500,
+         teacher_seconds: Optional[float] = None) -> dict:
     """Measured seconds of one forward of the shape's engine and of the teacher, at ``batch`` rows of ``size`` x
     ``size`` latents (the teacher's sample size by default), at one step: {"shape", "params", "teacher_params",
     "share", "seconds", "teacher_seconds", "cost", "batch", "size"} (``engine.shape_report``)."""
     from .engine import shape_report
-    return shape_report(teacher, shape_from(shape), batch=int(batch), size=size, repeats=int(repeats), step=int(step))
+    return shape_report(teacher, shape_from(shape), batch=int(batch), size=size, repeats=int(repeats),
+                        step=int(step), teacher_seconds=teacher_seconds)

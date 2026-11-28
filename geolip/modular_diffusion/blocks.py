@@ -29,6 +29,18 @@ def identity_rotary(q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
     return q, k
 
 
+_EYE_CACHE: dict = {}
+
+
+def _eye_mask(n: int, device: torch.device) -> Tensor:
+    key = (n, device)
+    cached = _EYE_CACHE.get(key)
+    if cached is None:
+        cached = torch.eye(n, dtype=torch.bool, device=device)
+        _EYE_CACHE[key] = cached
+    return cached
+
+
 class SelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int):
         super().__init__()
@@ -47,7 +59,7 @@ class SelfAttention(nn.Module):
         if key_mask is None:
             y = F.scaled_dot_product_attention(q, k, v)
         else:
-            eye = torch.eye(n, dtype=torch.bool, device=x.device)
+            eye = _eye_mask(n, x.device)
             allowed = key_mask.to(device=x.device, dtype=torch.bool)[:, None, None, :] | eye[None, None]
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=allowed)
         return self.out(y.transpose(1, 2).reshape(b, n, d))

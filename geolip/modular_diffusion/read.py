@@ -21,7 +21,7 @@ import math
 import numpy as np
 import torch
 
-from .spectral import band_masks, band_power as _band_power
+from .spectral import band_masks, band_power as _band_power, patchify, to_grid
 from .units import NULL_CLASS
 
 T_GRID = (0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95)
@@ -37,6 +37,14 @@ def band_power(model, x):
     return _band_power(x, model.patch, model.grid)
 
 
+def _token_fft(x, patch: int, grid: int):
+    return torch.fft.fft2(to_grid(patchify(x.double(), patch), grid)) / grid
+
+
+def _fft_power(f):
+    return (f.real ** 2 + f.imag ** 2).mean(dim=(0, 1))
+
+
 def attention_read(member, h, ctx, e, grid):
     """Where the first block of a member attends: mean Chebyshev distance, weight on itself, weight within 3 x 3."""
     blk = member.blocks[0]
@@ -50,8 +58,9 @@ def attention_read(member, h, ctx, e, grid):
     idx = torch.arange(n, device=h.device)
     rr, cc = idx // grid, idx % grid
     dist = torch.maximum((rr[:, None] - rr[None, :]).abs(), (cc[:, None] - cc[None, :]).abs()).float()
-    return {"mean_distance": float((att * dist).sum(-1).mean()), "on_itself": float(att.diagonal(dim1=-2, dim2=-1).mean()),
-            "in_3x3_block": float((att * (dist <= 1)).sum(-1).mean())}
+    vals = torch.stack([(att * dist).sum(-1).mean(), att.diagonal(dim1=-2, dim2=-1).mean(),
+                        (att * (dist <= 1)).sum(-1).mean()]).tolist()
+    return {"mean_distance": vals[0], "on_itself": vals[1], "in_3x3_block": vals[2]}
 
 
 def read_symbols(model, n: int, device):
@@ -74,8 +83,7 @@ def read(model, bed, heldout: int, device) -> dict:
     def kw(sl):                                      # the rows' symbols, only for a model with symbol-gated units
         return {} if sym is None else {"symbols": sym[sl]}
 
-    masks, _ = band_masks(model.grid, 3)
-    masks = [m.to(device) for m in masks]
+    masks_cpu, _ = band_masks(model.grid, 3)
     chunk = CHUNK
     stage_names = [u.name for u in model.stage_units]
     out = {"members": [m.name for m in model.members], "stage_edges": model.edges}
@@ -87,16 +95,19 @@ def read(model, bed, heldout: int, device) -> dict:
         tt = t_u[sl].view(-1, 1, 1, 1)
         v = model.velocity((1 - tt) * z0[sl] + tt * z1[sl], t_u[sl], cls[sl], **kw(sl))
         per.append(((v - (z1[sl] - z0[sl])) ** 2).mean(dim=(1, 2, 3)).double())
-    per = torch.cat(per)
-    out["heldout_loss"] = float(per.mean())
-    bins = torch.clamp((t_u * 10).long(), max=9)
-    out["loss_by_level_bin"] = [float(per[bins == b].mean()) if bool((bins == b).any()) else None for b in range(10)]
+    per_cpu = torch.cat(per).cpu()
+    out["heldout_loss"] = float(per_cpu.mean())
+    bins_cpu = torch.clamp((t_u.cpu() * 10).long(), max=9)
+    out["loss_by_level_bin"] = [float(per_cpu[bins_cpu == b].mean()) if bool((bins_cpu == b).any()) else None
+                                for b in range(10)]
 
     # (2) at ten fixed noise levels
     levels = {}
     n_lv = min(n_held, LEVEL_ITEMS)
     member_parts = {m.part for m in model.members}
     class_anchor = model.anchor is not None and getattr(model.anchor, "symbols", 0) > 0
+    patch, grid = model.patch, model.grid
+    cls_cpu_all = cls[:n_lv].cpu() if bed.n_classes else None
     for t in T_GRID:
         acc = {}
         att = {}
@@ -115,47 +126,72 @@ def read(model, bed, heldout: int, device) -> dict:
             def add(key, p):
                 acc[key] = acc.get(key, 0) + p * w
 
-            add("err", band_power(model, full - target))
-            add("linear", band_power(model, model.anchor_velocity(zt, tt, cls[sl]) - target))
+            f_target = _token_fft(target, patch, grid)
+            f_parts = {k: _token_fft(v, patch, grid) for k, v in parts.items()}
+            if f_parts:
+                f_full = sum(f_parts.values())
+            else:
+                f_full = torch.zeros_like(f_target)
+            f_err = f_full - f_target
+            add("err", _fft_power(f_err))
+            if "anchor" in f_parts:
+                f_anc = f_parts["anchor"]
+            else:
+                f_anc = _token_fft(model.anchor_velocity(zt, tt, cls[sl]), patch, grid)
+            add("linear", _fft_power(f_anc - f_target))
             if class_anchor:                                   # the per-class anchor read without the class
-                add("linear_null", band_power(model, model.anchor_velocity(zt, tt) - target))
-            add("zero", band_power(model, target))
+                add("linear_null", _fft_power(_token_fft(model.anchor_velocity(zt, tt), patch, grid) - f_target))
+            add("zero", _fft_power(f_target))
             mem = [k for k in parts if k in member_parts]
             if mem:
-                add("err_all_members_off", band_power(model, full - torch.stack([parts[k] for k in mem]).sum(dim=0) - target))
-            for k, v in parts.items():
-                add("off:" + k, band_power(model, full - v - target))
-                add("out:" + k, band_power(model, v))
+                f_mem = sum(f_parts[k] for k in mem)
+                add("err_all_members_off", _fft_power(f_err - f_mem))
+            for k, fk in f_parts.items():
+                add("off:" + k, _fft_power(f_err - fk))
+                add("out:" + k, _fft_power(fk))
             if stage_names:                                    # the stage units: read by skipping them
                 parts2, _, _, _ = model.components(zt, tt, cls[sl], skip=stage_names, **kw(sl))
                 full2 = torch.stack(list(parts2.values())).sum(dim=0) if parts2 else torch.zeros_like(zt)
-                add("off:stage_body", band_power(model, full2 - target))
-                add("out:stage_body", band_power(model, full - full2))
+                f_full2 = _token_fft(full2, patch, grid)
+                add("off:stage_body", _fft_power(f_full2 - f_target))
+                add("out:stage_body", _fft_power(f_full - f_full2))
             if i == 0 and abs(t - 0.45) < 1e-9 and h is not None:       # a staged model returns no trunk state
                 for m in model.members:
                     if len(m.blocks) == 0:                     # a part with no block attends nowhere
                         continue
-                    g =(m.gate(tt, cls[sl], kw(sl).get("symbols")) if getattr(m, "symbol_gate", False)
+                    g = (m.gate(tt, cls[sl], kw(sl).get("symbols")) if getattr(m, "symbol_gate", False)
                          else m.gate(tt, cls[sl]))
                     if bool((g > 0).any()):
                         att[m.name] = attention_read(m, h, ctx, e, model.grid)
             if bed.n_classes:
-                animals = (cls[sl] >= 2) & (cls[sl] <= 7)
+                cls_c = cls_cpu_all[sl]
+                animals_c = (cls_c >= 2) & (cls_c <= 7)
+                vehicles_c = ~animals_c
                 e_full = ((full - target) ** 2).mean(dim=(1, 2, 3)).double()
+                e_full_c = e_full.cpu()
                 for c in range(10):
-                    cm = cls[sl] == c
-                    csum[c] += float(e_full[cm].sum())
+                    cm = cls_c == c
+                    csum[c] += float(e_full_c[cm].sum())
                     ccnt[c] += int(cm.sum())
                 v_null = model.velocity(zt, tt, torch.full_like(cls[sl], NULL_CLASS))
-                add("err_null", band_power(model, v_null - target))
-                for k, v in parts.items():
-                    d_off = ((full - v - target) ** 2).mean(dim=(1, 2, 3)).double() - e_full
-                    for gname, gm in (("animals", animals), ("vehicles", ~animals)):
-                        gsum[(k, gname)] = gsum.get((k, gname), 0.0) + float(d_off[gm].sum())
-                        gcnt[(k, gname)] = gcnt.get((k, gname), 0) + int(gm.sum())
+                add("err_null", _fft_power(_token_fft(v_null, patch, grid) - f_target))
+                if parts:
+                    part_keys = list(parts.keys())
+                    d_offs = torch.stack([((full - parts[k] - target) ** 2).mean(dim=(1, 2, 3)).double() - e_full
+                                          for k in part_keys]).cpu()
+                    n_ani = int(animals_c.sum())
+                    n_veh = int(vehicles_c.sum())
+                    for pi, k in enumerate(part_keys):
+                        d_off_c = d_offs[pi]
+                        gsum[(k, "animals")] = gsum.get((k, "animals"), 0.0) + float(d_off_c[animals_c].sum())
+                        gcnt[(k, "animals")] = gcnt.get((k, "animals"), 0) + n_ani
+                        gsum[(k, "vehicles")] = gsum.get((k, "vehicles"), 0.0) + float(d_off_c[vehicles_c].sum())
+                        gcnt[(k, "vehicles")] = gcnt.get((k, "vehicles"), 0) + n_veh
+
+        acc = {k: v.cpu() for k, v in acc.items()}
 
         def by_band(p):
-            d = {n: float(p[m].mean()) for n, m in zip(READ_BANDS, masks)}
+            d = {n: float(p[m].mean()) for n, m in zip(READ_BANDS, masks_cpu)}
             d["all"] = float(p.mean())
             return d
 
@@ -168,7 +204,7 @@ def read(model, bed, heldout: int, device) -> dict:
         keys = [k[4:] for k in acc if k.startswith("off:")]
         row["off_cost"] = {k: {n: v - row["error"][n] for n, v in by_band(acc["off:" + k]).items()} for k in keys}
         row["output_share"] = {k: {n: float(acc["out:" + k][m].sum() / acc["out:" + k].sum().clamp_min(1e-30))
-                                    for n, m in zip(READ_BANDS, masks)} for k in keys}
+                                    for n, m in zip(READ_BANDS, masks_cpu)} for k in keys}
         row["output_power"] = {k: float(acc["out:" + k].mean()) for k in keys}
         if "err_all_members_off" in acc:
             all_off = float(acc["err_all_members_off"].mean()) - row["error"]["all"]

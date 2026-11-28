@@ -500,8 +500,8 @@ def _run_timing(a: dict, log) -> dict:
     folder = os.path.join(a["out"], "timing_engine")
     k = 0 if a["kind"] in C.THING_KINDS else None
     C.train_engine(a["kind"], k, bed, int(a["seed"]), folder, steps=int(a["steps"]), batch=int(a["batch"]),
-                   every=0, heldout=int(a["heldout"]), dim=int(a["dim"]), heads=int(a["heads"]),
-                   depth=int(a["depth"]), save_every=0, read=a["read"], log=log)
+                   every=0, heldout=min(int(a["heldout"]), 16), dim=int(a["dim"]), heads=int(a["heads"]),
+                   depth=int(a["depth"]), save_every=0, read=a["read"], log=log, sync_steps=True)
     with open(os.path.join(folder, "checkpoint.json"), encoding="utf-8") as fh:
         secs = json.load(fh)["step_seconds"]
     tail = sorted(secs[int(a["from_step"]):]) or sorted(secs)
@@ -532,13 +532,15 @@ def _run_compose(a: dict, log) -> dict:
     else:
         answer, desc = (None, "REAL: real scenes of the lists") if row == "REAL" else build_row(row, parts)
     by_n, sheets, unswapped, exact = {}, {}, {}, {}
+    need_real = row == "REAL" or a["bed"] == "C"
     for n, L in lists_for(a).items():
         t0 = time.time()
-        real = real_pixels(L["cells"], L["colors"], a["bed"], L["noise_seed"])
+        real = real_pixels(L["cells"], L["colors"], a["bed"], L["noise_seed"]) if need_real else None
         z = None if row == "REAL" else _sample_lists(answer, L, a)
         pix = real if row == "REAL" else made_pixels(z)
         rd = judge_reads(judge, pix, L["cells"], L["colors"], cell_rights=bool(swap))
-        rd.update(picture_reads(pix, L["cells"], L["colors"], a["bed"], real))
+        pic_rd = picture_reads(pix, L["cells"], L["colors"], a["bed"], real)
+        rd.update(pic_rd)
         rd["seconds"] = time.time() - t0
         by_n[str(n)] = rd
         if n in (4, 9) or a["lists"]:
@@ -547,18 +549,19 @@ def _run_compose(a: dict, log) -> dict:
             f"ghosts {rd['ghosts']['mean'] if rd['ghosts']['mean'] is not None else '-'}; {rd['seconds']:.0f} s")
         for name, jm in more:                    # a further judge reads the same pictures
             by_judge[name][str(n)] = dict(judge_reads(jm, pix, L["cells"], L["colors"], cell_rights=bool(swap)),
-                                          **picture_reads(pix, L["cells"], L["colors"], a["bed"], real))
+                                          **pic_rd)
         if swap:
             t1 = time.time()
             z_u = _sample_lists(answer_u, L, a)
             pix_u = made_pixels(z_u)
             ru = judge_reads(judge, pix_u, L["cells"], L["colors"], cell_rights=True)
-            ru.update(picture_reads(pix_u, L["cells"], L["colors"], a["bed"], real))
+            pic_ru = picture_reads(pix_u, L["cells"], L["colors"], a["bed"], real)
+            ru.update(pic_ru)
             ru["seconds"] = time.time() - t1
             unswapped[str(n)] = ru
             for name, jm in more:
                 unswapped_by[name][str(n)] = dict(judge_reads(jm, pix_u, L["cells"], L["colors"], cell_rights=True),
-                                                  **picture_reads(pix_u, L["cells"], L["colors"], a["bed"], real))
+                                                  **pic_ru)
             exact[str(n)] = exchange_exact(pix, pix_u, L["cells"], sorted(swap), S.to_pixels(z), S.to_pixels(z_u))
             log(f"{row} n={n} unexchanged: cell rate {ru['cell_rate']['mean']:.3f}, scene right "
                 f"{ru['scene_right']['mean']:.3f}; largest difference outside the exchanged cells "
@@ -656,6 +659,29 @@ def _run_controls(a: dict, log) -> dict:
             "inconclusive": any(not u["descended"] for u in parts.used)}
 
 
+def _exact_row_handles(row: str, parts: Parts):
+    """Build a collective row's base engines once so twin exchanges and snap-in reuse them without reloading."""
+    a = parts.a
+    cells = parse_cells(a["part_cells"])
+    read = "rotary" if row == "R1r" else "embedding"
+    if row in ("R1", "R1r"):
+        things = {k: parts.get("addressed_thing", k, read=read, cells=cells) for k in range(9)}
+        base = parts.get("addressed_base", None, read=read)
+        col = C.Collective(things, base, addressed=True)
+        return (lambda z, t, c, k: col.answer(z, t, c, k, "gate")), things, base, None, True, "gate", "addressed_thing", read, cells
+    if row in ("R2", "R3", "R4"):
+        things = {k: parts.get("whole_thing", k) for k in range(9)}
+        if row == "R4":
+            uncond = parts.get("whole_unconditional", None)
+            col = C.Collective(things, None, addressed=False, unconditional=uncond)
+            return (lambda z, t, c, k: col.answer(z, t, c, k, "sum_unconditional")), things, None, uncond, False, "sum_unconditional", "whole_thing", "embedding", None
+        base = parts.get("whole_empty", None)
+        join = "gate" if row == "R2" else "sum_empty"
+        col = C.Collective(things, base, addressed=False)
+        return (lambda z, t, c, k: col.answer(z, t, c, k, join)), things, base, None, False, join, "whole_thing", "embedding", None
+    return None
+
+
 def _run_exact(a: dict, log) -> dict:
     parts = Parts(a)
     L4 = S.request_lists(4, int(a["count"]), seed=LIST_SEED + 4)
@@ -667,7 +693,11 @@ def _run_exact(a: dict, log) -> dict:
     noise = C.start_noise(int(a["count"]), NOISE_SEED + 4)
     out = {}
     for row in [r.strip() for r in str(a["rows"]).split(",") if r.strip()]:
-        base_answer, _ = build_row(row, parts)
+        handles = _exact_row_handles(row, parts)
+        if handles is not None:
+            base_answer, things, base, uncond, addressed, join, thing_kind, read, cells = handles
+        else:
+            base_answer, _ = build_row(row, parts)
         ex = []
         first_cls = first["cells"].gather(1, first["order"][:, :1])[:, 0]      # the class of each list's first request
         for k in range(9):
@@ -675,12 +705,23 @@ def _run_exact(a: dict, log) -> dict:
             if not sel.numel():
                 continue
             cs, ks = first["cells"][sel], first["colors"][sel]
-            twin_answer, _ = build_row(row, parts, twin={k: int(a["twin_seed"])})
+            if handles is not None:
+                tw_things = dict(things)
+                tw_things[k] = parts.get(thing_kind, k, seed=int(a["twin_seed"]), read=read, cells=cells)
+                tw_col = C.Collective(tw_things, base, addressed=addressed, unconditional=uncond)
+                twin_answer = lambda z, t, c, kk, _col=tw_col, _j=join: _col.answer(z, t, c, kk, _j)
+            else:
+                twin_answer, _ = build_row(row, parts, twin={k: int(a["twin_seed"])})
             z_a = C.sample(base_answer, cs, ks, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]), noise=noise[sel])
             z_b = C.sample(twin_answer, cs, ks, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]), noise=noise[sel])
             o, i = C.outside_inside(made_pixels(z_a), made_pixels(z_b), cs, k)
             ex.append({"class": k, "lists": int(sel.numel()), "largest_outside": o, "mean_inside": i})
-        without, _ = build_row(row, parts, without=(8,))
+        if handles is not None:
+            wo_col = C.Collective({kk: v for kk, v in things.items() if kk != 8}, base,
+                                  addressed=addressed, unconditional=uncond)
+            without = lambda z, t, c, kk, _col=wo_col, _j=join: _col.answer(z, t, c, kk, _j)
+        else:
+            without, _ = build_row(row, parts, without=(8,))
         z_a = C.sample(without, snap["cells"], snap["colors"], 0, int(a["sample_steps"]), a["device"], int(a["chunk"]),
                        noise=noise[idx])
         z_b = C.sample(base_answer, snap["cells"], snap["colors"], 0, int(a["sample_steps"]), a["device"],
@@ -872,18 +913,17 @@ def _run_draw(a: dict, log) -> dict:
         z = C.sample(answer, cells, colors, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]), noise=noise)
         pix = made_pixels(z)
         judge = SJ.load_judge(folders[0], a["device"])
+        extra_judges = [(judge_name(f), SJ.load_judge(f, a["device"])) for f in folders[1:]]
         pt, pc = SJ.predict(judge, S.to_model(pix))
-        for f in folders[1:]:                    # a further judge reads the same pictures
-            jm = SJ.load_judge(f, a["device"])
-            more[judge_name(f)] = SJ.predict(jm, S.to_model(pix)), None
+        for name, jm in extra_judges:            # a further judge reads the same pictures
+            more[name] = SJ.predict(jm, S.to_model(pix)), None
         if swap:
             z_u = C.sample(answer_u, cells, colors, 0, int(a["sample_steps"]), a["device"], int(a["chunk"]), noise=noise)
             pix_u = made_pixels(z_u)
             pt_u, pc_u = SJ.predict(judge, S.to_model(pix_u))
             exact.append(exchange_exact(pix, pix_u, cells, sorted(swap), S.to_pixels(z), S.to_pixels(z_u)))
-            for f in folders[1:]:
-                jm = SJ.load_judge(f, a["device"])
-                more[judge_name(f)] = more[judge_name(f)][0], SJ.predict(jm, S.to_model(pix_u))
+            for name, jm in extra_judges:
+                more[name] = more[name][0], SJ.predict(jm, S.to_model(pix_u))
         engines = described if swap else parts.used
         bad = [u["tag"] for u in parts.used if not u["descended"]]
     elif swap:                                   # nothing drawn: the pairs are still checked; nothing to compare

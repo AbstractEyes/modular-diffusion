@@ -208,7 +208,7 @@ class Model(nn.Module):
 
     def components(self, zt: Tensor, t: Tensor, cls_idx: Tensor, only: Optional[Iterable[str]] = None,
                    scale: Optional[Dict[str, Tensor]] = None, skip: Iterable[str] = (),
-                   symbols: Optional[Tensor] = None):
+                   symbols: Optional[Tensor] = None, _va: Optional[Tensor] = None):
         """-> (parts {label: field [B, C, H, W]}, h, ctx, e).
 
         only: member names to run (the others are left out); scale: {member name: [B] weights} (member dropout);
@@ -218,7 +218,12 @@ class Model(nn.Module):
         out = {}
         anc = self.anchor
         use_out = anc is not None and anc.output and anc.name not in skip
-        va = self.anchor_velocity(zt, t, cls_idx) if (use_out or self.stem.anchor_in) else None
+        if _va is not None:
+            va = _va
+        elif use_out or self.stem.anchor_in:
+            va = self.anchor_velocity(zt, t, cls_idx)
+        else:
+            va = None
         if use_out:
             out[anc.part] = va
         x = self.patchify(zt)
@@ -253,6 +258,13 @@ class Model(nn.Module):
                     scale: Optional[Tensor] = None, symbols: Optional[Tensor] = None) -> Optional[Tensor]:
         """One member's field [B, C, H, W] from the trunk state (None when its gate is zero for every sample): the
         member runs on the gated rows only, its output is weighted by the gate, kept to its band, and zero elsewhere."""
+        if (scale is None and m.classes is None and not m.symbol_gate
+                and m.lo <= 0.0 and m.hi >= 1.0 and m.soft == 0.0):
+            y, _ = m(h, ctx, e)
+            y = y.float()
+            if m.keep:
+                y = self.keep_band(y, self.band_index(m))
+            return self.unpatchify(y)
         g = m.gate(t, cls_idx, symbols) if m.symbol_gate else m.gate(t, cls_idx)
         if scale is not None:
             g = g * scale

@@ -155,7 +155,12 @@ class Teacher:
         return self.tokenize([""] * int(batch))
 
     def empty_states(self, batch: int) -> Tensor:
-        one = self.text_states(self.empty_ids(1))
+        cached = getattr(self, "_empty_one_cache", None)
+        if cached is None or cached[0] != self.device or cached[1] != self.dtype:
+            one = self.text_states(self.empty_ids(1))
+            self._empty_one_cache = (self.device, self.dtype, one)
+        else:
+            one = cached[2]
         return one.expand(int(batch), -1, -1).clone()
 
     def to(self, device=None, dtype: Optional[torch.dtype] = None) -> "Teacher":
@@ -164,6 +169,7 @@ class Teacher:
             self.device = torch.device(device)
         if dtype is not None:
             self.dtype = dtype
+        self._empty_one_cache = None
         for m in (self.unet, self.text_encoder, self.vae):
             if m is not None:
                 m.to(device=self.device, dtype=self.dtype)
@@ -298,7 +304,8 @@ def with_unet(source: Teacher, folder: str) -> Teacher:
 
 def load_teacher(path: str, device="cpu", dtype: torch.dtype = torch.float32, vae: bool = False,
                  unet: Optional[str] = None, kind: str = "eps", shift: Optional[float] = None,
-                 unguided: Optional[str] = None, kappa: float = 1.0) -> Teacher:
+                 unguided: Optional[str] = None, kappa: float = 1.0,
+                 vae_dtype: Optional[torch.dtype] = None) -> Teacher:
     """The teacher from a local diffusers folder (unet/, text_encoder/, tokenizer/, scheduler/, and vae/ when asked),
     frozen, on ``device`` in ``dtype``. Never downloads.
 
@@ -322,19 +329,21 @@ def load_teacher(path: str, device="cpu", dtype: torch.dtype = torch.float32, va
     unet = _owned(unet.to(device=device, dtype=dtype))
     text = _owned(text.to(device=device, dtype=dtype))
     if v is not None:
-        v = _owned(v.to(device=device, dtype=dtype))
+        v = _owned(v.to(device=device, dtype=dtype if vae_dtype is None else vae_dtype))
     return Teacher(unet, text, tok, v, device, dtype, process=process, unguided=unguided, kappa=kappa)
 
 
 def _owned(module: nn.Module) -> nn.Module:
-    """Every tensor of a loaded module copied into ordinary memory of its own. Tensors read from a memory-mapped file
-    can sit at addresses the CPU kernels treat differently from freshly allocated ones, so the teacher and a copy of
-    its numbers (an inherited engine) could disagree in the last digits; after this they take the same path."""
+    """Every CPU tensor of a loaded module copied into ordinary memory of its own. Tensors read from a memory-mapped
+    file can sit at addresses the CPU kernels treat differently from freshly allocated ones, so the teacher and a copy
+    of its numbers (an inherited engine) could disagree in the last digits; after this they take the same path."""
     with torch.no_grad():
         for p in module.parameters():
-            p.data = p.data.clone()
+            if p.device.type == "cpu":
+                p.data = p.data.clone()
         for name, b in list(module.named_buffers()):
-            owner_name, _, leaf = name.rpartition(".")
-            owner = module.get_submodule(owner_name) if owner_name else module
-            owner._buffers[leaf] = b.clone()
+            if b is not None and b.device.type == "cpu":
+                owner_name, _, leaf = name.rpartition(".")
+                owner = module.get_submodule(owner_name) if owner_name else module
+                owner._buffers[leaf] = b.clone()
     return module

@@ -24,7 +24,7 @@ uniform step of its step set and, with probability rho (the whole-range share), 
 from __future__ import annotations
 
 import math
-from typing import List, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 from torch import Tensor
@@ -52,10 +52,25 @@ def band_index(band: Union[str, int]) -> int:
     return BANDS.index(band)
 
 
+_OWNERS_CACHE: Optional[List[frame.Owner]] = None
+_WEIGHTS_TABLE: Optional[Tensor] = None
+_BAND_STEPS_CACHE: Dict[int, Tensor] = {}
+
+
 def band_owners() -> List[frame.Owner]:
     """The three bands as declared owners of the address frame: windows on s = t / 1000 with the half-width 0.06."""
-    cuts = (0.0,) + EDGES + (1.0,)
-    return [frame.owner(cuts[i], cuts[i + 1], SOFT, name=name) for i, name in enumerate(BANDS)]
+    global _OWNERS_CACHE
+    if _OWNERS_CACHE is None:
+        cuts = (0.0,) + EDGES + (1.0,)
+        _OWNERS_CACHE = [frame.owner(cuts[i], cuts[i + 1], SOFT, name=name) for i, name in enumerate(BANDS)]
+    return list(_OWNERS_CACHE)
+
+
+def _weights_table() -> Tensor:
+    global _WEIGHTS_TABLE
+    if _WEIGHTS_TABLE is None:
+        _WEIGHTS_TABLE = frame.projective(band_owners(), _ALL.double() / STEPS)
+    return _WEIGHTS_TABLE
 
 
 def _steps(t: Steps) -> Tensor:
@@ -80,7 +95,7 @@ def band_coordinate(t: Steps) -> Tensor:
 
 def band_weights(t: Steps) -> Tensor:
     """[B, 3] float64: the weights of the bands (columns clean, middle, noisy) at the steps t, from the frame's gate."""
-    return frame.projective(band_owners(), band_coordinate(t))
+    return _weights_table()[_steps(t).cpu()]
 
 
 def band_weights_at(s: Union[float, Sequence[float], Tensor]) -> Tensor:
@@ -102,17 +117,22 @@ _ALL = torch.arange(STEPS)
 
 def band_steps(band: Union[str, int]) -> Tensor:
     """The band's step set: the steps 0 .. 999 where its weight is above zero, ascending."""
-    return _ALL[band_weight(_ALL, band) > 0]
+    idx = band_index(band)
+    cached = _BAND_STEPS_CACHE.get(idx)
+    if cached is None:
+        cached = _ALL[_weights_table()[:, idx] > 0]
+        _BAND_STEPS_CACHE[idx] = cached
+    return cached
 
 
 def core_steps(band: Union[str, int]) -> Tensor:
     """The steps where the band's weight is exactly one (no other band is asked there)."""
-    return _ALL[band_weight(_ALL, band) == 1.0]
+    return _ALL[_weights_table()[:, band_index(band)] == 1.0]
 
 
 def crossfade_steps() -> Tensor:
     """The steps where two bands are above zero."""
-    return _ALL[(band_weights(_ALL) > 0).sum(dim=1) > 1]
+    return _ALL[(_weights_table() > 0).sum(dim=1) > 1]
 
 
 def sample_steps(band: Union[str, int], n: int, rho: float, generator: torch.Generator) -> Tensor:
@@ -121,7 +141,9 @@ def sample_steps(band: Union[str, int], n: int, rho: float, generator: torch.Gen
     if not 0.0 <= float(rho) <= 1.0:
         raise ValueError(f"the whole-range share rho lies in [0, 1], not {rho}")
     dev = generator.device
-    own = band_steps(band).to(dev)
+    own = band_steps(band)
+    if own.device != dev:
+        own = own.to(dev)
     whole = torch.rand(n, generator=generator, device=dev) < float(rho)
     pick_own = own[torch.randint(len(own), (n,), generator=generator, device=dev)]
     pick_all = torch.randint(STEPS, (n,), generator=generator, device=dev)
@@ -142,8 +164,13 @@ def sd15_alphas_cumprod() -> Tensor:
 
 def add_noise(x0: Tensor, eps: Tensor, t: Tensor, alphas_cumprod: Tensor) -> Tensor:
     """z_t = sqrt(alpha_bar_t) x0 + sqrt(1 - alpha_bar_t) eps, one step per row, in x0's dtype."""
-    a = alphas_cumprod.to(device=x0.device)[t.to(x0.device).long()]
     shape = (-1,) + (1,) * (x0.dim() - 1)
-    sa = a.sqrt().to(x0.dtype).reshape(shape)
-    sb = (1.0 - a).sqrt().to(x0.dtype).reshape(shape)
+    if t.device == alphas_cumprod.device and alphas_cumprod.device != x0.device:
+        a = alphas_cumprod[t.long()]
+        sa = a.sqrt().to(dtype=x0.dtype).to(device=x0.device).reshape(shape)
+        sb = (1.0 - a).sqrt().to(dtype=x0.dtype).to(device=x0.device).reshape(shape)
+    else:
+        a = alphas_cumprod.to(device=x0.device)[t.to(x0.device).long()]
+        sa = a.sqrt().to(x0.dtype).reshape(shape)
+        sb = (1.0 - a).sqrt().to(x0.dtype).reshape(shape)
     return sa * x0 + sb * eps

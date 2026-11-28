@@ -219,7 +219,7 @@ def exchanged(sd_ref: Dict[str, Tensor], sd_don: Dict[str, Tensor], keys: Sequen
     """The reference's tensors ``keys`` (of its ``state_dict()``, which shares the module's memory) replaced in place by
     the donor's for the body of the ``with``, then restored from a saved copy; the yielded dict's "ok" says, after the
     ``with``, whether every restored tensor equals its saved copy element by element."""
-    saved = {k: sd_ref[k].detach().clone() for k in keys}
+    saved = {k: sd_ref[k].detach().cpu().clone() for k in keys}
     out = {"ok": None}
     try:
         with torch.no_grad():
@@ -230,7 +230,7 @@ def exchanged(sd_ref: Dict[str, Tensor], sd_don: Dict[str, Tensor], keys: Sequen
         with torch.no_grad():
             for k in keys:
                 sd_ref[k].copy_(saved[k])
-        out["ok"] = all(torch.equal(sd_ref[k], saved[k]) for k in keys)
+        out["ok"] = all(torch.equal(sd_ref[k].detach().cpu(), saved[k]) for k in keys)
         del saved
 
 
@@ -266,11 +266,11 @@ def _group_exchange(a: dict, log) -> dict:
     for name, keys in plan:
         t0 = time.time()
         with exchanged(sd_ref, sd_don, keys) as restore:
-            reads = {b: relative_read(_answers(ref_part, probe, steps[b]), refs[b]) for b in BANDS}
+            ans = {b: _answers(ref_part, probe, steps[b]) for b in BANDS}
+            reads = {b: relative_read(ans[b], refs[b]) for b in BANDS}
             extra = {}
             if name == "all":
-                extra = {"equals_donor": all(relative_read(_answers(ref_part, probe, steps[b]), donor_ans[b])["equal"]
-                                             for b in BANDS)}
+                extra = {"equals_donor": all(relative_read(ans[b], donor_ans[b])["equal"] for b in BANDS)}
         ok = restore["ok"]
         restored_ok = restored_ok and ok
         params = sum(sd_ref[k].numel() for k in keys)
@@ -489,22 +489,25 @@ def _sampler_check(a: dict, log) -> dict:
     states = source.text_states(ids)
     shape = _latent_shape(source)
     z0 = initial_noise(int(a["noise_seed"]), states.shape[0], shape).to(source.device)
-    lib_steps: List[Tensor] = []
-    seen = []
+    first_lib: List[Tensor] = []
+    step_idx = [0]
 
     def watch(t, z, eps):
-        seen.append(z.detach().clone())
+        if step_idx[0] == 1:
+            first_lib.append(z.detach().clone())
+        step_idx[0] += 1
 
     g = float(a["guidance"])
     n = int(a["sample_steps"])
     zl = sample(source, states, source.unguided_states(1), 0, n, g, latent_shape=shape, z=z0, process=source.process,
                 on_step=watch)
-    lib_steps = seen[1:] + [zl]                                   # the latents after each step
-    second: List[Tensor] = []
-    zs = second_flow_sampler(source.unet, states, z0, n, source.process.shift, g, on_step=lambda i, x: second.append(x.clone()))
+    lib_first = first_lib[0] if first_lib else zl                 # the latent after step 0
+    first_second: List[Tensor] = []
+    zs = second_flow_sampler(source.unet, states, z0, n, source.process.shift, g,
+                             on_step=lambda i, x: first_second.append(x.detach().clone()) if i == 0 else None)
     again = sample(source, states, source.unguided_states(1), 0, n, g, latent_shape=shape, z=z0, process=source.process)
-    first_diff = float((lib_steps[0].double() - second[0].double()).abs().max())
-    first_scale = float(lib_steps[0].double().abs().max())
+    first_diff = float((lib_first.double() - first_second[0].double()).abs().max())
+    first_scale = float(lib_first.double().abs().max())
     final_diff = float((zl.double() - zs.double()).abs().max())
     tol = float(a["tolerance"])
     out = {"source": where, "process": source.record(), "rows_sampled": int(states.shape[0]), "steps": n,

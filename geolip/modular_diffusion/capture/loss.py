@@ -18,14 +18,33 @@ from torch import Tensor
 
 
 def capture_loss(o_s: Tensor, o_t: Tensor, eps: Tensor, lam_out: float = 1.0,
-                 lam_data: float = 0.0) -> Tuple[Tensor, Dict[str, float]]:
+                 lam_data: float = 0.0, *, sync: bool = True) -> Tuple[Tensor, Dict[str, object]]:
     """-> (the loss to step on, {"out": the teacher term, "data": the noise term, "total"}). Both terms are computed
-    and reported whatever their weights; a term weighted 0 adds nothing to the gradient. Computed in float32."""
+    and reported whatever their weights; a term weighted 0 is computed without gradients and adds nothing to the
+    autograd graph. Computed in float32. ``sync=False`` returns detached scalar tensors instead of Python floats."""
     o_s = o_s.float()
-    out = (o_s - o_t.detach().float()).pow(2).mean()
-    data = (o_s - eps.detach().float()).pow(2).mean()
-    total = float(lam_out) * out + float(lam_data) * data
-    return total, {"out": float(out.detach()), "data": float(data.detach()), "total": float(total.detach())}
+    lo, ld = float(lam_out), float(lam_data)
+    if lo != 0.0:
+        out = (o_s - o_t.detach().float()).pow(2).mean()
+    else:
+        with torch.no_grad():
+            out = (o_s.detach() - o_t.detach().float()).pow(2).mean()
+    if ld != 0.0:
+        data = (o_s - eps.detach().float()).pow(2).mean()
+    else:
+        with torch.no_grad():
+            data = (o_s.detach() - eps.detach().float()).pow(2).mean()
+    if lo != 0.0 and ld != 0.0:
+        total = lo * out + ld * data
+    elif lo != 0.0:
+        total = out if lo == 1.0 else lo * out
+    elif ld != 0.0:
+        total = data if ld == 1.0 else ld * data
+    else:
+        total = o_s.sum() * 0.0
+    if sync:
+        return total, {"out": float(out.detach()), "data": float(data.detach()), "total": float(total.detach())}
+    return total, {"out": out.detach(), "data": data.detach(), "total": total.detach()}
 
 
 def drop_prompts(states: Tensor, empty: Tensor, p: float, generator: torch.Generator) -> Tuple[Tensor, Tensor]:

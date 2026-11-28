@@ -314,13 +314,20 @@ def snap_in(build: Union[str, Build], card_path: str) -> Build:
                     folder=b.folder)
         write_build(new, build_file)
         if card.birth.get("hash") and card.birth.get("hash") == card.hash:          # a newborn
-            gap = born_gap(link(new, strict=False), link(b, strict=False))
+            m_new = link(new, strict=False)
+            m_old = Model(b, list(m_new.units)[:-1])
+            gap = born_gap(m_new, m_old)
             if gap != 0.0:
                 raise StaleUnit(name, f"a newborn must change nothing; born_gap {gap}")
             if card.marks.get("born_gap") is None and dst_c in copied:
                 card.marks["born_gap"] = gap
                 write_card(card, dst_c)
-        link(new, strict=True)
+            bad = m_new.link_report["problems"]
+            if bad:
+                first = next(n for n in new.names() if n in bad)
+                raise StaleUnit(first, "; ".join(bad[first]), [n for n in new.names() if n in bad])
+        else:
+            link(new, strict=True)
         return new
     except BaseException:
         with open(build_file, "wb") as fh:
@@ -420,7 +427,7 @@ def export_build(model, folder: str, seed: Optional[int] = None, base: Union[Non
                 units = [newborn if x.name == u.name else x for x in model.units]
                 card.marks["born_gap"] = born_gap(Model(b, units).to(dev),
                                                   Model(_without(b, u.name), [x for x in model.units if x.name != u.name]).to(dev))
-            save_unit(u, card, folder)
+            save_unit(u, card, folder, _hash=h)
         entries.append(UnitEntry(e.name, e.type, dict(e.address), dict(e.spec), stream=e.stream, index=e.index,
                                  file=u.name + WEIGHTS_SUFFIX, hash=h))
     out = Build(name=name or b.name, geometry=dict(b.geometry), units=entries, info=dict(b.info), folder=os.path.abspath(folder))

@@ -48,6 +48,7 @@ class FeatureCache:
     def __init__(self, folder: str, meta: Dict[str, Any]):
         self.folder = folder
         self.meta = meta
+        self._mem: Optional[Dict[int, Dict[str, Tensor]]] = None
 
     @property
     def steps(self) -> int:
@@ -82,7 +83,7 @@ class FeatureCache:
                 gen = _step_generator(seed, step, device)
                 x, cls = bed.train_batch(batch, gen)
                 zt, t, cls_d, target = model.draw(x, cls, gen, cond_drop, t_sampling)
-                parts, h, ctx, e = model.components(zt, t, cls_d)
+                parts, h, ctx, e = model.components(zt, t, cls_d, skip=train)
                 rec = {"t": t, "cls": cls_d, "target": target, "h": h, "ctx": ctx, "e": e}
                 for label, v in parts.items():
                     if label not in skip_labels:
@@ -126,10 +127,16 @@ class FeatureCache:
 
     def batch(self, step: int, device="cpu") -> Dict[str, Tensor]:
         """The stored tensors of one step."""
+        from safetensors.torch import load_file
         if not 0 <= step < self.steps:
             raise IndexError(f"the cache holds steps 0..{self.steps - 1}, not {step}")
-        rec = read_weights(_step_file(self.folder, step))
-        return {k: v.to(device) for k, v in rec.items()}
+        if self._mem is not None:
+            rec = self._mem.get(step)
+            if rec is None:
+                rec = load_file(_step_file(self.folder, step), device="cpu")
+                self._mem[step] = rec
+            return {k: v.to(device) for k, v in rec.items()}
+        return load_file(_step_file(self.folder, step), device=str(device))
 
     # ------------------------------------------------------------------ training from the cache
     def parts(self, model, rec: Dict[str, Tensor]) -> Dict[str, Tensor]:
@@ -193,21 +200,29 @@ class FeatureCache:
         opt = torch.optim.Adam(params, lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0)
         model.train()
         t0 = time.time()
-        for step in range(steps):
-            for group in opt.param_groups:
-                group["lr"] = lr * min(1.0, (step + 1) / max(1, warmup))
-            loss = self.loss(model, step % self.steps)
-            if not loss.requires_grad:
-                continue
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if equalize:
-                equalize_grads(model)
-            opt.step()
-            if step % log_every == 0 or step == steps - 1:
-                curve.append([step, float(loss.detach())])
-                if log is not None:
-                    spent = time.time() - t0
-                    log(f"  cached step {step + 1}/{steps}  loss {float(loss.detach()):.4f}  spent {spent:.0f} s  "
-                        f"left about {spent / (step + 1) * (steps - step - 1):.0f} s")
+        use_mem = passes > 1 and steps > self.steps and self.size_bytes() <= 512 * 1024 * 1024
+        if use_mem:
+            self._mem = {}
+        try:
+            for step in range(steps):
+                for group in opt.param_groups:
+                    group["lr"] = lr * min(1.0, (step + 1) / max(1, warmup))
+                loss = self.loss(model, step % self.steps)
+                if not loss.requires_grad:
+                    continue
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                if equalize:
+                    equalize_grads(model)
+                opt.step()
+                if step % log_every == 0 or step == steps - 1:
+                    lv = float(loss.detach())
+                    curve.append([step, lv])
+                    if log is not None:
+                        spent = time.time() - t0
+                        log(f"  cached step {step + 1}/{steps}  loss {lv:.4f}  spent {spent:.0f} s  "
+                            f"left about {spent / (step + 1) * (steps - step - 1):.0f} s")
+        finally:
+            if use_mem:
+                self._mem = None
         return curve

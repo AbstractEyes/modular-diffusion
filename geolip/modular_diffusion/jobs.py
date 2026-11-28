@@ -146,17 +146,20 @@ def run_job(job: Job, out: str, python: str = sys.executable, env: Optional[Dict
     with open(os.path.join(d, "run.log"), "ab") as log:
         p = subprocess.Popen(cmd, cwd=d, env=env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                              creationflags=_no_window())
-        while p.poll() is None:
-            if end_at_cap and time.time() - t0 > cap_min * 60:
-                capped = True
-                p.terminate()
-                try:
-                    p.wait(timeout=grace_s)
-                except subprocess.TimeoutExpired:
-                    p.kill()
-                    p.wait()
+        while True:
+            try:
+                p.wait(timeout=poll_s)
                 break
-            time.sleep(poll_s)
+            except subprocess.TimeoutExpired:
+                if end_at_cap and time.time() - t0 > cap_min * 60:
+                    capped = True
+                    p.terminate()
+                    try:
+                        p.wait(timeout=grace_s)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait()
+                    break
     return p.returncode, time.time() - t0, capped
 
 

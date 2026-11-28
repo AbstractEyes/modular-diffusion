@@ -63,9 +63,11 @@ class PicturesBed:
                  dc_share: float = 0.060, without_classes=(), only_classes=None):
         self.device = device
         self.tilt = None
-        d = np.load(npz)
-        xtr = torch.from_numpy(d["x_train"]).permute(0, 3, 1, 2).float() / 255.0
-        xte = torch.from_numpy(d["x_test"]).permute(0, 3, 1, 2).float() / 255.0
+        with np.load(npz) as d:
+            xtr = torch.from_numpy(d["x_train"]).permute(0, 3, 1, 2).float() / 255.0
+            xte = torch.from_numpy(d["x_test"]).permute(0, 3, 1, 2).float() / 255.0
+            ytr_raw = d["y_train"]
+            yte_raw = d["y_test"]
         self.mean = xtr.mean(dim=(0, 2, 3), keepdim=True)
         self.std = xtr.std(dim=(0, 2, 3), keepdim=True)
         xtr, xte = (xtr - self.mean) / self.std, (xte - self.mean) / self.std
@@ -75,9 +77,9 @@ class PicturesBed:
             xte = token_filter(xte, self.tilt, grid)
         self.grid = grid
         self.xtr = xtr.to(device)
-        self.ytr = torch.from_numpy(d["y_train"]).to(device)
+        self.ytr = torch.from_numpy(ytr_raw).to(device)
         self.xte = xte.to(device)
-        self.yte = torch.from_numpy(d["y_test"]).to(device)
+        self.yte = torch.from_numpy(yte_raw).to(device)
         self.spectrum = measure_spectrum(self.xtr[:SPECTRUM_PICTURES]).cpu()       # float64 on the run device, then CPU
         self.field_shape = tuple(self.xtr.shape[1:])
         self.n_classes = 10

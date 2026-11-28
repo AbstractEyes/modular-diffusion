@@ -24,8 +24,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import warnings
-from typing import Any, Dict, Iterator, List
+from typing import Any, Dict, Iterator, List, Set
 
 import torch
 
@@ -55,9 +56,12 @@ class _State:
     def __init__(self, mode: str):
         self.mode = mode
         self.caught: List[warnings.WarningMessage] = []
+        self._seen: Set[str] = set()
         self.workspace: Dict[str, Any] = {}
 
     def messages(self) -> List[str]:
+        if self._seen:
+            return sorted(self._seen)
         return sorted({str(w.message) for w in self.caught})
 
     def record(self, result: dict) -> None:
@@ -80,12 +84,21 @@ def mode(value: str) -> Iterator[_State]:
         state.workspace = set_workspace()
     was = torch.are_deterministic_algorithms_enabled()
     was_warn = torch.is_deterministic_algorithms_warn_only_enabled()
-    with warnings.catch_warnings(record=True) as caught:
+    with warnings.catch_warnings(record=False):
         warnings.simplefilter("always")
-        state.caught = caught                       # the live list: ``record`` sees every warning raised so far
+        prev_show = warnings._showwarnmsg
+
+        def _capture(msg: warnings.WarningMessage) -> None:
+            text = str(msg.message)
+            if text not in state._seen:
+                state._seen.add(text)
+                state.caught.append(msg)
+                warnings.filterwarnings("ignore", message="^" + re.escape(text) + "$", category=msg.category)
+
+        warnings._showwarnmsg = _capture
         torch.use_deterministic_algorithms(True, warn_only=(value == "warn"))
         try:
             yield state
         finally:
-            state.caught = list(caught)
+            warnings._showwarnmsg = prev_show
             torch.use_deterministic_algorithms(was, warn_only=was_warn)

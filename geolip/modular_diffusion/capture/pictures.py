@@ -122,10 +122,16 @@ def _kernel(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 def _mmd2(a: np.ndarray, b: np.ndarray) -> float:
     na, nb = a.shape[0], b.shape[0]
-    kaa, kbb, kab = _kernel(a, a), _kernel(b, b), _kernel(a, b)
-    within_a = (kaa.sum() - np.trace(kaa)) / (na * (na - 1))
-    within_b = (kbb.sum() - np.trace(kbb)) / (nb * (nb - 1))
-    return float(within_a + within_b - 2.0 * kab.mean())
+    kaa = _kernel(a, a)
+    within_a = float((kaa.sum() - np.trace(kaa)) / (na * (na - 1)))
+    del kaa
+    kbb = _kernel(b, b)
+    within_b = float((kbb.sum() - np.trace(kbb)) / (nb * (nb - 1)))
+    del kbb
+    kab = _kernel(a, b)
+    cross = float(kab.mean())
+    del kab
+    return float(within_a + within_b - 2.0 * cross)
 
 
 def kid(a, b, blocks: int = 10) -> dict:
@@ -196,9 +202,9 @@ def prepare_pictures(pictures: Tensor, size: int, mean: Sequence[float], std: Se
         x = torch.nn.functional.interpolate(x, size=(nh, nw), mode="bicubic", antialias=True, align_corners=False)
     top, left = (nh - size) // 2, (nw - size) // 2
     x = x[..., top:top + size, left:left + size]
-    m = torch.tensor(list(mean), dtype=x.dtype).reshape(1, 3, 1, 1)
-    s = torch.tensor(list(std), dtype=x.dtype).reshape(1, 3, 1, 1)
-    return (x - m) / s
+    m = mean if isinstance(mean, Tensor) else torch.tensor(list(mean), dtype=x.dtype).reshape(1, 3, 1, 1)
+    s = std if isinstance(std, Tensor) else torch.tensor(list(std), dtype=x.dtype).reshape(1, 3, 1, 1)
+    return (x - m.to(device=x.device, dtype=x.dtype)) / s.to(device=x.device, dtype=x.dtype)
 
 
 class ClipJudge:
@@ -220,6 +226,8 @@ class ClipJudge:
         cfg = _preprocessor_config(self.path) or {}
         self.mean = tuple(cfg.get("image_mean", CLIP_MEAN))
         self.std = tuple(cfg.get("image_std", CLIP_STD))
+        self._mean_t = torch.tensor(list(self.mean), dtype=torch.float32).reshape(1, 3, 1, 1)
+        self._std_t = torch.tensor(list(self.std), dtype=torch.float32).reshape(1, 3, 1, 1)
 
     @torch.no_grad()
     def scores(self, pictures: Tensor, ids: Tensor, batch: int = 64) -> np.ndarray:
@@ -227,7 +235,7 @@ class ClipJudge:
             raise ValueError(f"{pictures.shape[0]} pictures and {ids.shape[0]} prompts")
         out = []
         for i in range(0, pictures.shape[0], int(batch)):
-            x = prepare_pictures(pictures[i:i + batch], self.size, self.mean, self.std)
+            x = prepare_pictures(pictures[i:i + batch], self.size, self._mean_t, self._std_t)
             img = _features(self.model.get_image_features(pixel_values=x.to(self.device, self.dtype)))
             txt = _features(self.model.get_text_features(input_ids=ids[i:i + batch].to(self.device).long()))
             out.append(_cosine_score(img, txt))
