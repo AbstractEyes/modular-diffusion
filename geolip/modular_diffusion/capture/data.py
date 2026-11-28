@@ -71,6 +71,7 @@ def rows_in_order(folder: str, first: int, n: int) -> Tuple[Tensor, Tensor]:
     """(latents float32 [n, C, h, w], ids long [n, 77]): rows ``first`` .. ``first + n - 1`` of a folder of shards in
     file order (row i is the i-th row of the shards taken in the index's order). Shards wholly before ``first`` or
     after the last row are not read. ValueError when the folder holds fewer than ``first + n`` rows."""
+    from safetensors import safe_open
     first, n = int(first), int(n)
     if first < 0 or n < 1:
         raise ValueError("first >= 0 and n >= 1")
@@ -84,13 +85,15 @@ def rows_in_order(folder: str, first: int, n: int) -> Tuple[Tensor, Tensor]:
     for name, count in zip(index["shards"], counts):
         end = start + count
         if end > first and start < first + n:
-            x, t = read_shard(os.path.join(folder, name))
             lo, hi = max(first, start) - start, min(first + n, end) - start
-            lat.append(x[lo:hi])
-            ids.append(t[lo:hi])
+            with safe_open(os.path.join(folder, name), framework="pt") as fh:
+                lat.append(fh.get_slice("latents")[lo:hi])
+                ids.append(fh.get_slice("ids")[lo:hi])
         start = end
         if start >= first + n:
             break
+    if len(lat) == 1:
+        return lat[0].float(), ids[0].long()
     return torch.cat(lat).float(), torch.cat(ids).long()
 
 
@@ -134,6 +137,8 @@ class LatentBatches:
         self.device = torch.device(device)
         self.rows = sum(self.counts)
         self._held: Optional[Tuple[int, Tensor, Tensor]] = None
+        self._held_shard_order: Optional[Tuple[int, List[int]]] = None
+        self._held_row_order: Optional[Tuple[int, int, Tensor]] = None
         from safetensors import safe_open
         with safe_open(os.path.join(self.folder, self.files[0]), framework="pt") as fh:
             self.latent_shape = tuple(int(x) for x in fh.get_slice("latents").get_shape()[1:])
@@ -149,12 +154,16 @@ class LatentBatches:
         return self.rows
 
     def _shard_order(self, e: int) -> List[int]:
-        g = torch.Generator().manual_seed(self.seed * 1_000_003 + e)
-        return torch.randperm(len(self.files), generator=g).tolist()
+        if self._held_shard_order is None or self._held_shard_order[0] != e:
+            g = torch.Generator().manual_seed(self.seed * 1_000_003 + e)
+            self._held_shard_order = (e, torch.randperm(len(self.files), generator=g).tolist())
+        return self._held_shard_order[1]
 
     def _row_order(self, e: int, shard: int) -> Tensor:
-        g = torch.Generator().manual_seed((self.seed * 1_000_003 + e) * 100_003 + shard)
-        return torch.randperm(self.counts[shard], generator=g)
+        if self._held_row_order is None or self._held_row_order[0] != e or self._held_row_order[1] != shard:
+            g = torch.Generator().manual_seed((self.seed * 1_000_003 + e) * 100_003 + shard)
+            self._held_row_order = (e, shard, torch.randperm(self.counts[shard], generator=g))
+        return self._held_row_order[2]
 
     def _shard(self, i: int) -> Tuple[Tensor, Tensor]:
         if self._held is None or self._held[0] != i:
@@ -183,18 +192,35 @@ class LatentBatches:
         lat_parts: List[Tensor] = []
         id_parts: List[Tensor] = []
         have = 0
-        for lat, ids in self._rows(start_row):
-            while lat.shape[0]:
-                take = min(batch - have, lat.shape[0])
-                lat_parts.append(lat[:take])
-                id_parts.append(ids[:take])
-                lat, ids = lat[take:], ids[take:]
-                have += take
-                if have == batch:
-                    x0 = torch.cat(lat_parts).to(self.device, torch.float32)
-                    tok = torch.cat(id_parts).to(self.device, torch.long)
-                    lat_parts, id_parts, have = [], [], 0
-                    yield x0, tok
+        e, r = divmod(int(start_row), self.rows)
+        while True:
+            for s in self._shard_order(e):
+                n = self.counts[s]
+                if r >= n:
+                    r -= n
+                    continue
+                if n == 0:
+                    continue
+                lat, ids = self._shard(s)
+                order = self._row_order(e, s)
+                while r < n:
+                    take = min(batch - have, n - r)
+                    idx = order[r:r + take]
+                    lat_parts.append(lat[idx])
+                    id_parts.append(ids[idx])
+                    r += take
+                    have += take
+                    if have == batch:
+                        if len(lat_parts) == 1:
+                            x0 = lat_parts[0].to(self.device, torch.float32)
+                            tok = id_parts[0].to(self.device, torch.long)
+                        else:
+                            x0 = torch.cat(lat_parts).to(self.device, torch.float32)
+                            tok = torch.cat(id_parts).to(self.device, torch.long)
+                        lat_parts, id_parts, have = [], [], 0
+                        yield x0, tok
+                r = 0
+            e += 1
 
     def stream(self, start: int = 0) -> Iterator[Tuple[Tensor, Tensor]]:
         """Batches of the construction's size from batch number ``start`` on."""
@@ -215,8 +241,11 @@ def center_crop(picture, size: int = 512) -> Tensor:
     """[3, size, size] float32 in [-1, 1]: the picture (a PIL image or a path) resized so its shorter side is ``size``
     (bilinear) and cropped at the center, the preparation of the published text-to-image fine-tuning recipe."""
     from PIL import Image
-    img = Image.open(picture) if isinstance(picture, (str, os.PathLike)) else picture
-    img = img.convert("RGB")
+    if isinstance(picture, (str, os.PathLike)):
+        with Image.open(picture) as raw:
+            img = raw.convert("RGB")
+    else:
+        img = picture.convert("RGB")
     w, h = img.size
     scale = size / min(w, h)
     nw, nh = max(size, round(w * scale)), max(size, round(h * scale))

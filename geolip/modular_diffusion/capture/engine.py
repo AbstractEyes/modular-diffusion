@@ -154,6 +154,12 @@ def _context_of(teacher_unet, context: Optional[Tensor]) -> Optional[Tensor]:
     return None
 
 
+def _meta_unet(teacher_unet, shape: Shape):
+    from diffusers import UNet2DConditionModel
+    with torch.device("meta"):
+        return UNet2DConditionModel.from_config(engine_config(teacher_unet, shape))
+
+
 def _blank(teacher_unet, shape: Shape):
     from diffusers import UNet2DConditionModel
     return UNet2DConditionModel.from_config(engine_config(teacher_unet, shape)).float()
@@ -165,7 +171,8 @@ def build_engine(teacher_unet, shape: Union[str, Shape], text: bool = True, cont
     [77, D]) or, when the teacher itself is given, its empty prompt's states."""
     shape = shape_from(shape)
     t_unet = _unet_of(teacher_unet)
-    unet = _blank(teacher_unet, shape)
+    device = next(t_unet.parameters()).device
+    unet = _meta_unet(teacher_unet, shape)
     src = t_unet.state_dict()
     dst = unet.state_dict()
     filled = {}
@@ -175,12 +182,14 @@ def build_engine(teacher_unet, shape: Union[str, Shape], text: bool = True, cont
             raise KeyError(f"engine tensor {k} maps to {tk}, which the teacher does not have")
         if tuple(src[tk].shape) != tuple(v.shape):
             raise ValueError(f"engine tensor {k} {tuple(v.shape)} and teacher tensor {tk} {tuple(src[tk].shape)} differ")
-        filled[k] = src[tk].detach().to(device="cpu", dtype=v.dtype)
+        dtype = torch.float32 if v.is_floating_point() else v.dtype
+        filled[k] = src[tk].detach().to(device=device, dtype=dtype, copy=True)
     missing = sorted(set(dst) - set(filled))
     if missing:
         raise ValueError(f"engine tensors not inherited: {missing[:5]}")
-    unet.load_state_dict(filled, strict=True)
-    device = next(t_unet.parameters()).device
+    unet.load_state_dict(filled, strict=True, assign=True)
+    for p in unet.parameters():
+        p.requires_grad_(True)
     ctx = None if text else _context_of(teacher_unet, context)
     return Engine(unet, shape, text, ctx).to(device)
 
@@ -249,7 +258,7 @@ def forward_seconds(part, z: Tensor, t: Tensor, states: Tensor, repeats: int = 3
 
 
 def shape_report(teacher_unet, shape: Union[str, Shape], batch: int = 1, size: Optional[int] = None,
-                 repeats: int = 3, step: int = 500) -> dict:
+                 repeats: int = 3, step: int = 500, teacher_seconds: Optional[float] = None) -> dict:
     """Parameters of the shape's engine, their share of the teacher's, and its forward cost against the teacher's
     (measured here, one forward at ``batch`` rows of ``size`` x ``size`` latents, at one step)."""
     shape = shape_from(shape)
@@ -263,7 +272,7 @@ def shape_report(teacher_unet, shape: Union[str, Shape], batch: int = 1, size: O
     ctx = torch.randn(batch, 77, int(unet.config.cross_attention_dim), generator=g).to(dev, dtype)
     t = torch.full((batch,), int(step), device=dev, dtype=torch.long)
     eng = eng.to(dtype)
-    ts = forward_seconds(unet, z, t, ctx, repeats)
+    ts = forward_seconds(unet, z, t, ctx, repeats) if teacher_seconds is None else float(teacher_seconds)
     es = forward_seconds(eng, z, t, ctx, repeats)
     pt, pe = param_count(unet), param_count(eng)
     return {"shape": shape.name, "params": pe, "teacher_params": pt, "share": pe / pt, "seconds": es,
@@ -292,15 +301,39 @@ def save_engine(engine: Engine, folder: str, name: str = "engine", average: Opti
 def load_engine(teacher_unet, folder: str, name: str = "engine", average: bool = True) -> Engine:
     """An engine written by ``save_engine``: its averaged numbers when ``average`` and the file is there, else its last
     numbers (the averaged file holds the parameters; anything else comes from the last numbers)."""
+    from safetensors import safe_open
     from safetensors.torch import load_file
     with open(os.path.join(folder, name + ".json"), encoding="utf-8") as fh:
         card = json.load(fh)
-    state = load_file(os.path.join(folder, name + ".safetensors"))
+    eng_path = os.path.join(folder, name + ".safetensors")
     avg_path = os.path.join(folder, name + "_avg.safetensors")
     if average and os.path.isfile(avg_path):
-        state.update(load_file(avg_path))
+        state = load_file(avg_path)
+        with safe_open(eng_path, framework="pt", device="cpu") as fh:
+            for k in fh.keys():
+                if k not in state:
+                    state[k] = fh.get_tensor(k)
+    else:
+        state = load_file(eng_path)
     shape = Shape.parse(card["shape"])
+    text = bool(card["text"])
     ctx = state.get("context")
-    eng = build_engine(teacher_unet, shape, text=bool(card["text"]), context=ctx)
-    eng.load_state_dict({k: v.to(eng.state_dict()[k].dtype) for k, v in state.items()}, strict=True)
+    device = next(_unet_of(teacher_unet).parameters()).device
+    unet = _meta_unet(teacher_unet, shape)
+    eng = Engine(unet, shape, text=text, context=ctx)
+    expected = eng.state_dict()
+    loaded = {}
+    for k, v in state.items():
+        if k not in expected:
+            loaded[k] = v
+            continue
+        ev = expected[k]
+        if tuple(v.shape) != tuple(ev.shape):
+            raise RuntimeError(f"size mismatch for {k}: copying a param with shape {tuple(v.shape)} from checkpoint, "
+                               f"the shape in current model is {tuple(ev.shape)}.")
+        dtype = torch.float32 if ev.is_floating_point() else ev.dtype
+        loaded[k] = v.detach().to(device=device, dtype=dtype, copy=True)
+    eng.load_state_dict(loaded, strict=True, assign=True)
+    for p in eng.parameters():
+        p.requires_grad_(True)
     return eng

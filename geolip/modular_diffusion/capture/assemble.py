@@ -75,23 +75,36 @@ class Assembly(nn.Module):
         t = t.reshape(-1)
         if t.numel() == 1 and b > 1:
             t = t.expand(b)
-        w = self.weights(t.cpu()).to(z.device)
+        t_cpu = t.cpu()
+        w_cpu = self.weights(t_cpu)
+        active = []
+        for slot in range(len(self.parts)):
+            ws_cpu = w_cpu[:, slot]
+            on_cpu = ws_cpu > 0
+            n_on = int(on_cpu.sum())
+            if n_on > 0:
+                active.append((slot, ws_cpu, on_cpu, n_on))
+        t_dev = t.to(z.device)
+        if len(active) == 1:
+            slot, ws_cpu, _, n_on = active[0]
+            if n_on == b and bool((ws_cpu == 1.0).all()):
+                return self.parts[slot](z, t_dev, states)
         acc = None
         dtype = z.dtype
-        for slot, part in enumerate(self.parts):
-            ws = w[:, slot]
-            on = ws > 0
-            n_on = int(on.sum())
-            if n_on == 0:
-                continue
+        view_shape = (-1,) + (1,) * (z.dim() - 1)
+        for slot, ws_cpu, on_cpu, n_on in active:
+            part = self.parts[slot]
             if n_on == b:
-                o = part(z, t.to(z.device), states)
-                contrib = ws.reshape(-1, *([1] * (z.dim() - 1))) * o.double()
+                o = part(z, t_dev, states)
+                ws = ws_cpu.to(z.device).reshape(view_shape)
+                contrib = ws * o.double()
             else:
-                idx = torch.nonzero(on, as_tuple=False).squeeze(1)
-                o = part(z[idx], t.to(z.device)[idx], None if states is None else states[idx])
+                idx_cpu = torch.nonzero(on_cpu, as_tuple=False).squeeze(1)
+                idx = idx_cpu.to(z.device)
+                o = part(z[idx], t_dev[idx], None if states is None else states[idx])
                 contrib = torch.zeros((b,) + tuple(o.shape[1:]), dtype=torch.float64, device=z.device)
-                contrib[idx] = ws[idx].reshape(-1, *([1] * (z.dim() - 1))) * o.double()
+                ws = ws_cpu[idx_cpu].to(z.device).reshape(view_shape)
+                contrib[idx] = ws * o.double()
             dtype = o.dtype
             acc = contrib if acc is None else acc + contrib
         return acc.to(dtype)
@@ -125,10 +138,18 @@ def initial_noise(seed: int, batch: int, latent_shape: Sequence[int]) -> Tensor:
     return torch.randn((int(batch),) + tuple(int(x) for x in latent_shape), generator=g)
 
 
+def _ignores_text(part: nn.Module) -> bool:
+    if getattr(part, "text", True) is False:
+        return True
+    if isinstance(part, Assembly):
+        return all(getattr(p, "text", True) is False for p in part.parts)
+    return False
+
+
 @torch.no_grad()
 def guided(part: nn.Module, z: Tensor, t: Tensor, states: Tensor, empty: Optional[Tensor], guidance: float) -> Tensor:
     """u + g (c - u): the empty branch u and the prompted branch c in one batch (empty rows first)."""
-    if empty is None or float(guidance) == 1.0:
+    if empty is None or float(guidance) == 1.0 or states is empty or _ignores_text(part):
         return part(z, t, states)
     b = z.shape[0]
     both = part(torch.cat([z, z]), torch.cat([t, t]), torch.cat([empty.expand(b, -1, -1), states]))

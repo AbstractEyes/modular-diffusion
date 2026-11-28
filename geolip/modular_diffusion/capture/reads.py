@@ -154,6 +154,19 @@ def teacher_answers(teacher, probe: Probe, band: str) -> Dict[int, Tensor]:
     return {int(t): _answer(teacher, probe.z(int(t)), int(t), probe.states, probe.batch) for t in probe.steps[band]}
 
 
+def _band_read_from_answers(answers: Dict[int, Tensor], ref: Dict[int, Tensor], band: str, steps: Tensor) -> dict:
+    per, total, count = {}, 0.0, 0
+    for t in steps:
+        t = int(t)
+        d = (answers[t].double() - ref[t].double()).pow(2)
+        s = float(d.sum())
+        n = d.numel()
+        per[str(t)] = s / n
+        total += s
+        count += n
+    return {"band": band, "mse": total / count, "per_step": per, "steps": [int(t) for t in steps], "elements": count}
+
+
 def band_read(part, teacher, band: str, probe: Probe, reference: Optional[Dict[int, Tensor]] = None) -> dict:
     """The mean squared difference, per element, between the part's and the teacher's answers on the band's probe
     steps (float64), with the same per step."""
@@ -164,9 +177,11 @@ def band_read(part, teacher, band: str, probe: Probe, reference: Optional[Dict[i
         t = int(t)
         o = _answer(part, probe.z(t), t, probe.states, probe.batch).double()
         d = (o - ref[t].double()).pow(2)
-        per[str(t)] = float(d.mean())
-        total += float(d.sum())
-        count += d.numel()
+        s = float(d.sum())
+        n = d.numel()
+        per[str(t)] = s / n
+        total += s
+        count += n
     return {"band": band, "mse": total / count, "per_step": per, "steps": [int(t) for t in probe.steps[band]],
             "elements": count}
 
@@ -175,7 +190,7 @@ def born_read(teacher, shape: Union[str, Shape], band: str, probe: Probe, text: 
               reference: Optional[Dict[int, Tensor]] = None) -> dict:
     """``band_read`` of the shape's engine as it is born (inherited, untrained), with its size."""
     shape = shape_from(shape)
-    eng = build_engine(teacher, shape, text=text)
+    eng = build_engine(teacher, shape, text=text).eval()
     r = band_read(eng, teacher, band, probe, reference)
     p = param_count(eng)
     r.update({"shape": shape.name, "text": bool(text), "params": p, "share": p / param_count(teacher)})
@@ -228,8 +243,37 @@ def _reuse(parts: Dict[str, object], other_part):
     return other_part
 
 
+def _same_model(a, b) -> bool:
+    if a is b:
+        return True
+    if isinstance(a, UNetPart) and isinstance(b, UNetPart):
+        return a.unet is b.unet
+    return False
+
+
+def _active_parts_at_steps(model, steps: Sequence) -> List[List[Tuple[object, float]]]:
+    if not isinstance(model, Assembly):
+        return [[(model, 1.0)] for _ in steps]
+    if all(isinstance(t, int) for t in steps):
+        w = model.weights(torch.tensor(list(steps), dtype=torch.long))
+    else:
+        w = model.weights(torch.tensor([float(t) for t in steps], dtype=torch.float64))
+    out = []
+    for k in range(len(steps)):
+        row = [(model.parts[s], float(w[k, s])) for s in range(len(model.parts)) if float(w[k, s]) > 0.0]
+        out.append(row)
+    return out
+
+
+def _identical_active(a: List[Tuple[object, float]], b: List[Tuple[object, float]]) -> bool:
+    if len(a) != len(b):
+        return False
+    return all(wa == wb and _same_model(pa, pb) for (pa, wa), (pb, wb) in zip(a, b))
+
+
 def exchange(assembly: Assembly, band: str, other_part, probe: Probe, teacher=None, sample_steps: int = 50,
-             guidance: float = 7.5, seed: Optional[int] = None, group: int = 0) -> dict:
+             guidance: float = 7.5, seed: Optional[int] = None, group: int = 0,
+             references: Optional[Dict[str, Dict[int, Tensor]]] = None) -> dict:
     """Replace one band's part of an assembly by ``other_part`` and read what moves.
 
     Per band: its read against the teacher (``teacher``; the assembly itself when none is given, so the reads are the
@@ -244,16 +288,19 @@ def exchange(assembly: Assembly, band: str, other_part, probe: Probe, teacher=No
     after = Assembly(parts)
     ref_model = teacher if teacher is not None else assembly
     out = {"band": band, "bands": {}}
+    b_idx = band_index(band)
     for b in BANDS:
-        ref = teacher_answers(ref_model, probe, b)
-        r0 = band_read(assembly, ref_model, b, probe, ref)
-        r1 = band_read(after, ref_model, b, probe, ref)
-        silent = [int(t) for t in probe.steps[b] if float(band_weights(int(t))[0, band_index(band)]) == 0.0]
+        steps = probe.steps[b]
+        ref = references[b] if (references is not None and b in references) else teacher_answers(ref_model, probe, b)
+        before_ans = ref if teacher is None else teacher_answers(assembly, probe, b)
+        after_ans = teacher_answers(after, probe, b)
+        r0 = _band_read_from_answers(before_ans, ref, b, steps)
+        r1 = _band_read_from_answers(after_ans, ref, b, steps)
+        w_steps = band_weights(steps)[:, b_idx]
+        silent = [int(t) for i, t in enumerate(steps) if float(w_steps[i]) == 0.0]
         moved = 0.0
         for t in silent:
-            z = probe.z(t)
-            d = (_answer(after, z, t, probe.states, probe.batch).double()
-                 - _answer(assembly, z, t, probe.states, probe.batch).double())
+            d = after_ans[t].double() - before_ans[t].double()
             moved = max(moved, float(d.abs().max()))
         out["bands"][b] = {"before": r0["mse"], "after": r1["mse"], "change": r1["mse"] - r0["mse"],
                            "silent_steps": silent, "largest_change_where_silent": moved}
@@ -286,23 +333,29 @@ def chain_errors(driver, asked, probe: Probe, sample_steps: int = 50, guidance: 
     ts = process.grid(sample_steps)
     index = {t: k for k, t in enumerate(ts)}
     n = probe.states.shape[0]
-    e = torch.zeros(len(ts), n, dtype=torch.float64)
+    drv = as_part(driver)
     other = as_part(asked)
+    a_drv = _active_parts_at_steps(drv, ts)
+    a_oth = _active_parts_at_steps(other, ts)
+    same_step = [_identical_active(a_drv[k], a_oth[k]) for k in range(len(ts))]
+    e = torch.zeros(len(ts), n, dtype=torch.float64, device=probe.states.device)
     finals = []
     for j, (first, rows) in enumerate(sample_groups(n, group)):
         states = probe.states[first:first + rows]
         empty = probe.empty.to(device=states.device, dtype=states.dtype)      # as the sampler casts it
 
         def watch(t, z, eps, first=first, rows=rows, states=states, empty=empty):
+            k = index[t]
+            if same_step[k]:
+                return
             tt = process.fed(rows, t, z.device)
             other_eps = guided(other, z, tt, states, empty, guidance)
-            d = (eps.double() - other_eps.double()).pow(2).reshape(rows, -1).mean(dim=1)
-            e[index[t], first:first + rows] = d.cpu()
+            e[k, first:first + rows] = (eps.double() - other_eps.double()).pow(2).reshape(rows, -1).mean(dim=1)
 
         z = initial_noise(group_seed(s, j), rows, shape)
-        finals.append(sample(driver, states, probe.empty, s, sample_steps, guidance, latent_shape=shape,
+        finals.append(sample(drv, states, probe.empty, s, sample_steps, guidance, latent_shape=shape,
                              alphas_cumprod=probe.alphas_cumprod, z=z, on_step=watch, process=probe.process))
-    return e, torch.cat(finals)
+    return e.cpu(), torch.cat(finals)
 
 
 def band_errors(e: Tensor, steps: Sequence[int]) -> Dict[str, Tensor]:
@@ -412,22 +465,28 @@ def steering_read(part, teacher, band: str, probe: Probe, guidance: float = 7.5,
     g = float(guidance)
     ref = reference if reference is not None else steering_answers(teacher, probe, band)
     empty = unguided_rows(probe)
+    p = as_part(part)
+    no_text = getattr(p, "text", True) is False or (
+        isinstance(p, Assembly) and all(getattr(x, "text", True) is False for x in p.parts))
     total = dict.fromkeys(STEERING_SUMS, 0.0)
     per, count = {}, 0
     for t in probe.steps[band]:
         t = int(t)
         z = probe.z(t)
-        ec = _answer(part, z, t, probe.states, probe.batch).double()
-        eu = _answer(part, z, t, empty, probe.batch).double()
+        ec = _answer(p, z, t, probe.states, probe.batch).double()
+        eu = ec if no_text else _answer(p, z, t, empty, probe.batch).double()
         tc, tu = ref[t][0].double(), ref[t][1].double()
         err_c, err_u = ec - tc, eu - tu
         d_e, d_t = ec - eu, tc - tu
         err_d = d_e - d_t
         g_t = tu + g * d_t
         err_g = (eu + g * d_e) - g_t
-        s = {"err_c": float(err_c.pow(2).sum()), "ref_c": float(tc.pow(2).sum()), "err_u": float(err_u.pow(2).sum()),
-             "ref_u": float(tu.pow(2).sum()), "err_d": float(err_d.pow(2).sum()), "ref_d": float(d_t.pow(2).sum()),
-             "err_g": float(err_g.pow(2).sum()), "ref_g": float(g_t.pow(2).sum()), "cross": float((err_u * err_d).sum())}
+        vals = torch.stack([
+            err_c.pow(2).sum(), tc.pow(2).sum(), err_u.pow(2).sum(), tu.pow(2).sum(),
+            err_d.pow(2).sum(), d_t.pow(2).sum(), err_g.pow(2).sum(), g_t.pow(2).sum(),
+            (err_u * err_d).sum(),
+        ]).tolist()
+        s = dict(zip(STEERING_SUMS, vals))
         n = err_c.numel()
         per[str(t)] = dict(_steering_ratios(s), mse=s["err_c"] / n, sums=s)
         for k in STEERING_SUMS:

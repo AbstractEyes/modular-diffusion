@@ -107,6 +107,22 @@ def _autocast(kind: str, device: torch.device):
 
 def averaged_engine(engine: Engine, average: Dict[str, Tensor]) -> Engine:
     """A copy of the engine holding the averaged parameters (the copy holds no gradients)."""
+    cfg = getattr(engine.unet, "config", None)
+    if cfg is not None:
+        from diffusers import UNet2DConditionModel
+        clean_cfg = {k: v for k, v in dict(cfg).items() if not k.startswith("_")}
+        with torch.device("meta"):
+            unet = UNet2DConditionModel.from_config(clean_cfg)
+        ctx = None if engine.text else average["context"]
+        e = Engine(unet, engine.shape, text=engine.text, context=ctx)
+        state = {name: average[name].detach().clone() for name, _ in engine.named_parameters()}
+        for name, buf in engine.named_buffers():
+            state[name] = buf.detach().clone()
+        e.load_state_dict(state, strict=True, assign=True)
+        for p in e.parameters():
+            p.requires_grad_(True)
+        e.train(engine.training)
+        return e
     e = copy.deepcopy(engine)
     with torch.no_grad():
         for name, p in e.named_parameters():
@@ -170,6 +186,15 @@ def _save(path: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
+def _make_adam(params, lr: float, device: torch.device) -> torch.optim.Adam:
+    if device.type == "cuda":
+        try:
+            return torch.optim.Adam(params, lr=float(lr), betas=BETAS, eps=EPS, weight_decay=0.0, fused=True)
+        except (RuntimeError, TypeError):
+            pass
+    return torch.optim.Adam(params, lr=float(lr), betas=BETAS, eps=EPS, weight_decay=0.0, foreach=None)
+
+
 def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Callable, *, steps: int, batch: int,
                       seed: int, out: str, rho: float = 0.0, lr: float = 5e-5, lam_out: float = 1.0,
                       lam_data: float = 0.0, drop: float = 0.1, text: bool = True, average_decay: float = 0.9999,
@@ -214,9 +239,10 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
     else:
         engine = build_engine(teacher, shape, text=text)
     engine.train()
-    params = [p for p in engine.parameters()]
-    opt = torch.optim.Adam(params, lr=float(lr), betas=BETAS, eps=EPS, weight_decay=0.0, foreach=None)
-    average = {n: p.detach().clone() for n, p in engine.named_parameters()}
+    named_params = list(engine.named_parameters())
+    params = [p for _, p in named_params]
+    opt = _make_adam(params, lr, device)
+    average = {n: p.detach().clone() for n, p in named_params}
     history = []
     reads_log = []
     step_seconds = []
@@ -232,8 +258,9 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
         step_seconds = [float(x) for x in ck.get("step_seconds", [])]
         done = int(ck["step"])
         log(f"RESUME from step {done:,} of {steps:,} ({ck_path})")
+    avg_list = [average[n] for n, _ in named_params]
     ac = teacher.alphas_cumprod
-    empty = teacher.empty_states(1)
+    empty_f = teacher.empty_states(1).to(device=device, dtype=torch.float32)
     trained = param_count(engine)
     log(f"JOB band engine: shape {shape.name}, band {band}, init {init}, rho {rho:g}, {steps:,} steps x batch {batch}"
         f" = {steps * batch:,} rows; {trained:,} trained numbers ({trained / param_count(teacher):.3f} of the teacher's); "
@@ -259,65 +286,86 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
 
     t0 = time.time()
     start = done
+    zero_f64 = torch.zeros((), dtype=torch.float64, device=device)
     for k in range(done, stop):
         s0 = time.perf_counter()
         g = step_generator(seed, k)
         x0, ids = source(k, batch)
         x0 = x0.to(device=device, dtype=torch.float32)
-        t = sample_steps(band, batch, rho, g)
+        t_cpu = sample_steps(band, batch, rho, g)
         eps = torch.randn(tuple(x0.shape), generator=g).to(device)
-        t = t.to(device)
-        z = add_noise(x0, eps, t, ac)
-        states = teacher.text_states(ids.to(device)).float()
-        states, dropped = drop_prompts(states, empty.float(), drop, g)
+        z = add_noise(x0, eps, t_cpu, ac)
+        t = t_cpu.to(device)
+        dropped_cpu = torch.rand(batch, generator=g, device=g.device) < float(drop)
+        n_dropped = int(dropped_cpu.sum())
+        if n_dropped == batch:
+            states = empty_f.expand(batch, -1, -1)
+        elif n_dropped == 0:
+            states = teacher.text_states(ids.to(device)).float()
+        else:
+            keep = ~dropped_cpu
+            kept = teacher.text_states(ids[keep].to(device)).float()
+            states = empty_f.expand(batch, -1, -1).clone()
+            states[keep.to(device)] = kept
         if grouped:
             opt.zero_grad(set_to_none=True)
-            terms = {"out": 0.0, "data": 0.0, "total": 0.0}
+            t_out = zero_f64
+            t_data = zero_f64
+            t_total = zero_f64
             for a in range(0, batch, micro):
                 b = min(a + micro, batch)
                 w = (b - a) / batch                 # this group's share of the whole batch's mean
                 with _autocast(autocast, device):
                     o_t = teacher.predict(z[a:b], t[a:b], states[a:b])
                     o_s = engine(z[a:b], t[a:b], states[a:b])
-                loss, part = capture_loss(o_s, o_t, eps[a:b], lam_out, lam_data)
+                loss, part = capture_loss(o_s, o_t, eps[a:b], lam_out, lam_data, sync=False)
                 (loss * w).backward()               # the gradients add up in the parameters
-                for key in terms:
-                    terms[key] += w * part[key]
+                t_out = t_out + w * part["out"].double()
+                t_data = t_data + w * part["data"].double()
+                t_total = t_total + w * part["total"].double()
                 del o_t, o_s, loss
         else:
             with _autocast(autocast, device):
                 o_t = teacher.predict(z, t, states)        # no gradient; the inputs cast to the teacher's precision
                 o_s = engine(z, t, states)
-            loss, terms = capture_loss(o_s, o_t, eps, lam_out, lam_data)
+            loss, part = capture_loss(o_s, o_t, eps, lam_out, lam_data, sync=False)
             opt.zero_grad(set_to_none=True)
             loss.backward()
-        # one host read a step: the per-tensor sums are added on the device first
-        sq = float(torch.stack([p.grad.double().pow(2).sum() for p in params if p.grad is not None]).sum())
+            t_out = part["out"].double()
+            t_data = part["data"].double()
+            t_total = part["total"].double()
+            del o_t, o_s, loss
+        # one host read a step: fused per-tensor norms summed on device, combined with loss terms
+        grads = [p.grad for p in params if p.grad is not None]
+        sq_t = torch.stack(torch._foreach_norm(grads, 2.0)).double().pow(2).sum() if grads else zero_f64
         opt.step()
+        opt.zero_grad(set_to_none=True)
         n = k + 1
         d = average_decay_at(n, average_decay)
         with torch.no_grad():
-            for name, p in engine.named_parameters():
-                average[name].mul_(d).add_(p.detach(), alpha=1.0 - d)
-        row = {"step": n, "loss": terms["total"], "out": terms["out"], "data": terms["data"],
-               "grad_norm": math.sqrt(sq), "dropped": int(dropped.sum())}
+            torch._foreach_mul_(avg_list, d)
+            torch._foreach_add_(avg_list, params, alpha=1.0 - d)
+        out_v, data_v, total_v, sq = torch.stack([t_out, t_data, t_total, sq_t]).tolist()
+        row = {"step": n, "loss": total_v, "out": out_v, "data": data_v,
+               "grad_norm": math.sqrt(sq), "dropped": n_dropped}
         history.append(row)
         step_seconds.append(time.perf_counter() - s0)       # the step only: the reads below are not counted
         if n == 1:
-            log(f"STEP 1 terms: teacher term {terms['out']:.6g} (weight {lam_out:g}), noise term {terms['data']:.6g} "
-                f"(weight {lam_data:g}), total {terms['total']:.6g}, gradient norm {row['grad_norm']:.4g}")
+            log(f"STEP 1 terms: teacher term {out_v:.6g} (weight {lam_out:g}), noise term {data_v:.6g} "
+                f"(weight {lam_data:g}), total {total_v:.6g}, gradient norm {row['grad_norm']:.4g}")
         if log_every and (n % int(log_every) == 0 or n == stop):
             spent = time.time() - t0
             left = spent / (n - start) * (steps - n)
-            log(f"step {n:,}/{steps:,} loss {terms['total']:.6g} (teacher {terms['out']:.6g}, noise {terms['data']:.6g})"
+            log(f"step {n:,}/{steps:,} loss {total_v:.6g} (teacher {out_v:.6g}, noise {data_v:.6g})"
                 f" grad {row['grad_norm']:.4g}; spent {spent / 60:.1f} min, left {left / 60:.1f} min")
         if every and on_every is not None and (n % every == 0 or n == steps):
             read_now(n)                                     # before a checkpoint of the same step, so a resume has it
         if save_every and n % int(save_every) == 0 and n != stop:
             checkpoint(n)
     final = max(done, stop)
-    checkpoint(final)
     finished = final >= steps
+    if not finished or keep_checkpoint:
+        checkpoint(final)
     avg_engine = averaged_engine(engine, average)
     per_step = _median(step_seconds)
     if finished:
@@ -329,7 +377,7 @@ def train_band_engine(teacher, shape: Union[str, Shape], band: str, source: Call
                        "reads": reads_log, "log": history}, fh, indent=1)
             fh.write("\n")
         os.replace(tmp, os.path.join(out, TRAIN_JSON))
-        if not keep_checkpoint:
+        if not keep_checkpoint and os.path.isfile(ck_path):
             os.remove(ck_path)
     seconds = time.time() - t0
     log(f"{'DONE' if finished else 'PAUSED'} at step {final:,} of {steps:,}; {seconds / 60:.1f} min this run"
