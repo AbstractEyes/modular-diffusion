@@ -81,6 +81,15 @@ class Staged(nn.Module):
         self.clusters = nn.ModuleList(clusters)
         self.cuts: List[float] = cuts
         self.soft = float(soft)
+        out_m, seen_m = [], set()
+        for c in clusters:
+            for m in c.members:
+                if id(m) not in seen_m:
+                    seen_m.add(id(m))
+                    out_m.append(m)
+        self._members = out_m
+        self._stage_owners = [frame.owner(cuts[s], cuts[s + 1], self.soft, name=f"stage_{s}")
+                              for s in range(len(clusters))]
 
     # ------------------------------------------------------------------ shapes and roles
     @property
@@ -105,13 +114,7 @@ class Staged(nn.Module):
 
     @property
     def members(self) -> list:
-        out, seen = [], set()
-        for c in self.clusters:
-            for m in c.members:
-                if id(m) not in seen:
-                    seen.add(id(m))
-                    out.append(m)
-        return out
+        return list(self._members)
 
     @property
     def stage_units(self) -> list:
@@ -128,7 +131,7 @@ class Staged(nn.Module):
     # ------------------------------------------------------------------ the blend
     def weights(self, t: Tensor) -> Tensor:
         """[S, B]: the stage weights at t (the stage factors of the stages' addresses, ``frame.stage_weights``)."""
-        return frame.stage_weights(frame.stage_owners(self), t)
+        return frame.stage_weights(self._stage_owners, t)
 
     def anchor_velocity(self, zt: Tensor, t: Tensor, cls_idx: Optional[Tensor] = None) -> Tensor:
         return self.clusters[0].anchor_velocity(zt, t, cls_idx)
@@ -143,22 +146,44 @@ class Staged(nn.Module):
         rows it did not run). only, scale, skip and the rows' symbols are passed to every cluster."""
         skip = set(skip)
         out: Dict[str, Tensor] = {}
+        va_all = None
         if self.adds_anchor and self.anchor.name not in skip:
-            out[self.anchor.part] = self.anchor_velocity(zt, t, cls_idx)
+            va_all = self.anchor_velocity(zt, t, cls_idx)
+            out[self.anchor.part] = va_all
         w = self.weights(t)
+        b = zt.shape[0]
         for s, c in enumerate(self.clusters):
-            idx = torch.nonzero(w[s] > 0, as_tuple=False).squeeze(1)
-            if idx.numel() == 0:
+            ws_row = w[s]
+            idx = torch.nonzero(ws_row > 0, as_tuple=False).squeeze(1)
+            n_on = idx.numel()
+            if n_on == 0:
                 continue
             inner = skip | ({c.anchor.name} if self.adds_anchor else set())
-            sc = None if scale is None else {k: v[idx] for k, v in scale.items()}
-            kw = {} if symbols is None else {"symbols": symbols[idx]}
-            parts, _, _, _ = c.components(zt[idx], t[idx], cls_idx[idx], only=only, scale=sc, skip=inner, **kw)
-            ws = w[s][idx].view(-1, 1, 1, 1)
-            for label, v in parts.items():
-                if label not in out:
-                    out[label] = zt.new_zeros(zt.shape, dtype=v.dtype)
-                out[label] = out[label].index_add(0, idx, ws.to(v.dtype) * v)
+            if n_on == b:
+                kw = {} if symbols is None else {"symbols": symbols}
+                if va_all is not None and c.stem.anchor_in:
+                    kw["_va"] = va_all
+                parts, _, _, _ = c.components(zt, t, cls_idx, only=only, scale=scale, skip=inner, **kw)
+                all_one = bool((ws_row == 1.0).all())
+                if all_one:
+                    for label, v in parts.items():
+                        out[label] = v if label not in out else out[label] + v
+                else:
+                    ws = ws_row.view(-1, 1, 1, 1)
+                    for label, v in parts.items():
+                        term = ws.to(v.dtype) * v
+                        out[label] = term if label not in out else out[label] + term
+            else:
+                sc = None if scale is None else {k: v[idx] for k, v in scale.items()}
+                kw = {} if symbols is None else {"symbols": symbols[idx]}
+                if va_all is not None and c.stem.anchor_in:
+                    kw["_va"] = va_all[idx]
+                parts, _, _, _ = c.components(zt[idx], t[idx], cls_idx[idx], only=only, scale=sc, skip=inner, **kw)
+                ws = ws_row[idx].view(-1, 1, 1, 1)
+                for label, v in parts.items():
+                    if label not in out:
+                        out[label] = zt.new_zeros(zt.shape, dtype=v.dtype)
+                    out[label] = out[label].index_add(0, idx, ws.to(v.dtype) * v)
         return out, None, None, None
 
     def velocity(self, zt: Tensor, t: Tensor, cls_idx: Tensor, symbols: Optional[Tensor] = None) -> Tensor:

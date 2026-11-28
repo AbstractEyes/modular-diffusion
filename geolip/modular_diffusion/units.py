@@ -59,6 +59,10 @@ class Unit(nn.Module):
         self.address = dict(address)
         self.spec = dict(spec)
         self.geometry = dict(geometry)
+        win = self.address.get("window", ("0", "1"))
+        self._lo = float(win[0])
+        self._hi = float(win[1])
+        self._soft = float(self.address.get("soft", "0"))
 
     def owned_state(self) -> Dict[str, Tensor]:
         return dict(self.state_dict())
@@ -74,15 +78,15 @@ class Unit(nn.Module):
     # window helpers shared by windowed units
     @property
     def lo(self) -> float:
-        return float(self.address.get("window", ["0", "1"])[0])
+        return self._lo
 
     @property
     def hi(self) -> float:
-        return float(self.address.get("window", ["0", "1"])[1])
+        return self._hi
 
     @property
     def soft(self) -> float:
-        return float(self.address.get("soft", "0"))
+        return self._soft
 
 
 class Anchor(Unit):

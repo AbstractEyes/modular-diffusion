@@ -94,10 +94,18 @@ def field_spectrum(grid: int, slope: float, dc_share: float) -> Tensor:
     return s
 
 
-def measure_spectrum(x: Tensor) -> Tensor:
+def measure_spectrum(x: Tensor, chunk: int = 2000) -> Tensor:
     """x [B, C, H, W] -> power per channel and pixel-grid frequency [C, H, W] (float64), mean over items."""
-    f = torch.fft.fft2(x.double()) / x.shape[-1]
-    return (f.real ** 2 + f.imag ** 2).mean(dim=0)
+    n = x.shape[0]
+    side = x.shape[-1]
+    if n <= chunk:
+        f = torch.fft.fft2(x.double()) / side
+        return (f.real ** 2 + f.imag ** 2).mean(dim=0)
+    total = torch.zeros(x.shape[1:], dtype=torch.float64, device=x.device)
+    for i in range(0, n, chunk):
+        f = torch.fft.fft2(x[i:i + chunk].double()) / side
+        total += (f.real ** 2 + f.imag ** 2).sum(dim=0)
+    return total / n
 
 
 def token_filter(x: Tensor, gain: Tensor, grid: int) -> Tensor:

@@ -128,6 +128,16 @@ def _tensor_bytes(t: Tensor) -> bytes:
     return raw
 
 
+def _hash_tensor(h, t: Tensor) -> None:
+    flat = t.detach().to("cpu").contiguous().reshape(-1)
+    if not flat.numel():
+        return
+    if sys.byteorder == "little" or flat.element_size() == 1:
+        h.update(memoryview(flat.view(torch.uint8).numpy()))
+    else:
+        h.update(_tensor_bytes(flat))
+
+
 def state_hash(unit_type: str, address: Mapping[str, Any], spec: Mapping[str, Any], state: Mapping[str, Tensor]) -> str:
     """The content hash of a unit given its description and owned state (see the module docstring)."""
     h = hashlib.sha256()
@@ -136,7 +146,7 @@ def state_hash(unit_type: str, address: Mapping[str, Any], spec: Mapping[str, An
         t = state[k]
         h.update(b"\0" + k.encode("utf-8") + b"\0" + str(t.dtype).encode("ascii") + b"\0"
                  + canonical_json(list(t.shape)).encode("ascii") + b"\0")
-        h.update(_tensor_bytes(t))
+        _hash_tensor(h, t)
     return h.hexdigest()
 
 
@@ -228,16 +238,16 @@ def unit_files(folder: str, name: str) -> Tuple[str, str]:
     return os.path.join(folder, name + WEIGHTS_SUFFIX), os.path.join(folder, name + CARD_SUFFIX)
 
 
-def save_unit(unit, card: UnitCard, folder: str) -> UnitCard:
+def save_unit(unit, card: UnitCard, folder: str, *, _hash: Optional[str] = None) -> UnitCard:
     """Write a unit's weight file and card into ``folder``. The card's name, type, address, spec, hash, parameters and
     parent_hash are filled in from the unit; returns the card written."""
     from safetensors.torch import save_file
     os.makedirs(folder, exist_ok=True)
     wpath, cpath = unit_files(folder, unit.name)
-    state = {k: v.detach().to("cpu").contiguous().clone() for k, v in unit.owned_state().items()}
+    state = {k: v.detach().to("cpu").contiguous() for k, v in unit.owned_state().items()}
     card.name, card.type = unit.name, unit.unit_type
     card.address, card.spec = dict(unit.address), dict(unit.spec)
-    card.hash = state_hash(unit.unit_type, unit.address, unit.spec, state)
+    card.hash = state_hash(unit.unit_type, unit.address, unit.spec, state) if _hash is None else _hash
     card.parameters = {"count": int(sum(v.numel() for v in state.values())),
                        "tensors": {k: list(state[k].shape) for k in sorted(state)}}
     card.parent_hash = parent_hash(card.parents)

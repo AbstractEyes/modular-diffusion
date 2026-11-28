@@ -30,7 +30,16 @@ INCEPTION_BATCH = 500
 def frechet_distance(mu1, cov1, mu2, cov2) -> float:
     mu1, mu2 = np.asarray(mu1, dtype=np.float64), np.asarray(mu2, dtype=np.float64)
     cov1, cov2 = np.asarray(cov1, dtype=np.float64), np.asarray(cov2, dtype=np.float64)
-    eig = np.linalg.eigvals(cov1 @ cov2).real
+    if np.allclose(cov1, cov1.T, atol=1e-12) and np.allclose(cov2, cov2.T, atol=1e-12):
+        c1 = 0.5 * (cov1 + cov1.T)
+        c2 = 0.5 * (cov2 + cov2.T)
+        w1, v1 = np.linalg.eigh(c1)
+        s1 = np.sqrt(np.clip(w1, 0.0, None))
+        root1 = (v1 * s1) @ v1.T
+        prod = root1 @ c2 @ root1
+        eig = np.linalg.eigvalsh(0.5 * (prod + prod.T))
+    else:
+        eig = np.linalg.eigvals(cov1 @ cov2).real
     root = np.sqrt(np.clip(eig, 0.0, None)).sum()
     d = mu1 - mu2
     return float(d @ d + np.trace(cov1) + np.trace(cov2) - 2.0 * root)
@@ -107,7 +116,7 @@ class InceptionJudge:
         out = []
         for i in range(0, pictures.shape[0], INCEPTION_BATCH):
             f = self.net(pictures[i:i + INCEPTION_BATCH].to(self.device))[0]
-            out.append(f.double().cpu().numpy())
+            out.append(f.cpu().numpy().astype(np.float64))
         return np.concatenate(out) if out else np.zeros((0, 2048))
 
 
