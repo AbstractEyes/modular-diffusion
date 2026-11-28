@@ -195,6 +195,17 @@ def _check_pointers(cells_row, colors_row, points_row, held):
         assert (row[a], row[q]) not in held and int(colors_row[a]) == int(colors_row[q])
 
 
+def test_5c_member_batch_returns_its_layout_on_the_cpu_equal_to_its_device_tensors():
+    for v, cls in ((MB.T1, 3), (MB.T1, None), (MB.T2, 3), (MB.T2, None), (MB.T3, 5)):
+        mb = MB.member_batch(v, cls, BED, 20, _gen(54))
+        for key in ("cells", "colors", "points", "told", "visible"):
+            dev, cpu = mb[key], mb[key + "_cpu"]
+            if dev is None:
+                assert cpu is None, (v.name, key)
+                continue
+            assert cpu.device.type == "cpu" and torch.equal(cpu, dev.cpu()), (v.name, cls, key)
+
+
 def test_5b_a_things_row_can_hold_two_pointers_at_once_and_stays_valid():
     mb = MB.member_batch(MB.T2, 4, BED, 600, _gen(53))
     both = mb["pointing"] & mb["other_pointing"]
@@ -425,6 +436,26 @@ def test_15_pointer_lists_obey_the_rules_and_the_held_pairs():
             assert ((row[a], row[q]) in held) == only
             assert int(pl.colors[i, a]) == int(base.colors[i, q])
         print("only_held", only, ": lists pointed", int(pl.pointed.sum()), "of 200")
+
+
+def test_15b_pointer_lists_with_distinct_colors_give_every_request_of_a_list_its_own_color():
+    n = 6
+    pl = MB.pointer_lists(n, 200, 151, distinct=True)
+    plain = MB.pointer_lists(n, 200, 151)
+    assert torch.equal(pl.cells, plain.cells)
+    stated = []
+    for i in range(200):
+        req = [c for c in range(9) if int(pl.cells[i, c]) >= 0]
+        cols = [int(pl.colors[i, c]) for c in req if int(pl.points[i, c]) < 0]      # the stated colors
+        assert len(set(cols)) == len(cols)
+        ps = [c for c in req if int(pl.points[i, c]) >= 0]
+        for a in ps:                                                               # the pointer takes the asked color
+            q = pl.cells[i].tolist().index(int(pl.points[i, a]))
+            assert int(pl.colors[i, a]) == int(pl.colors[i, q])
+        stated.append(len(cols) == n - len(ps))
+    MB.check_layout(pl.cells, pl.colors, pl.points)
+    print("lists pointed with distinct colors:", int(pl.pointed.sum()), "of 200")
+    assert all(stated)
 
 
 # ------------------------------------------------------------------ 16. a forward of fixed shape

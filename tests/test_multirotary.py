@@ -306,3 +306,270 @@ def test_the_kernel_of_float_digits_is_the_cosine_form_itself():
     want = (1 + 2 * sum(torch.cos(2 * math.pi * j * a.double() / 5) for j in (1, 2))) / 5
     assert torch.equal(k, want) and 0.0 < float(k[1]) < 1.0
 
+
+# ================================================================== an outside audit's claims, each closed by a test
+# ------------------------------------------------------------------ 14. unsigned digits
+def test_unsigned_digits_give_the_kernel_of_signed_ones():
+    for lv in M.PLACE_MEMBER.levels:
+        a = torch.arange(lv.modulus)[:, None].expand(-1, lv.modulus).reshape(-1)
+        b = torch.arange(lv.modulus)[None, :].expand(lv.modulus, -1).reshape(-1)
+        want = M.level_kernel(lv, a, b)
+        got = M.level_kernel(lv, a.to(torch.uint8), b.to(torch.uint8))
+        assert torch.equal(got, want), (lv.name, got.tolist(), want.tolist())
+
+
+# ------------------------------------------------------------------ 15. digits out of range
+def test_digits_out_of_range_raise_a_value_error():
+    lv = M.PLACE_MEMBER.level("member_0")
+    for bad in (torch.tensor([-1]), torch.tensor([5]), torch.tensor([-0.5]), torch.tensor([-0.99]),
+                torch.tensor([float("nan")]), torch.tensor([float("inf")]), torch.tensor([float("-inf")])):
+        with pytest.raises(ValueError):
+            lv.check_digits(bad)
+    lv.check_digits(torch.tensor([0.0, 3.5, 4.0]))                          # inside 0 .. modulus - 1: accepted
+
+
+# ------------------------------------------------------------------ 16. the rotary's arguments
+def test_angle_rotary_refuses_a_negative_head_and_mismatched_widths():
+    g = _gen(16)
+    ang = torch.rand(1, 4, 32, generator=g)
+    q, k = torch.randn(1, 2, 4, 64, generator=g), torch.randn(1, 2, 4, 64, generator=g)
+    with pytest.raises(ValueError):
+        M.angle_rotary(ang, ang, head_angles={-1: (ang, ang)})(q, k)            # a negative head
+    with pytest.raises(ValueError):
+        M.angle_rotary(ang, torch.rand(1, 4, 30, generator=g))                 # query and key angles of two widths
+    with pytest.raises(ValueError):
+        M.angle_rotary(ang, ang, head_angles={0: (ang[..., :31], ang[..., :31])})   # a head's angles of another width
+    with pytest.raises(ValueError):
+        M.angle_rotary(ang, ang)(q, k[..., :60])                               # keys of another head size
+
+
+# ------------------------------------------------------------------ 17. the look read with the mask by keyword
+def test_record_looks_reads_the_key_mask_and_the_rotary_given_by_keyword():
+    torch.manual_seed(17)
+    attn = SelfAttention(128, 2)
+    g = _gen(17)
+    x = torch.randn(2, 12, 128, generator=g)
+    rows, cols = _positions(2, 12, g), _positions(2, 12, g)
+    dig = {k: torch.randint(0, M.PLACE_MEMBER.level(k).modulus, (2, 12), generator=g) for k in M.PLACE_MEMBER.names}
+    rot = M.PLACE_MEMBER.rotary(rows, cols, dig)
+    km = torch.rand(2, 12, generator=g) > 0.5
+    want = M.attention_weights(attn, x, rot, km)
+
+    class Holder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = attn
+
+    with M.record_looks([Holder()]) as looks, torch.no_grad():
+        attn(x, rot, key_mask=km)
+        attn(x, rotary=rot, key_mask=km)
+    assert len(looks) == 2 and all(torch.equal(e["weights"], want) for e in looks)
+
+
+# ------------------------------------------------------------------ 18. no negative zero from the kernel
+def test_the_kernel_of_whole_digits_carries_no_negative_zero():
+    for lv in M.PLACE_MEMBER.levels + M.PLACE_ONLY.levels:
+        a = torch.arange(lv.modulus)[:, None].expand(-1, lv.modulus)
+        b = torch.arange(lv.modulus)[None, :].expand(lv.modulus, -1)
+        k = M.level_kernel(lv, a, b)
+        assert not bool(torch.signbit(k).any()), (lv.name, int(torch.signbit(k).sum()))
+
+
+# ------------------------------------------------------------------ 19. the null anchor's offset
+def test_the_member_levels_null_digit_turns_by_zero_and_digit_zero_by_minus_four_steps():
+    for name in ("member_0", "member_1"):
+        lv = M.PLACE_MEMBER.level(name)
+        assert torch.equal(lv.angles(torch.tensor(4)), torch.zeros(2, dtype=torch.float64))
+        want = torch.tensor([2 * math.pi * k / 5 for k in lv.ks], dtype=torch.float64) * (0.0 - 4.0)
+        assert torch.equal(lv.angles(torch.tensor(0)), want)
+
+
+# ------------------------------------------------------------------ 20. the look read on an engine's masked forward
+def test_record_looks_on_a_masked_engine_forward_sums_to_one_and_reads_no_masked_key():
+    eng = C.born("addressed_thing", 2, 0, read="rotary")
+    batch = C.kind_batch("addressed_thing", 2, scenes.ScenesBed("F"), 3, _gen(20))
+    z, t, _ = C.noisy(batch["x"], _gen(21))
+    seen = []
+    hooks = [blk.attn.register_forward_pre_hook(lambda m, a: seen.append((a[0].detach(), a[1], a[2])))
+             for blk in eng.blocks]
+    try:
+        with M.record_looks(eng.blocks) as looks, torch.no_grad():
+            C.engine_forward(eng, batch, z, t)
+    finally:
+        for h in hooks:
+            h.remove()
+    assert len(looks) == len(seen) == 3
+    for e, (x, rot, km) in zip(looks, seen):
+        w = e["weights"]
+        assert km is not None and not bool(km.all())
+        allowed = km[:, None, None, :] | torch.eye(km.shape[1], dtype=torch.bool)[None, None]
+        assert float((w.sum(-1) - 1).abs().max()) < 1e-5
+        assert float(w[~allowed.expand_as(w)].abs().max()) == 0.0
+        assert torch.equal(w, M.attention_weights(eng.blocks[e["block"]].attn, x, rot, km))
+
+
+# ------------------------------------------------------------------ 21. the edges the tests did not reach
+def test_refusals_and_edges_kernel_name_and_serve():
+    with pytest.raises(ValueError):
+        M.level_kernel(M.Level("even", (0, 1), (1, 2), 4), torch.tensor(0), torch.tensor(1))      # an even modulus
+    with pytest.raises(ValueError):
+        M.level_kernel(M.Level("gap", (0, 1), (1, 3), 7), torch.tensor(0), torch.tensor(1))       # multiples 1, 3
+    with pytest.raises(ValueError):
+        M.name_phases(M.phase_table("edges", 8, 9), b"")
+    g = _gen(21)
+    v0 = torch.randn(2, 5, 3, generator=g)
+    base = torch.rand(2, 5, generator=g, dtype=torch.float64)
+    none = M.serve(v0, torch.zeros(0, 2, 5, 3), torch.zeros(2, 5, 0, dtype=torch.float64), base)
+    assert torch.equal(none, base.float()[..., None] * v0)                    # no member: the base alone
+    vs = torch.randn(3, 2, 5, 3, generator=g).bfloat16()
+    w = torch.rand(2, 5, 3, generator=g, dtype=torch.float64)
+    got = M.serve(v0.bfloat16(), vs, w, base)
+    want = base.bfloat16()[..., None] * v0.bfloat16()
+    for i in range(3):
+        want = want + w[..., i].bfloat16()[..., None] * vs[i]
+    assert got.dtype == torch.bfloat16 and torch.equal(got, want)
+
+
+# ------------------------------------------------------------------ 22. the candidate form on negative arguments
+def test_the_candidate_form_refuses_arguments_below_zero_beyond_rounding():
+    with pytest.raises(ValueError):
+        M.candidate_weights(torch.tensor([[-10.0, 9.9]], dtype=torch.float64))
+    w, base = M.candidate_weights(torch.tensor([[-1e-12, 3.0]], dtype=torch.float64))     # a rounding below zero
+    assert abs(float(w.sum() + base.sum()) - 1.0) < 1e-12
+
+
+# ------------------------------------------------------------------ 23. the look read in half precision
+def test_attention_weights_in_bfloat16_take_their_logits_in_float32():
+    torch.manual_seed(23)
+    attn = SelfAttention(128, 2).bfloat16()
+    g = _gen(23)
+    x = (torch.randn(1, 40, 128, generator=g) * 3).bfloat16()
+    rows, cols = _positions(1, 40, g), _positions(1, 40, g)
+    dig = {k: torch.randint(0, M.PLACE_MEMBER.level(k).modulus, (1, 40), generator=g) for k in M.PLACE_MEMBER.names}
+    rot = M.PLACE_MEMBER.rotary(rows, cols, dig)
+    with torch.no_grad():
+        qkv = attn.qkv(x).view(1, 40, 3, 2, 64).permute(2, 0, 3, 1, 4)
+        q, k = rot(qkv[0], qkv[1])
+        want = torch.softmax((q.float() @ k.float().transpose(-1, -2)) / 8.0, dim=-1)
+        got = M.attention_weights(attn, x, rot)
+    diff = float((got - want).abs().max())
+    print("bfloat16 look read against float32 logits:", diff)
+    assert diff < 1e-6
+
+
+# ------------------------------------------------------------------ 24. the minor guards
+def test_look_takes_any_mask_as_a_set_serve_checks_shapes_and_a_name_is_bytes():
+    st = M.PLACE_MEMBER
+    lv = [st.level("place_column"), st.level("place_row")]
+    g = _gen(24)
+    tok = {n: torch.randint(0, 3, (2, 7), generator=g) for n in ("place_column", "place_row")}
+    req = {n: torch.randint(0, 3, (2, 9), generator=g) for n in ("place_column", "place_row")}
+    m = torch.rand(2, 9, generator=g) > 0.5
+    assert torch.equal(M.look(lv, tok, req, m.long() * 2), M.look(lv, tok, req, m))
+    with pytest.raises(ValueError):
+        M.serve(torch.zeros(2, 5, 3), torch.zeros(3, 1, 5, 3), torch.zeros(2, 5, 3, dtype=torch.float64),
+                torch.zeros(2, 5, dtype=torch.float64))
+    with pytest.raises(TypeError):
+        M.name_phases(M.phase_table("edges", 8, 9), 5)
+
+
+# ------------------------------------------------------------------ 25. the faster forms are the present forms, bit for bit
+def _ref_band_rates(n, lo, hi):
+    lam = float(lo) * (float(hi) / float(lo)) ** (torch.arange(n, dtype=torch.float64) / n)
+    return 2 * math.pi / lam
+
+
+def _ref_level_angles(lv, digits):
+    rates = torch.tensor([2 * math.pi * k / lv.modulus for k in lv.ks], dtype=torch.float64)
+    return rates * (digits.double() - lv.offset)[..., None]
+
+
+def _ref_angles(st, rows, cols, digits):
+    """The structure's angles as written before the audit."""
+    r, c = rows.double(), cols.double()
+    out = torch.zeros(r.shape + (st.n_pairs,), dtype=torch.float64)
+    lo, hi = st.band
+    if st.row:
+        out[..., list(st.row)] = r[..., None] * _ref_band_rates(len(st.row), lo, hi)
+    if st.column:
+        out[..., list(st.column)] = c[..., None] * _ref_band_rates(len(st.column), lo, hi)
+    for lv in st.levels:
+        out[..., list(lv.pairs)] = _ref_level_angles(lv, digits[lv.name])
+    return out.float()
+
+
+def _ref_tables(ang):
+    a = torch.cat([ang, ang], dim=-1).unsqueeze(-3)
+    return a.cos(), a.sin()
+
+
+def _ref_angle_rotary(query_angles, key_angles, head_angles=None):
+    ck, sk = _ref_tables(key_angles.float())
+    cq, sq = (ck, sk) if query_angles is key_angles else _ref_tables(query_angles.float())
+    heads = {int(h): (_ref_tables(hq.float()), _ref_tables(hk.float())) for h, (hq, hk) in (head_angles or {}).items()}
+
+    def _rot(q, k):
+        qc, qs, kc, ks = cq, sq, ck, sk
+        if heads:
+            n_heads = q.shape[-3]
+            index = torch.arange(n_heads).view(n_heads, 1, 1)
+            for h, ((hqc, hqs), (hkc, hks)) in heads.items():
+                on = index == h
+                qc, qs = torch.where(on, hqc, qc), torch.where(on, hqs, qs)
+                kc, ks = torch.where(on, hkc, kc), torch.where(on, hks, ks)
+        return (q * qc.to(q.dtype) + rotary.rotate_half(q) * qs.to(q.dtype),
+                k * kc.to(k.dtype) + rotary.rotate_half(k) * ks.to(k.dtype))
+
+    return _rot
+
+
+def _ref_rest_weights(u):
+    u = u.double()
+    den = torch.ones(u.shape[:-1], dtype=torch.float64)
+    for j in range(u.shape[-1]):
+        den = den + 2.0 * torch.sinh(u[..., j] / 2.0) ** 2
+    w = torch.sinh(u) / den[..., None]
+    total = torch.zeros_like(den)
+    for j in range(u.shape[-1]):
+        total = total + w[..., j]
+    return w, 1.0 - total
+
+
+def _ref_serve(base_answer, answers, w, base):
+    v = base.to(base_answer.dtype)[..., None] * base_answer
+    for i in range(answers.shape[0]):
+        v = v + w[..., i].to(answers.dtype)[..., None] * answers[i]
+    return v
+
+
+def test_the_faster_forms_equal_the_present_forms_bit_for_bit():
+    g = _gen(25)
+    b, n = 3, 40
+    rows, cols = _positions(b, n, g), _positions(b, n, g)
+    for st in (M.PLACE_ONLY, M.PLACE_MEMBER):
+        kd = {k: torch.randint(0, st.level(k).modulus, (b, n), generator=g) for k in st.names}
+        qd = dict(kd)
+        qd[st.names[-1]] = (kd[st.names[-1]] + 1) % st.level(st.names[-1]).modulus
+        ak, aq = st.angles(rows, cols, kd), st.angles(rows, cols, qd)
+        assert torch.equal(ak, _ref_angles(st, rows, cols, kd)) and torch.equal(aq, _ref_angles(st, rows, cols, qd))
+        assert torch.equal(st.angles(rows, cols, kd, check=False), ak)
+        hq, hk = torch.rand(b, n, 32, generator=g) * 6, torch.rand(b, n, 32, generator=g) * 6
+        for heads, dtype in ((None, torch.float32), ({1: (hq, hk)}, torch.float32), ({0: (hq, hk)}, torch.bfloat16)):
+            q = torch.randn(b, 3, n, 64, generator=g).to(dtype)
+            k = torch.randn(b, 3, n, 64, generator=g).to(dtype)
+            new, old = st.rotary(rows, cols, kd, qd, heads), _ref_angle_rotary(aq, ak, heads)
+            for _ in range(3):                                                   # three blocks: the same tables
+                q1, k1 = new(q, k)
+                q2, k2 = old(q, k)
+                assert torch.equal(q1, q2) and torch.equal(k1, k2), (st.names, heads, dtype)
+    u = torch.rand(4, 7, 9, generator=g, dtype=torch.float64) * 4 * (torch.rand(4, 7, 9, generator=g) > 0.6)
+    w, base = M.rest_weights(u)
+    w0, b0 = _ref_rest_weights(u)
+    assert torch.equal(w, w0) and torch.equal(base, b0)
+    v0, vs = torch.randn(4, 7, 5, generator=g), torch.randn(9, 4, 7, 5, generator=g)
+    assert torch.equal(M.serve(v0, vs, w, base), _ref_serve(v0, vs, w, base))
+    lvs = [M.PLACE_MEMBER.level("member_0"), M.PLACE_MEMBER.level("member_1")]
+    rd = {"member_0": torch.randint(0, 5, (4, 9), generator=g), "member_1": torch.randint(0, 5, (4, 9), generator=g)}
+    adr = torch.randint(0, 5, (6, 2), generator=g)
+    assert torch.equal(M.member_match(lvs, rd, adr, check=False), M.member_match(lvs, rd, adr))
+

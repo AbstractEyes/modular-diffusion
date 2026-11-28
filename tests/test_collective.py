@@ -330,12 +330,13 @@ def test_exchanging_one_class_changes_no_pixel_outside_its_cells(read):
     d = cell_crops((a - b).abs())
     assert float(d[~inside].max()) == 0.0
     assert float(d[inside].max()) > 0.0
-    # adding an engine nobody asks for changes nothing
-    asked = sorted({int(x) for x in cells[cells >= 0].tolist()})
+    # adding an engine nobody asks for changes nothing (on the first two lists, which leave classes unasked)
+    few_c, few_k = cells[:2], colors[:2]
+    asked = sorted({int(x) for x in few_c[few_c >= 0].tolist()})
     missing = [c for c in range(9) if c not in asked]
-    if missing:
-        fewer = _collective(read=read, classes=[c for c in range(9) if c != missing[0]])
-        assert torch.equal(_sample(fewer, cells, colors), a)
+    assert missing
+    fewer = _collective(read=read, classes=[c for c in range(9) if c != missing[0]])
+    assert torch.equal(_sample(fewer, few_c, few_k), _sample(_collective(read=read), few_c, few_k))
     # the sampler repeats bit for bit
     assert torch.equal(_sample(_collective(read=read), cells, colors), a)
 

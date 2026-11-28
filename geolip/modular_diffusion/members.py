@@ -95,7 +95,9 @@ REQUEST LISTS THAT POINT (``pointer_lists``): the lists of ``scenes.request_list
 generator seeded seed + 50000, keys [count, 9, 9] (rand). A pair (asking cell a, asked cell q) is valid when both hold
 requests, the asked class stands once in the list and differs from the asking class, and the pair of classes is outside
 ``held_pairs`` (inside it with ``only_held``); each list's valid pair with the smallest key[a, q] points (the asking
-request takes the asked color); a list without a valid pair keeps points -1 and is flagged.
+request takes the asked color); a list without a valid pair keeps points -1 and is flagged. With ``distinct``, after
+the keys and before the pointer is chosen: perm [count, 9] (rand), and a list's n requests in their drawn order take
+the first n colors of argsort(perm) (n different colors).
 
 THE COLLECTIVE (``MemberCollective``). Each engine runs ONE forward over the scenes in which its class is requested
 (told "all": every request, its visible keys by the rule above; told "own": one row a (scene, request) pair, each pair's
@@ -526,7 +528,10 @@ def member_batch(variant: Variant, cls: Optional[int], bed: ScenesBed, n: int, g
     """The training rows of an engine (see the module's text for the draw order) -> x, cells, colors, points, told,
     visible, loss_mask, hidden, params, pointing [n] bool (the rows whose own request points), can_point [n] bool
     (the rows with a candidate for it), other_pointing [n] bool (the rows in which another request points) and
-    other_can_point [n] bool (the rows with a valid pair for it)."""
+    other_can_point [n] bool (the rows with a valid pair for it); and the layout on the CPU as drawn: cells_cpu,
+    colors_cpu, points_cpu, told_cpu and visible_cpu (None for "open"), so that a trainer can prepare its inputs
+    without reading anything back from the bed's device (for told "own" these are copies of the stored rows' tensors,
+    taken back from the bed's device)."""
     dev = bed.device
     n = int(n)
     if variant.told == "own":
@@ -534,10 +539,13 @@ def member_batch(variant: Variant, cls: Optional[int], bed: ScenesBed, n: int, g
             raise ValueError("told 'own' rows are the stored rows: no clutter to exclude, no pointers")
         kb = kind_batch("addressed_thing" if cls is not None else "addressed_base", cls, bed, n, gen)
         none = torch.zeros(n, dtype=torch.bool, device=dev)
+        cells_cpu = kb["cells"].cpu().clone()                    # the stored path: these are copies back from the bed
         return {"x": kb["x"], "cells": kb["cells"], "colors": kb["colors"], "points": no_points(kb["cells"]),
                 "told": kb["told"], "visible": kb["key_mask"], "loss_mask": kb["loss_mask"], "hidden": kb["hidden"],
                 "params": kb["params"], "pointing": none, "can_point": none, "other_pointing": none,
-                "other_can_point": none}
+                "other_can_point": none, "cells_cpu": cells_cpu, "colors_cpu": kb["colors"].cpu().clone(),
+                "points_cpu": no_points(cells_cpu), "told_cpu": kb["told"].cpu().clone(),
+                "visible_cpu": kb["key_mask"].cpu().clone()}
     if exclude is not None and cls is not None and int(exclude) == int(cls):
         raise ValueError("an engine's own class cannot be excluded from its clutter")
     r = torch.arange(n)
@@ -584,13 +592,17 @@ def member_batch(variant: Variant, cls: Optional[int], bed: ScenesBed, n: int, g
     points[ro, ask[other]] = cells[ro, asked[other]]
     colors[ro, ask[other]] = colors[ro, asked[other]]
     pixels, params = scenes.render(cells, colors, bed.bed, gen, dev)                     # (4)
+    cpu = {"cells_cpu": cells.clone(), "colors_cpu": colors.clone(), "points_cpu": points.clone(),
+           "told_cpu": cells >= 0,
+           "visible_cpu": visible_for(cells, cls) if variant.see == "masked" else None}
     cells, colors, points = cells.to(dev), colors.to(dev), points.to(dev)
     told = cells >= 0
     mine = cell_tokens(cells < 0) if cls is None else cell_tokens(cells == int(cls))
     visible = visible_for(cells, cls) if variant.see == "masked" else None
-    return {"x": scenes.to_model(pixels), "cells": cells, "colors": colors, "points": points, "told": told,
-            "visible": visible, "loss_mask": mine, "hidden": None, "params": params, "pointing": pointing.to(dev),
-            "can_point": can.to(dev), "other_pointing": other.to(dev), "other_can_point": other_can.to(dev)}
+    return dict({"x": scenes.to_model(pixels), "cells": cells, "colors": colors, "points": points, "told": told,
+                 "visible": visible, "loss_mask": mine, "hidden": None, "params": params,
+                 "pointing": pointing.to(dev), "can_point": can.to(dev), "other_pointing": other.to(dev),
+                 "other_can_point": other_can.to(dev)}, **cpu)
 
 
 # ------------------------------------------------------------------ request lists that point
@@ -602,12 +614,19 @@ class PointerLists(NamedTuple):
     order: Tensor       # [count, n] long: the requested cells in the order they were drawn
 
 
-def pointer_lists(n: int, count: int, seed: int, held_pairs=(), only_held: bool = False) -> PointerLists:
-    """See the module's text."""
+def pointer_lists(n: int, count: int, seed: int, held_pairs=(), only_held: bool = False,
+                  distinct: bool = False) -> PointerLists:
+    """See the module's text. ``distinct``: before the pointer is chosen, the n requests of each list are recolored
+    with n different colors (after the keys, from the same generator: perm [count, 9] = rand; a list's requests in their
+    drawn order take the first n colors of argsort(perm)), so that the other requests all differ in color."""
     rl = scenes.request_lists(int(n), int(count), int(seed))
     gen = torch.Generator().manual_seed(int(seed) + 50000)
     keys = torch.rand(int(count), N_CELLS, N_CELLS, generator=gen)
     cells, colors = rl.cells.clone(), rl.colors.clone()
+    if distinct:
+        perm = torch.rand(int(count), N_CELLS, generator=gen)
+        new = torch.argsort(perm, dim=1, stable=True)[:, :int(n)]                # [count, n] distinct colors
+        colors.scatter_(1, rl.order, new)                                          # request j of a list -> new[:, j]
     valid = _valid_pairs(cells, _held_matrix(held_pairs), only_held)
     pointed = valid.flatten(1).any(dim=1)
     ask_cell, asked_cell = _smallest_pair(valid, keys)

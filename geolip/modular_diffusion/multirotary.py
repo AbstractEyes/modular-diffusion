@@ -50,6 +50,14 @@ one (two at u = 1: 1.1267) and its base goes negative; the candidate form's weig
 
     serve:  v = base v_0 + sum_i w_i v_i                                         (the weights cast to the answers' dtype)
 
+The candidate form refuses an argument below -1e-9 (whole-number digits give arguments >= 0 exactly; float digits can
+give negative ones through the kernel's side lobes, where its denominator can cross zero).
+
+DIGIT CHECKS. A level's digits must lie in 0 .. modulus - 1 (finite, for float digits): one tensor predicate a check,
+read once. ``Level.angles``, ``Structure.angles``, ``Structure.rotary``, ``level_kernel``, ``look`` and
+``member_match`` take ``check=False`` for callers that checked their digits already (on the CPU, before moving them),
+so that a step on a card reads nothing back from it.
+
 THE KEY BINDING (``phase_table``, ``name_phases``, ``name_kernel``). A table P[j, k, b] of phases uniform on [0, 2 pi)
 for pair j, distance k from the end of a name and byte b, drawn once in float64 from a CPU generator seeded
 crc32(tag) (torch.rand of shape [pairs, reach, 256], times 2 pi). A name x_1 .. x_n (n <= reach bytes) gets
@@ -110,12 +118,22 @@ class Level:
         return torch.tensor([TWO_PI * k / self.modulus for k in self.ks], dtype=torch.float64, device=device)
 
     def check_digits(self, digits: Tensor) -> None:
-        if digits.numel() and (int(digits.min()) < 0 or int(digits.max()) >= self.modulus):
+        """Raise unless every digit lies in 0 .. modulus - 1 (a float digit also finite): one tensor predicate, read
+        once (one transfer when the digits are on a card)."""
+        digits = torch.as_tensor(digits)
+        if not digits.numel():
+            return
+        bad = (digits < 0) | (digits >= self.modulus)
+        if digits.is_floating_point():
+            bad = bad | ~torch.isfinite(digits)
+        if bool(bad.any()):
             raise ValueError(f"level {self.name!r}: digits are 0 .. {self.modulus - 1}")
 
-    def angles(self, digits: Tensor) -> Tensor:
-        """[..., P] float64: the angle of each of the level's pairs for the digits [...]."""
-        self.check_digits(digits)
+    def angles(self, digits: Tensor, check: bool = True) -> Tensor:
+        """[..., P] float64: the angle of each of the level's pairs for the digits [...]. ``check=False`` skips the
+        digit check (for callers that checked on the CPU)."""
+        if check:
+            self.check_digits(digits)
         return self.rates(digits.device) * (digits.double() - self.offset)[..., None]
 
     def distinct_ks(self) -> Tuple[int, ...]:
@@ -128,6 +146,14 @@ class Level:
 
 def _as_pairs(x) -> Tuple[int, ...]:
     return tuple(int(p) for p in x)
+
+
+def _span(pairs: Sequence[int]):
+    """An index for the pairs: a slice when they run in one contiguous increasing range, else the list."""
+    p = tuple(pairs)
+    if p == tuple(range(p[0], p[0] + len(p))):
+        return slice(p[0], p[0] + len(p))
+    return list(p)
 
 
 def _band_rates(n: int, lo: float, hi: float) -> Tensor:
@@ -178,10 +204,10 @@ class Structure:
                 return lv
         raise KeyError(f"no level {name!r}; the levels are {self.names}")
 
-    def angles(self, rows: Tensor, cols: Tensor, digits: Mapping[str, Tensor]) -> Tensor:
+    def angles(self, rows: Tensor, cols: Tensor, digits: Mapping[str, Tensor], check: bool = True) -> Tensor:
         """[..., head_dim // 2] float32: every pair's angle for tokens at (rows, cols) [...] (floats) with the levels'
         digits [...] (every level named). The relative pairs as ``rotary.anchored_angles`` computes them (float64,
-        ``.float()`` last); 0 on the content and held pairs."""
+        ``.float()`` last); 0 on the content and held pairs. ``check=False`` skips the digit checks."""
         missing = [n for n in self.names if n not in digits]
         if missing:
             raise KeyError(f"no digits for the levels {missing}")
@@ -190,58 +216,81 @@ class Structure:
         out = torch.zeros(r.shape + (self.n_pairs,), dtype=torch.float64, device=dev)
         lo, hi = self.band
         if self.row:
-            out[..., list(self.row)] = r[..., None] * _band_rates(len(self.row), lo, hi).to(dev)
+            out[..., _span(self.row)] = r[..., None] * _band_rates(len(self.row), lo, hi).to(dev)
         if self.column:
-            out[..., list(self.column)] = c[..., None] * _band_rates(len(self.column), lo, hi).to(dev)
+            out[..., _span(self.column)] = c[..., None] * _band_rates(len(self.column), lo, hi).to(dev)
         for lv in self.levels:
-            out[..., list(lv.pairs)] = lv.angles(digits[lv.name].to(dev))
+            out[..., _span(lv.pairs)] = lv.angles(digits[lv.name].to(dev), check)
         return out.float()
 
     def rotary(self, rows: Tensor, cols: Tensor, key_digits: Mapping[str, Tensor],
                query_digits: Optional[Mapping[str, Tensor]] = None,
-               head_angles: Optional[Mapping[int, Tuple[Tensor, Tensor]]] = None) -> Rotary:
+               head_angles: Optional[Mapping[int, Tuple[Tensor, Tensor]]] = None, check: bool = True) -> Rotary:
         """The rotary (q, k) -> (q, k) on [B, heads, N, head_dim]: the keys turned by the angles of ``key_digits``, the
         queries by those of ``query_digits`` (the keys' when None); rows, cols and digits [B, N]. ``head_angles``
         {head: (query angles, key angles)}, each [B, N, head_dim // 2], replace the structure's angles on that head
-        (``angle_rotary`` builds the callable from the angles)."""
-        ak = self.angles(rows, cols, key_digits)
-        aq = ak if query_digits is None else self.angles(rows, cols, query_digits)
+        (``angle_rotary`` builds the callable from the angles). The query angles are the key angles with only the
+        levels whose query digits are other tensors recomputed (the cast to float32 acts number by number, so this is
+        the full computation, bit for bit)."""
+        ak = self.angles(rows, cols, key_digits, check)
+        aq = ak
+        if query_digits is not None:
+            aq = ak.clone()
+            dev = rows.device
+            for lv in self.levels:
+                if query_digits[lv.name] is not key_digits[lv.name]:
+                    aq[..., _span(lv.pairs)] = lv.angles(query_digits[lv.name].to(dev), check).float()
         return angle_rotary(aq, ak, head_angles)
 
 
 def _tables(ang: Tensor) -> Tuple[Tensor, Tensor]:
     """[..., N, P] angles -> (cos, sin) [..., 1, N, 2 P] in the rotate-half layout (as ``rotary.anchored_rotary``): the
-    head axis is put before the token axis, whatever stands in front."""
-    a = torch.cat([ang, ang], dim=-1).unsqueeze(-3)
-    return a.cos(), a.sin()
+    head axis is put before the token axis, whatever stands in front. The cosine and sine are taken once on the P
+    angles and repeated (the same numbers as taking them on the repeated angles)."""
+    c, s = ang.cos(), ang.sin()
+    return torch.cat([c, c], dim=-1).unsqueeze(-3), torch.cat([s, s], dim=-1).unsqueeze(-3)
 
 
 def angle_rotary(query_angles: Tensor, key_angles: Tensor,
                  head_angles: Optional[Mapping[int, Tuple[Tensor, Tensor]]] = None) -> Rotary:
-    """The rotary (q, k) -> (q, k) on [B, heads, N, 2 P] from angles [B, N, P] (tables in float32, as
+    """The rotary (q, k) -> (q, k) on [..., heads, N, 2 P] from angles [..., N, P] (tables in float32, as
     ``rotary.anchored_rotary`` builds them): the queries turned by ``query_angles``, the keys by ``key_angles`` (pass
-    the same tensor for both when they are equal). ``head_angles`` {head: (query angles, key angles)}, each [B, N, P],
-    replace both on that head only; every other head keeps the two given."""
+    the same tensor for both when they are equal). ``head_angles`` {head: (query angles, key angles)}, each [..., N, P],
+    replace both on that head only (heads 0 .. heads - 1); every other head keeps the two given. Widths are checked when
+    the rotary is built (the angles) and when it is called (q and k). The per-head tables are merged at the first call
+    and kept for the later calls of the same number of heads, dtypes and device (the same numbers every call)."""
+    p = int(key_angles.shape[-1])
+    if int(query_angles.shape[-1]) != p:
+        raise ValueError(f"query angles of {query_angles.shape[-1]} pairs, key angles of {p}")
+    for h, (hq, hk) in (head_angles or {}).items():
+        if int(h) < 0:
+            raise ValueError(f"head {h} named: heads are 0 .. heads - 1")
+        if int(hq.shape[-1]) != p or int(hk.shape[-1]) != p:
+            raise ValueError(f"head {h}'s angles are of {hq.shape[-1]} and {hk.shape[-1]} pairs, not {p}")
     ck, sk = _tables(key_angles.float())
     cq, sq = (ck, sk) if query_angles is key_angles else _tables(query_angles.float())
     heads = {int(h): (_tables(hq.float()), _tables(hk.float())) for h, (hq, hk) in (head_angles or {}).items()}
-    hd = 2 * int(key_angles.shape[-1])
+    hd = 2 * p
+    kept: Dict[tuple, Tuple[Tensor, Tensor, Tensor, Tensor]] = {}
 
     def _rot(q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
-        if q.shape[-1] != hd:
-            raise ValueError(f"the angles are for a head of {hd} numbers, not {q.shape[-1]}")
-        qc, qs, kc, ks = cq, sq, ck, sk
-        if heads:
-            n_heads = q.shape[-3]
-            if max(heads) >= n_heads:
-                raise ValueError(f"head {max(heads)} named; the forward has {n_heads} heads")
-            index = torch.arange(n_heads, device=q.device).view(n_heads, 1, 1)
-            for h, ((hqc, hqs), (hkc, hks)) in heads.items():
-                on = index == h                                        # [heads, 1, 1], broadcast over [B, heads, N, 2 P]
-                qc, qs = torch.where(on, hqc, qc), torch.where(on, hqs, qs)
-                kc, ks = torch.where(on, hkc, kc), torch.where(on, hks, ks)
-        return (q * qc.to(q.dtype) + rotate_half(q) * qs.to(q.dtype),
-                k * kc.to(k.dtype) + rotate_half(k) * ks.to(k.dtype))
+        if q.shape[-1] != hd or k.shape[-1] != hd:
+            raise ValueError(f"the angles are for a head of {hd} numbers, not {q.shape[-1]} and {k.shape[-1]}")
+        n_heads = q.shape[-3]
+        key = (n_heads, q.dtype, k.dtype, q.device)
+        if key not in kept:
+            qc, qs, kc, ks = cq, sq, ck, sk
+            if heads:
+                if max(heads) >= n_heads:
+                    raise ValueError(f"head {max(heads)} named; the forward has {n_heads} heads")
+                index = torch.arange(n_heads, device=q.device).view(n_heads, 1, 1)
+                for h, ((hqc, hqs), (hkc, hks)) in heads.items():
+                    on = index == h                                    # [heads, 1, 1], broadcast over [..., heads, N, 2 P]
+                    qc, qs = torch.where(on, hqc, qc), torch.where(on, hqs, qs)
+                    kc, ks = torch.where(on, hkc, kc), torch.where(on, hks, ks)
+            kept[key] = (qc.to(q.dtype), qs.to(q.dtype), kc.to(k.dtype), ks.to(k.dtype))
+        qc, qs, kc, ks = kept[key]
+        return q * qc + rotate_half(q) * qs, k * kc + rotate_half(k) * ks
 
     return _rot
 
@@ -271,50 +320,60 @@ def pair_cosine_sum(level: Level, a: Tensor, b: Tensor) -> Tensor:
     return torch.cos(level.angles(a) - level.angles(b)).sum(dim=-1)
 
 
-def level_kernel(level: Level, a: Tensor, b: Tensor) -> Tensor:
+def _signed(x: Tensor) -> Tensor:
+    """Whole-number digits of an unsigned (or bool) dtype as int64; every other tensor as it is."""
+    return x.long() if not (x.is_floating_point() or x.dtype.is_signed) else x
+
+
+def level_kernel(level: Level, a: Tensor, b: Tensor, check: bool = True) -> Tensor:
     """float64 [...]: the lifted kernel (1 + 2 sum over the distinct multiples k of cos(2 pi k (a - b) / modulus)) /
-    modulus; defined when the distinct multiples are 1 .. (modulus - 1) / 2. For whole-number digits (integer tensors)
-    the value is exactly 1.0 or 0.0: the cosine sum lands within 1e-15 of it and is rounded to the nearest whole number,
-    so a product of kernels is exactly 0 off the address."""
+    modulus; defined when the distinct multiples are 1 .. (modulus - 1) / 2. Unsigned whole-number digits are read as
+    signed 64-bit integers first, so a - b does not wrap around. For whole-number digits (integer tensors) the value is exactly 1.0 or 0.0: the
+    cosine sum lands within 1e-15 of it and is rounded to the nearest whole number (+0.0, never -0.0), so a product of
+    kernels is exactly 0 off the address. ``check=False`` skips the digit checks."""
     a, b = torch.as_tensor(a), torch.as_tensor(b)
     p = (level.modulus - 1) // 2
     if level.modulus % 2 == 0 or level.distinct_ks() != tuple(range(1, p + 1)):
         raise ValueError(f"level {level.name!r}: the lifted kernel needs the multiples 1 .. (modulus - 1) / 2")
-    level.check_digits(a)
-    level.check_digits(b)
+    if check:
+        level.check_digits(a)
+        level.check_digits(b)
+    a, b = _signed(a), _signed(b)
     d = (a - b).double()
     s = torch.zeros_like(d)
     for k in range(1, p + 1):
         s = s + torch.cos((TWO_PI * k / level.modulus) * d)
     out = (1.0 + 2.0 * s) / level.modulus
     if not (a.is_floating_point() or b.is_floating_point()):
-        out = torch.round(out)            # whole-number digits: the value is 1 or 0; the cosines' rounding is taken off
+        out = torch.round(out) + 0.0      # whole-number digits: 1 or 0; the cosines' rounding taken off, -0.0 made +0.0
     return out
 
 
 def look(levels: Sequence[Level], token_digits: Mapping[str, Tensor], request_digits: Mapping[str, Tensor],
-         request_mask: Tensor) -> Tensor:
+         request_mask: Tensor, check: bool = True) -> Tensor:
     """[B, N, R] float64: the product over the (place) levels of level_kernel(token digit [B, N], request digit [B, R]),
-    0 where the request slot is masked out (request_mask [B, R] bool)."""
+    0 where the request slot is masked out (request_mask [B, R], read as a set: nonzero = in)."""
     out = None
     for lv in levels:
-        k = level_kernel(lv, token_digits[lv.name][:, :, None], request_digits[lv.name][:, None, :])
+        k = level_kernel(lv, token_digits[lv.name][:, :, None], request_digits[lv.name][:, None, :], check)
         out = k if out is None else out * k
     if out is None:
         raise ValueError("the look needs at least one level")
-    return out * request_mask[:, None, :].to(out.dtype)
+    return out * request_mask[:, None, :].to(device=out.device, dtype=torch.bool).to(out.dtype)
 
 
-def member_match(levels: Sequence[Level], request_digits: Mapping[str, Tensor], addresses: Tensor) -> Tensor:
+def member_match(levels: Sequence[Level], request_digits: Mapping[str, Tensor], addresses: Tensor,
+                 check: bool = True) -> Tensor:
     """[B, R, M] float64: the product over the (member) levels of level_kernel(request digit [B, R], member address
     digit); ``addresses`` [M, len(levels)] long, column l the digit of levels[l]."""
     addresses = torch.as_tensor(addresses, dtype=torch.long)
     if addresses.dim() != 2 or addresses.shape[1] != len(levels):
         raise ValueError("addresses are [members, number of member levels]")
+    if levels:
+        addresses = addresses.to(request_digits[levels[0].name].device)
     out = None
     for l, lv in enumerate(levels):
-        k = level_kernel(lv, request_digits[lv.name][:, :, None], addresses[None, None, :, l].to(
-            request_digits[lv.name].device))
+        k = level_kernel(lv, request_digits[lv.name][:, :, None], addresses[None, None, :, l], check)
         out = k if out is None else out * k
     if out is None:
         raise ValueError("the match needs at least one level")
@@ -331,9 +390,10 @@ def rest_weights(u: Tensor) -> Tuple[Tensor, Tensor]:
     """The rest form over the last axis (the members) -> (w [..., M], base [...]), float64:
     w_i = sinh(u_i) / (1 + sum_j 2 sinh(u_j / 2)^2), base = 1 - sum_i w_i. The sums run one member at a time in order."""
     u = u.double()
+    term = 2.0 * torch.sinh(u / 2.0) ** 2                       # each member's cosh(u) - 1, number by number
     den = torch.ones(u.shape[:-1], dtype=torch.float64, device=u.device)
     for j in range(u.shape[-1]):
-        den = den + 2.0 * torch.sinh(u[..., j] / 2.0) ** 2
+        den = den + term[..., j]
     w = torch.sinh(u) / den[..., None]
     total = torch.zeros_like(den)
     for j in range(u.shape[-1]):
@@ -341,11 +401,18 @@ def rest_weights(u: Tensor) -> Tuple[Tensor, Tensor]:
     return w, 1.0 - total
 
 
-def candidate_weights(u: Tensor) -> Tuple[Tensor, Tensor]:
+NEGATIVE_ROUNDING = 1e-9
+
+
+def candidate_weights(u: Tensor, check: bool = True) -> Tuple[Tensor, Tensor]:
     """The candidate form over the last axis -> (w [..., M], base [...]), float64: w_i = sinh(u_i) / (sum_j sinh(u_j)
-    + exp(-sum_j u_j)), base = exp(-sum_j u_j) / (the same denominator). The expressions of ``frame.overlap_weights``,
-    without its refusal of negative arguments (kernel arguments can sit a rounding below zero)."""
+    + exp(-sum_j u_j)), base = exp(-sum_j u_j) / (the same denominator). The expressions of ``frame.overlap_weights``;
+    an argument may sit a rounding below zero (down to -1e-9), and one further below raises (the denominator can cross
+    zero on negative arguments, which float digits can give through the kernel's negative side lobes). ``check=False``
+    skips that test."""
     u = u.double()
+    if check and u.numel() and bool((u < -NEGATIVE_ROUNDING).any()):
+        raise ValueError("the candidate form takes arguments of at least -1e-9 (a rounding below zero)")
     s = torch.sinh(u)
     rest = torch.exp(-u.sum(dim=-1, keepdim=True))
     den = s.sum(dim=-1, keepdim=True) + rest
@@ -357,9 +424,12 @@ def serve(base_answer: Tensor, answers: Tensor, w: Tensor, base: Tensor) -> Tens
     (the weights cast to the answers' dtype at the product; the sum in member order)."""
     if answers.shape[0] != w.shape[-1]:
         raise ValueError("one answer a member")
+    if tuple(answers.shape[1:]) != tuple(base_answer.shape):
+        raise ValueError(f"the members' answers are [M, {tuple(base_answer.shape)}], not {tuple(answers.shape)}")
     v = base.to(base_answer.dtype)[..., None] * base_answer
+    wc = w.to(answers.dtype)
     for i in range(answers.shape[0]):
-        v = v + w[..., i].to(answers.dtype)[..., None] * answers[i]
+        v = v + wc[..., i][..., None] * answers[i]
     return v
 
 
@@ -372,7 +442,9 @@ def phase_table(tag: str, pairs: int, reach: int) -> Tensor:
 
 def name_phases(table: Tensor, name: bytes) -> Tensor:
     """[pairs] float64: phi_j = sum_{k = 0}^{n - 1} table[j, k, name[n - 1 - k]] (mod 2 pi), summed from the last byte
-    (k = 0) in the table's dtype; a name of 1 .. reach bytes."""
+    (k = 0) in the table's dtype; a name of 1 .. reach bytes (bytes, bytearray or memoryview; anything else raises)."""
+    if not isinstance(name, (bytes, bytearray, memoryview)):
+        raise TypeError(f"a name is bytes, not {type(name).__name__}")
     name = bytes(name)
     if not 1 <= len(name) <= table.shape[1]:
         raise ValueError(f"a name holds 1 .. {table.shape[1]} bytes, not {len(name)}")
@@ -392,11 +464,12 @@ def name_kernel(phases_a: Tensor, phases_b: Tensor) -> Tensor:
 @torch.no_grad()
 def attention_weights(attn: SelfAttention, x: Tensor, rotary: Rotary, key_mask: Optional[Tensor] = None) -> Tensor:
     """[B, heads, N, N] float32: the softmax weights of ``attn`` on x [B, N, dim] with the rotary: q, k from
-    ``attn.qkv``, logits q k^T / sqrt(head_dim), a key read when key_mask [B, N] allows it or it is the query itself."""
+    ``attn.qkv``, logits q k^T / sqrt(head_dim) in float32 (whatever the dtype of q and k), a key read when key_mask
+    [B, N] allows it or it is the query itself."""
     b, n, d = x.shape
     qkv = attn.qkv(x).view(b, n, 3, attn.num_heads, attn.head_dim).permute(2, 0, 3, 1, 4)
     q, k = rotary(qkv[0], qkv[1])
-    logits = (q @ k.transpose(-1, -2)) / math.sqrt(attn.head_dim)
+    logits = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(attn.head_dim)
     if key_mask is not None:
         eye = torch.eye(n, dtype=torch.bool, device=x.device)
         allowed = key_mask.to(device=x.device, dtype=torch.bool)[:, None, None, :] | eye[None, None]
@@ -407,15 +480,17 @@ def attention_weights(attn: SelfAttention, x: Tensor, rotary: Rotary, key_mask: 
 @contextlib.contextmanager
 def record_looks(blocks: Sequence[nn.Module]) -> Iterator[List[Dict[str, object]]]:
     """Forward pre-hooks on each block's ``attn``: every call appends {"block": index, "weights": [B, heads, N, N]}
-    computed by ``attention_weights`` from the very inputs the attention received. The hooks are removed on exit."""
+    computed by ``attention_weights`` from the very inputs the attention received, given by position or by keyword
+    (x, rotary, key_mask). The hooks are removed on exit."""
     looks: List[Dict[str, object]] = []
     handles = []
     for i, blk in enumerate(blocks):
-        def hook(module, args, i=i):
-            x, rot = args[0], args[1]
-            km = args[2] if len(args) > 2 else None
+        def hook(module, args, kwargs, i=i):
+            x = args[0] if len(args) > 0 else kwargs["x"]
+            rot = args[1] if len(args) > 1 else kwargs["rotary"]
+            km = args[2] if len(args) > 2 else kwargs.get("key_mask")
             looks.append({"block": i, "weights": attention_weights(module, x.detach(), rot, km)})
-        handles.append(blk.attn.register_forward_pre_hook(hook))
+        handles.append(blk.attn.register_forward_pre_hook(hook, with_kwargs=True))
     try:
         yield looks
     finally:
