@@ -227,6 +227,8 @@ class _Job:
         self.device = torch.device(a["device"])
         self._teacher = None
         self._rows = None
+        self._probe_cache: Dict[tuple, tuple] = {}
+        self._base_cache: Dict[tuple, tuple] = {}
         from .capture import source_options
         self.source = source_options(a)
         if a["tiny"]:
@@ -266,6 +268,25 @@ class _Job:
             self._rows = rows_in_order(self.folder, 0, self.need)
         return self._rows[0][first:first + n], self._rows[1][first:first + n]
 
+    def probe_and_refs(self, k: int, seed: int):
+        """Cached (probe, {band: teacher_answers}) for the active seed so controls, r1 and r2 share one pass."""
+        key = (int(k), int(seed))
+        cached = self._probe_cache.get(key)
+        if cached is not None:
+            return cached
+        from ..capture import BANDS
+        from ..capture.reads import teacher_answers
+        self._probe_cache.clear()
+        teacher = self.teacher()
+        probe = _probe(self, k, seed)
+        refs = {b: teacher_answers(teacher, probe, b) for b in BANDS}
+        self._probe_cache[key] = (probe, refs)
+        return probe, refs
+
+    def clear_probe_cache(self) -> None:
+        self._probe_cache.clear()
+        self._base_cache.clear()
+
 
 def _write_part(path: str, obj: dict) -> None:
     from ..capture.reads import write_json
@@ -298,17 +319,18 @@ def _probe(job: _Job, k: int, seed: int):
 
 def _controls(job: _Job, k: int, seed: int, log) -> dict:
     from ..capture import BANDS
-    from ..capture.engine import build_engine, fresh_engine
-    from ..capture.reads import band_read, teacher_answers
+    from ..capture.engine import build_engine, fresh_engine, param_count
+    from ..capture.reads import band_read
     teacher = job.teacher()
-    probe = _probe(job, k, seed)
-    refs = {b: teacher_answers(teacher, probe, b) for b in BANDS}
+    probe, refs = job.probe_and_refs(k, seed)
     out = {}
     for name, make in (("full", lambda: build_engine(teacher, "full")),
                        ("inherited_base", lambda: build_engine(teacher, "base")),
                        ("random_base", lambda: fresh_engine(teacher, "base", seed=int(seed)))):
         eng = make().eval()
         out[name] = {b: float(band_read(eng, teacher, b, probe, refs[b])["mse"]) for b in BANDS}
+        if name == "inherited_base":
+            job._base_cache[(int(k), int(seed))] = (dict(out[name]), int(param_count(eng)))
         del eng
         _free(job.device)
     out["ratio"] = {b: (out["random_base"][b] / out["inherited_base"][b] if out["inherited_base"][b] > 0 else None)
@@ -320,7 +342,8 @@ def _controls(job: _Job, k: int, seed: int, log) -> dict:
 
 def _r1(job: _Job, k: int, seed: int, log) -> dict:
     from ..capture import measure
-    r = measure.removal_scores(job.teacher(), _probe(job, k, seed), log=log)
+    probe, refs = job.probe_and_refs(k, seed)
+    r = measure.removal_scores(job.teacher(), probe, log=log, references=refs)
     _free(job.device)
     return {"table": r["table"], "rows": r["rows"], "teacher_params": r["teacher_params"]}
 
@@ -328,13 +351,18 @@ def _r1(job: _Job, k: int, seed: int, log) -> dict:
 def _r2(job: _Job, k: int, seed: int, log) -> dict:
     from ..capture import BANDS
     from ..capture.engine import build_engine, param_count
-    from ..capture.reads import band_read, teacher_answers
+    from ..capture.reads import band_read
     teacher = job.teacher()
-    probe = _probe(job, k, seed)
-    refs = {b: teacher_answers(teacher, probe, b) for b in BANDS}
+    probe, refs = job.probe_and_refs(k, seed)
     total = param_count(teacher)
     out: Dict[str, dict] = {b: {} for b in BANDS}
     for name in NAMED:
+        if name == "base" and (int(k), int(seed)) in job._base_cache:
+            mse_by_band, p = job._base_cache[(int(k), int(seed))]
+            for b in BANDS:
+                out[b][name] = {"mse": mse_by_band[b], "params": int(p), "share": p / total}
+            log(f"r2 seed {seed}: {name} " + "  ".join(f"{b} {out[b][name]['mse']:.4g}" for b in BANDS))
+            continue
         eng = build_engine(teacher, name).eval()
         p = param_count(eng)
         for b in BANDS:
@@ -348,14 +376,26 @@ def _r2(job: _Job, k: int, seed: int, log) -> dict:
 
 def _r4(job: _Job, log) -> list:
     from ..capture import measure
+    from ..capture.engine import forward_seconds
     from ..capture.shapes import SHAPES
     a = job.a
     teacher = job.teacher()
+    unet = teacher.unet
+    batch = int(a["cost_batch"])
+    size = int(job.latent_shape[1])
+    repeats = int(a["cost_repeats"])
+    dev = next(unet.parameters()).device
+    dtype = next(unet.parameters()).dtype
+    g = torch.Generator().manual_seed(0)
+    z = torch.randn(batch, unet.config.in_channels, size, size, generator=g).to(dev, dtype)
+    ctx = torch.randn(batch, 77, int(unet.config.cross_attention_dim), generator=g).to(dev, dtype)
+    t = torch.full((batch,), 500, device=dev, dtype=torch.long)
+    ts = forward_seconds(unet, z, t, ctx, repeats)
+    del z, ctx, t
     shapes = [("full", SHAPES["full"])] + measure.single_changes() + [(n, SHAPES[n]) for n in NAMED]
     out = []
     for name, shape in shapes:
-        c = measure.cost(teacher, shape, batch=int(a["cost_batch"]), size=int(job.latent_shape[1]),
-                         repeats=int(a["cost_repeats"]))
+        c = measure.cost(teacher, shape, batch=batch, size=size, repeats=repeats, teacher_seconds=ts)
         out.append({"name": name, "shape": shape.text, "params": c["params"], "share": c["share"],
                     "seconds": c["seconds"], "teacher_seconds": c["teacher_seconds"], "cost": c["cost"],
                     "batch": c["batch"], "size": c["size"]})
@@ -484,6 +524,7 @@ def _reads(a, job: _Job, seeds: List[int], sample_dtype: str, head: dict, log, d
             what = "read back"
         else:
             if kind == "r3" and not cast:
+                job.clear_probe_cache()
                 job.teacher().to(dtype=DTYPES[sample_dtype])
                 job.log(f"teacher cast to {sample_dtype} for the prompt read")
                 cast = True

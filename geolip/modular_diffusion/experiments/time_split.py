@@ -370,6 +370,7 @@ def _run(a: dict, det) -> dict:
     else:
         folders = [f"stage_{s}" for s in range(3)]
         t_mix = SOFT_MIX if variant in ("split_soft", "copies_soft") else 0.0
+        alone_reads: List[dict] = []
         if variant == "tails_joint":
             clusters = share([born(4, 3) for _ in range(3)], ["anchor", "stem"])
             staged = Staged(clusters, CUTS, SOFT)
@@ -397,6 +398,7 @@ def _run(a: dict, det) -> dict:
                 log(f"PART {name}: t in [{TRAIN_RANGES[s][0]:g}, {TRAIN_RANGES[s][1]:g}), {n} steps")
                 res = fit_units(c, bed, seed, steps=n, trainable=trainable, t_range=TRAIN_RANGES[s], t_mix=t_mix,
                                 expect_anchor_at_birth=expect, **common)
+                alone_reads.append({"loss_over_levels": res["loss_over_levels"], "by_level": _levels(res)})
                 export(c, f, res, _non_anchor(c) if trainable == "all" else trainable, base=base)
                 parts.append(_part_row(name, f, res))
                 progress(name, n)
@@ -416,11 +418,14 @@ def _run(a: dict, det) -> dict:
     if clusters_final is not None:
         wrong = read(final.rotated(1), bed, int(a["heldout"]), device)
         result["wrong_assembly"] = {"loss_over_levels": wrong["loss_over_levels"], "by_stage": by_stage(wrong, CUTS)}
-        alone = []
-        for c in clusters_final:
-            r = read(c, bed, int(a["heldout"]), device)
-            alone.append({"loss_over_levels": r["loss_over_levels"], "by_level": _levels(r)})
-        result["alone"] = alone
+        if alone_reads:
+            result["alone"] = alone_reads
+        else:
+            alone = []
+            for c in clusters_final:
+                r = read(c, bed, int(a["heldout"]), device)
+                alone.append({"loss_over_levels": r["loss_over_levels"], "by_level": _levels(r)})
+            result["alone"] = alone
     judged: Dict[str, Any] = {}
 
     def score_of(m, tag: str = "") -> dict:

@@ -209,7 +209,8 @@ def source_options(a: dict) -> dict:
                 unguided=a["unguided"] or None, kappa=float(a["kappa"]))
 
 
-def load_source(a: dict, vae: bool = False, seed: int = 0, tiny_seed: Optional[int] = None):
+def load_source(a: dict, vae: bool = False, seed: int = 0, tiny_seed: Optional[int] = None,
+                vae_dtype: Optional[torch.dtype] = None):
     """(the source, where it came from) from the job's arguments: the tiny random teacher (``tiny_seed``, the job's
     seed by default; its U-Net from ``unet_seed`` when that is 0 or more), or the teacher folder with ``unet`` as its
     own U-Net folder when given; with the source's kind, shift, unguided side and kappa."""
@@ -226,8 +227,9 @@ def load_source(a: dict, vae: bool = False, seed: int = 0, tiny_seed: Optional[i
             where = f"tiny random teacher with the U-Net of {a['unet']} ({opts['kind']})"
     else:
         where = a["teacher"] or find_snapshot(a["repo"], a["revision"] or None)
+        extra = {"vae_dtype": vae_dtype} if vae_dtype is not None else {}
         source = load_teacher(where, device=a["device"], dtype=DTYPES[a["dtype"]], vae=vae, unet=a["unet"] or None,
-                              **opts)
+                              **extra, **opts)
         if a["unet"]:
             where = f"{where} with the U-Net of {a['unet']}"
     return source, where
@@ -236,7 +238,7 @@ def load_source(a: dict, vae: bool = False, seed: int = 0, tiny_seed: Optional[i
 def _teacher(a: dict, vae: bool = False):
     """The teacher and where it came from; with ``vae`` it carries its image decoder, kept in float32 whatever
     ``dtype`` is (cast after the teacher's own move, so nothing casts it back)."""
-    teacher, where = load_source(a, vae=vae, seed=int(a["seed"]))
+    teacher, where = load_source(a, vae=vae, seed=int(a["seed"]), vae_dtype=torch.float32 if vae else None)
     if vae:
         teacher.vae.float()
     return teacher, where
@@ -474,7 +476,7 @@ def _run(a: dict, det) -> dict:
     teacher, where = _teacher(a)
     log(f"CAPTURE {a['variant']}: teacher {where}; torch {torch.__version__}; package {__version__}")
     probe = _probe(a, teacher)
-    refs = {b: reads.teacher_answers(teacher, probe, b) for b in BANDS}
+    refs = None if a["variant"] == "chain_read" else {b: reads.teacher_answers(teacher, probe, b) for b in BANDS}
     rows = []
     result = {"experiment": EXPERIMENT, "variant": a["variant"], "teacher": where,
               "args": {k: a[k] for k in sorted(a) if not (k == "det" and not a[k])}, "torch": torch.__version__,
@@ -482,17 +484,22 @@ def _run(a: dict, det) -> dict:
               "probe": _probe_record(a, probe), "process": teacher.record()}
     curve_text = ""
     if a["variant"] == "born":
-        from ..capture.engine import build_engine
+        from ..capture.engine import build_engine, param_count
         full = build_engine(teacher, "full", text=True).eval()     # the shape full with the prompt: must read exactly 0
+        born_eng = build_engine(teacher, a["shape"], text=bool(a["text"])).eval()
+        born_params = param_count(born_eng)
+        born_share = born_params / param_count(teacher)
         for b in BANDS:
             copy_read = reads.band_read(teacher, teacher, b, probe, refs[b])
             full_read = reads.band_read(full, teacher, b, probe, refs[b])
-            born = reads.born_read(teacher, a["shape"], b, probe, text=bool(a["text"]), reference=refs[b])
+            born = reads.band_read(born_eng, teacher, b, probe, refs[b])
+            born.update({"shape": born_eng.shape.name, "text": bool(a["text"]),
+                         "params": born_params, "share": born_share})
             rows.append({"band": b, "part": "teacher copy", "mse": copy_read["mse"]})
             rows.append({"band": b, "part": "full copy with the prompt", "mse": full_read["mse"]})
             rows.append({"band": b, "part": f"{born['shape']} as born", "mse": born["mse"], "share": born["share"]})
             result.setdefault("reads", {})[b] = {"teacher_copy": copy_read, "full_copy": full_read, "born": born}
-        del full
+        del full, born_eng
     elif a["variant"] == "band_engine":
         from ..capture.schedule import band_index
         band = BANDS[band_index(a["band"])]
@@ -581,7 +588,7 @@ def _run(a: dict, det) -> dict:
         from ..capture.schedule import band_index
         band = BANDS[band_index(a["band"])]
         r = reads.exchange(Assembly(parts), band, other, probe, teacher=teacher, sample_steps=int(a["sample_steps"]),
-                           guidance=float(a["guidance"]), group=int(a["group"]))
+                           guidance=float(a["guidance"]), group=int(a["group"]), references=refs)
         result.update({"parts": a["parts"], "band": band, "other": a["other"], "exchange": r})
         for b in BANDS:
             x = r["bands"][b]
@@ -693,6 +700,9 @@ def _run_pictures(a: dict, det, log, t0: float) -> dict:
     pics = pictures.decode(teacher.vae, z, batch=int(a["decode_batch"]))
     t3 = time.time()
     log(f"decoded {n:,} pictures {tuple(pics.shape[1:])} in {t3 - t2:.1f} s")
+    del teacher, z, x0
+    if str(a["device"]).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     judge = score.make_judge(a["judge"], a["device"])
     feats = np.asarray(judge.features(pics), dtype=np.float32)
     saved = {"features": feats, "rows": file_rows}

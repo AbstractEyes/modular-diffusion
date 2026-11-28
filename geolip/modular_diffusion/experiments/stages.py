@@ -1030,6 +1030,7 @@ def _run(a: dict, det) -> dict:
         steps_block = []
         frozen_ok = True
         res = None
+        last_grow_read = None
         for i, (name, n) in enumerate(steps_plan):
             e = UnitEntry(name, "DepthBlock", {"site": "trunk", "slot": 2 + i}, {})
             unit = born("DepthBlock", seed, name, e.address, e.spec, b0.geometry)
@@ -1053,6 +1054,7 @@ def _run(a: dict, det) -> dict:
                 for pn, v in res["averaged"][entry].items():
                     named[pn].copy_(v.to(device=named[pn].device, dtype=named[pn].dtype))
             r_avg = read(model, bed, heldout, device)
+            last_grow_read = r_avg
             hashes = {u.name: content_hash(u) for u in model.units}
             steps_block.append({"block": name, "birth_gap": gap, "steps": n, "stream_seed": stream_seed, "last": last,
                                 "averaged": {"key": key, "loss_over_levels": r_avg["loss_over_levels"],
@@ -1073,7 +1075,7 @@ def _run(a: dict, det) -> dict:
         avg_folders = []
 
     log("READ the assembled model")
-    whole = read(final, bed, heldout, device)
+    whole = last_grow_read if variant == "grow" and last_grow_read is not None else read(final, bed, heldout, device)
     cn = class_numbers(whole)
     result: Dict[str, Any] = {
         "experiment": EXPERIMENT, "variant": variant, "seed": seed, "kind": kind, "cuts": list(cuts), "soft": soft,

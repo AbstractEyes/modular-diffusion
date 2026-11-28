@@ -217,9 +217,11 @@ def merge_lora(model, folder: str) -> dict:
         target = params.get(name + ".weight")
         if target is None:
             raise KeyError(f"the adapter's module {name} is not in the model")
+        compute_dtype = torch.float32 if target.is_cuda else torch.float64
         with torch.no_grad():
-            delta = (b.double() @ a.double()) * scale
-            target.add_(delta.to(target.dtype).to(target.device))
+            delta = (b.to(device=target.device, dtype=compute_dtype)
+                     @ a.to(device=target.device, dtype=compute_dtype)) * scale
+            target.add_(delta.to(target.dtype))
         pairs += 1
     if not pairs:
         raise ValueError(f"no LoRA pairs in {folder}")
@@ -237,7 +239,10 @@ class ChatWriter:
                  local_only: bool = True, batch: int = 8, max_new_tokens: int = 512, system: Optional[str] = None):
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
-        dtypes = {"": torch.float32, "fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
+        default_dtype = torch.float32
+        if str(device).startswith("cuda") and torch.cuda.is_available():
+            default_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        dtypes = {"": default_dtype, "fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
         if dtype not in dtypes:
             raise ValueError(f"dtype is empty, fp32, fp16 or bf16, not {dtype!r}")
         self.device, self.batch, self.max_new_tokens, self.system = device, int(batch), int(max_new_tokens), system
@@ -245,7 +250,7 @@ class ChatWriter:
         self.processor = AutoProcessor.from_pretrained(folder)
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
         self.tokenizer.padding_side = "left"
-        self.model = AutoModelForImageTextToText.from_pretrained(folder, dtype=dtypes[dtype]).eval()
+        self.model = AutoModelForImageTextToText.from_pretrained(folder, dtype=dtypes[dtype]).eval().to(device)
         self.merge = None
         if adapter:
             afolder = _local_folder(adapter, adapter_revision or None, local_only)
@@ -254,9 +259,8 @@ class ChatWriter:
             except ImportError:
                 self.merge = dict(merge_lora(self.model, afolder), how="plain sum")
             else:
-                self.model = PeftModel.from_pretrained(self.model, afolder).merge_and_unload().eval()
+                self.model = PeftModel.from_pretrained(self.model, afolder).merge_and_unload().eval().to(device)
                 self.merge = {"how": "peft merge_and_unload"}
-        self.model.to(device)
         template = getattr(self.processor, "chat_template", None) or getattr(self.tokenizer, "chat_template", "") or ""
         self.thinking_switch = "enable_thinking" in str(template)
         self.name = model + (f" + {adapter}" if adapter else "")
