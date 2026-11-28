@@ -18,8 +18,8 @@ address pairs inside attention, served by the amplitude gate over the same addre
 |          | (``members.pointer_lists(n, count, 6000 + n, held, distinct=True)`` and the same with                  |
 |          | ``only_held=True``; start noise seeded 7500 + n and 7600 + n; n of ``pointer_ns``): on the requests    |
 |          | that state their color, thing right and color right; on the pointing request, its thing right and its |
-|          | color right (the judged color of its cell is the asked request's); beside it THE ADDRESS-BLIND         |
-|          | REFERENCE of the very lists used; a sheet                                                              |
+|          | color right (the judged color of its cell is the asked request's); beside it THE TWO ADDRESS-BLIND     |
+|          | REFERENCES of the very lists used; a sheet                                                             |
 | address  | the address reads at the noise levels 0 and ``ts`` (FIND, SERVE, the two together with their two       |
 |          | controls, a missing and an unheld address, the tolerance control)                                       |
 | exchange | ``members.exchange_read`` between the collective and the same collective with the engine of            |
@@ -32,10 +32,18 @@ THE ENGINES are found under ``parts`` (one folder or several, separated by comma
 the kind, the class, the bed, the seed, ``part_steps``, the shape, ``exclude`` and ``held``, and read with their
 averaged weights; the base is the class "base".
 
-THE ADDRESS-BLIND REFERENCE (compose, per n): for every list in which a request points, a guesser that sees every
-other request's stated color and not the pointer names the most frequent color among them; it is right with
-probability (1 / the number of colors tied for the most) when the asked color is among them, else 0; the reference is
-the mean over the lists. With distinct colors it is 1 / (n - 1).
+THE TWO ADDRESS-BLIND REFERENCES (compose, per n and per job, each the mean over the lists in which a request points;
+written beside each other, with the number of lists and the histogram of k):
+    reference_all_stated  a guesser that sees every other request's stated color and no class at all names the most
+                          frequent color among them; it is right with probability (1 / the number of colors tied for
+                          the most) when the asked color is among them, else 0. With distinct colors it is 1 / (n - 1).
+                          The null of a kind that can see no class (pairs not turned).
+    reference_eligible    a guesser that reads the other requests' classes but not which one is asked names one of the
+                          asking cell's ELIGIBLE DONORS (``members.eligible_donors``: a request whose class stands once,
+                          differs from the asking class and is outside the held pairs, or inside them for the held job);
+                          given the asking cell the asked one is uniform over them, so with distinct colors it is right
+                          with probability 1 / k, k the number of eligible donors. The best any engine can do WITHOUT
+                          its own pointer: the stricter bar (never below the other).
 
 THE ADDRESS READS (``address``). The noise levels are t = 0 (pure noise, no trace of the picture) and ``ts``; each is
 reported apart. At a level t a picture x in model space and its noise give z = (1 - t) noise + t x.
@@ -49,7 +57,14 @@ reported apart. At a level t a picture x in model space and its noise give z = (
                  mean change (the weight on a candidate when it is asked minus when the other is), the mean change of
                  each pair group's score; and the share of rows in which the engine's one-step picture of the cell,
                  x_hat = z + (1 - t) v, is nearer in mean color over the cell (pixels) to the asked candidate's color
-                 than to the other's, under each ask
+                 than to the other's, under each ask. ``k`` is the number of rows DRAWN for each engine; the rows
+                 used are fewer by the skips (per engine and in total: drawn, used, each skip reason). THE RECEIPTS,
+                 since a signed mean of zero does not show that nothing moved and two separate rates do not show how
+                 often one row switched the right way: per block the largest |weight under ask a - weight under ask
+                 b| over rows, heads and both candidates, the same of the pair-group scores, and the rows whose
+                 weights and raw answers are exactly equal under the two asks (of ``rows``); per level the largest
+                 absolute change of the raw answers (block 0's pass) and the rows in which the picture is nearer the
+                 asked color under BOTH asks, under ask a only, under ask b only, under neither (of ``rows``)
     the scenes   of the other reads: ``k`` lists of ``members.pointer_lists(4, k, 31000)`` (no pointer for the told
                  "own" kinds), rendered from a generator seeded 31001, the noise of level t from one seeded 31002 +
                  round(1000 t); on each scene the edited cell is the first request that neither points nor is asked,
@@ -182,8 +197,21 @@ def load_collective(a: dict, seed: Optional[int] = None, twin: Optional[Dict[Opt
 
 
 # ------------------------------------------------------------------ compose
+def eligible_reference(pl: MB.PointerLists) -> dict:
+    """The eligible-donor reference of the lists that point (``reference_eligible`` of the module's text): {"mean",
+    "lists", "k_histogram"} (k as text -> the number of lists)."""
+    ks = [int(k) for k, p in zip(pl.eligible.tolist(), pl.pointed.tolist()) if p]
+    if any(k < 1 for k in ks):
+        raise RuntimeError("a list that points has an asking cell without an eligible donor")
+    hist: Dict[str, int] = {}
+    for k in sorted(ks):
+        hist[str(k)] = hist.get(str(k), 0) + 1
+    return {"mean": sum(1.0 / k for k in ks) / len(ks) if ks else None, "lists": len(ks), "k_histogram": hist}
+
+
 def blind_reference(cells: torch.Tensor, colors: torch.Tensor, points: torch.Tensor) -> dict:
-    """The address-blind reference of the lists that point (see the module's text): {"mean", "lists"}."""
+    """The all-stated address-blind reference of the lists that point (``reference_all_stated`` of the module's
+    text): {"mean", "lists"}."""
     vals = []
     for i in range(cells.shape[0]):
         ps = [c for c in range(9) if int(points[i, c]) >= 0]
@@ -261,12 +289,15 @@ def _run_compose(a: dict, log) -> dict:
                 reads = {name: pointing_reads(jm, pix, pl.cells, pl.colors, pl.points) for name, jm in judges}
                 first = reads[judges[0][0]]
                 blind = blind_reference(pl.cells, pl.colors, pl.points)
-                pointing.setdefault(label, {})[str(n)] = dict(first, by_judge=reads, blind_reference=blind,
-                                                              distinct_colors=True, seconds=time.time() - t0)
+                elig = eligible_reference(pl)
+                pointing.setdefault(label, {})[str(n)] = dict(first, by_judge=reads, reference_all_stated=blind,
+                                                              reference_eligible=elig, distinct_colors=True,
+                                                              seconds=time.time() - t0)
                 if n == 4 and not only:
                     sheets.append(pix[:8])
                 log(f"pointing lists ({label}) n={n}: pointing color right {first['pointing_color_right']['mean']} "
-                    f"against the address-blind {blind['mean']}; stated color right "
+                    f"against a guess among every other stated color {blind['mean']} and a guess among the eligible "
+                    f"requests {elig['mean']} ({elig['lists']} lists, k {elig['k_histogram']}); stated color right "
                     f"{first['stated_color_right']['mean']}")
     if int(a["sheet"]):
         write_sheet(os.path.join(a["out"], "sheet.jpg"), sheets)
@@ -317,26 +348,34 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
     bed = S.ScenesBed(a["bed"], "cpu")
     dev = a["device"]
     depth = len(next(iter(col.things.values())).blocks)
-    out = {"vary": vary, "by_t": {}}
+    out = {"vary": vary, "k_rows_drawn_per_engine": int(a["k"]), "by_t": {}}
     for t in _levels(a):
-        acc = {"rows": 0, "skipped_same_color": 0, "skipped_no_candidate": 0, "skipped_no_pointer": 0,
-               "nearer_asked_a": 0, "nearer_asked_b": 0, "blocks": {}}
+        acc = {"rows": 0, "rows_drawn": 0, "skipped_same_color": 0, "skipped_no_candidate": 0,
+               "skipped_no_pointer": 0, "nearer_asked_a": 0, "nearer_asked_b": 0, "both_nearer": 0, "only_a": 0,
+               "only_b": 0, "neither": 0, "max_abs_answer_delta": 0.0, "per_engine": {}, "blocks": {}}
         sums = {}
         for cls, eng in col.things.items():
             gen = torch.Generator().manual_seed(FIND_SEED + 100 * cls)
             mb = MB.member_batch(variant, cls, bed, int(a["k"]), gen, 1.0, _exclude(a), held_pairs(a["held"]))
             z_all = _noisy_at(mb["x"], t, FIND_SEED + 100 * cls + 1 + int(round(1000 * t)))
+            mine = {"drawn": int(mb["x"].shape[0]), "used": 0, "skipped_same_color": 0, "skipped_no_candidate": 0,
+                    "skipped_no_pointer": 0}
+            acc["per_engine"][str(cls)] = mine
+            acc["rows_drawn"] += mine["drawn"]
             for i in range(mb["x"].shape[0]):
                 own = [c for c in range(9) if int(mb["cells"][i, c]) == cls and int(mb["points"][i, c]) >= 0]
                 if not own:
                     acc["skipped_no_pointer"] += 1
+                    mine["skipped_no_pointer"] += 1
                     continue
                 cell = own[0]
                 ask_a = int(mb["points"][i, cell])
                 ask_b, why = _second_candidate(mb["cells"][i], mb["colors"][i], mb["points"][i], cls, ask_a)
                 if ask_b is None:
                     acc["skipped_" + why] += 1
+                    mine["skipped_" + why] += 1
                     continue
+                mine["used"] += 1
                 visible = mb["visible"][i:i + 1] if mb["visible"] is not None else None
                 z = z_all[i:i + 1].to(dev)
                 tt = torch.full((1,), float(t), device=dev)
@@ -348,7 +387,9 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
                 for blk in range(depth):
                     r = MB.find_read(eng, variant, z, tt, mb["cells"][i:i + 1], mb["colors"][i:i + 1],
                                      mb["points"][i:i + 1], 0, cell, ask_a, ask_b, blk, visible=visible, vary=vary)
-                    s = sums.setdefault(blk, {"w_asked_a": 0.0, "w_asked_b": 0.0, "change": 0.0, "groups": 0.0})
+                    s = sums.setdefault(blk, {"w_asked_a": 0.0, "w_asked_b": 0.0, "change": 0.0, "groups": 0.0,
+                                              "max_abs_weight_delta": 0.0, "max_abs_score_delta": 0.0,
+                                              "rows_exactly_equal": 0})
                     wa, wb = r["weights_a"].double(), r["weights_b"].double()           # [H, 2]
                     s["w_asked_a"] = s["w_asked_a"] + wa[:, 0]
                     s["w_asked_b"] = s["w_asked_b"] + wb[:, 1]
@@ -356,25 +397,40 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
                     ga = r["scores_a"].double()[:, 0] - r["scores_b"].double()[:, 0]     # [H, 8] on candidate a
                     gb = r["scores_b"].double()[:, 1] - r["scores_a"].double()[:, 1]
                     s["groups"] = s["groups"] + 0.5 * (ga + gb)
+                    s["max_abs_weight_delta"] = max(s["max_abs_weight_delta"], float((wa - wb).abs().max()))
+                    s["max_abs_score_delta"] = max(s["max_abs_score_delta"],
+                                                   float((r["scores_a"].double() - r["scores_b"].double()).abs().max()))
+                    s["rows_exactly_equal"] += int(torch.equal(r["weights_a"], r["weights_b"])
+                                                   and torch.equal(r["answer_a"], r["answer_b"]))
                     if blk == 0:
+                        acc["max_abs_answer_delta"] = max(acc["max_abs_answer_delta"], float(
+                            (r["answer_a"].double() - r["answer_b"].double()).abs().max()))
                         zt = patchify(z, S.PATCH)[0, MB._tokens_of(cell, z.device)].cpu()
-                        for tag, ans, mine, other in (("a", r["answer_a"], ca, cb), ("b", r["answer_b"], cb, ca)):
+                        nearer = {}
+                        for tag, ans, want, other in (("a", r["answer_a"], ca, cb), ("b", r["answer_b"], cb, ca)):
                             m = _mean_color(zt + (1 - t) * ans.cpu())
-                            if float((m - mine).norm()) < float((m - other).norm()):
+                            nearer[tag] = float((m - want).norm()) < float((m - other).norm())
+                            if nearer[tag]:
                                 acc["nearer_asked_" + tag] += 1
+                        acc[{(True, True): "both_nearer", (True, False): "only_a", (False, True): "only_b",
+                             (False, False): "neither"}[(nearer["a"], nearer["b"])]] += 1
         rows = max(1, acc["rows"])
         for blk, s in sums.items():
             acc["blocks"][str(blk)] = {
                 "weight_on_asked_under_ask_a": (s["w_asked_a"] / rows).tolist(),
                 "weight_on_asked_under_ask_b": (s["w_asked_b"] / rows).tolist(),
                 "mean_change_of_the_asked_weight": (s["change"] / rows).tolist(),
-                "mean_change_by_group": {g: (s["groups"][:, j] / rows).tolist() for j, g in enumerate(MB.GROUPS)}}
+                "mean_change_by_group": {g: (s["groups"][:, j] / rows).tolist() for j, g in enumerate(MB.GROUPS)},
+                "max_abs_weight_delta": s["max_abs_weight_delta"], "max_abs_score_delta": s["max_abs_score_delta"],
+                "rows_exactly_equal": s["rows_exactly_equal"], "rows": acc["rows"]}
         acc["share_nearer_asked_a"] = acc["nearer_asked_a"] / acc["rows"] if acc["rows"] else None
         acc["share_nearer_asked_b"] = acc["nearer_asked_b"] / acc["rows"] if acc["rows"] else None
         out["by_t"][str(t)] = acc
-        log(f"FIND t={t}: {acc['rows']} rows (skipped: {acc['skipped_same_color']} same color, "
-            f"{acc['skipped_no_candidate']} no second candidate, {acc['skipped_no_pointer']} no pointer); nearer the "
-            f"asked color: {acc['share_nearer_asked_a']} / {acc['share_nearer_asked_b']}")
+        log(f"FIND t={t}: {acc['rows']} rows used of {acc['rows_drawn']} drawn (skipped: {acc['skipped_same_color']} "
+            f"same color, {acc['skipped_no_candidate']} no second candidate, {acc['skipped_no_pointer']} no pointer); "
+            f"nearer the asked color: {acc['share_nearer_asked_a']} / {acc['share_nearer_asked_b']}; both asks "
+            f"right in {acc['both_nearer']} of {acc['rows']} rows (only a {acc['only_a']}, only b {acc['only_b']}, "
+            f"neither {acc['neither']}); largest answer change {acc['max_abs_answer_delta']}")
     return out
 
 
@@ -636,24 +692,44 @@ def _text(result: dict) -> str:
         for label, by_n in result["pointing"].items():
             lines += ["", f"LISTS THAT POINT ({label.replace('_', ' ')}; distinct colors)", "",
                       "| n | stated: thing right | stated: color right | pointing: thing right | pointing: color right "
-                      "| address-blind reference |", "|---|---|---|---|---|---|"]
+                      "| a guess among every other stated color | a guess among the eligible requests only | lists "
+                      "| k (eligible requests): lists |", "|---|---|---|---|---|---|---|---|---|"]
             lines += [f"| {n} | {_m(r['stated_thing_right'])} | {_m(r['stated_color_right'])} | "
                       f"{_m(r['pointing_thing_right'])} | {_m(r['pointing_color_right'])} | "
-                      f"{_f(r['blind_reference']['mean'])} |" for n, r in by_n.items()]
+                      f"{_f(r['reference_all_stated']['mean'])} | {_f(r['reference_eligible']['mean'])} | "
+                      f"{r['reference_eligible']['lists']} | "
+                      f"{', '.join(f'{k}: {c}' for k, c in r['reference_eligible']['k_histogram'].items())} |"
+                      for n, r in by_n.items()]
         lines.append(f"\ninconclusive: {_f(result['inconclusive'])}")
     elif v == "address":
         find = result["find"]
         if "by_t" in find:
-            lines += [f"FIND (vary {find['vary']})", "", "| t | rows | skipped: same color | block | head | weight on the "
-                      "asked (ask a) | (ask b) | mean change | nearer the asked color (a / b) |",
-                      "|---|---|---|---|---|---|---|---|---|"]
+            lines += [f"FIND (vary {find['vary']}; k = {find.get('k_rows_drawn_per_engine')} rows drawn for each "
+                      "engine)", "", "| t | rows | skipped: same color | block | head | weight on the "
+                      "asked (ask a) | (ask b) | mean change | nearer the asked color (a / b) | largest weight change "
+                      "| largest score change | rows exactly equal |",
+                      "|---|---|---|---|---|---|---|---|---|---|---|---|"]
             for t, x in find["by_t"].items():
                 for blk, b in x["blocks"].items():
                     for h in range(len(b["mean_change_of_the_asked_weight"])):
                         lines.append(f"| {t} | {x['rows']} | {x['skipped_same_color']} | {blk} | {h} | "
                                      f"{_f(b['weight_on_asked_under_ask_a'][h])} | {_f(b['weight_on_asked_under_ask_b'][h])}"
                                      f" | {_f(b['mean_change_of_the_asked_weight'][h])} | "
-                                     f"{_f(x['share_nearer_asked_a'])} / {_f(x['share_nearer_asked_b'])} |")
+                                     f"{_f(x['share_nearer_asked_a'])} / {_f(x['share_nearer_asked_b'])} | "
+                                     f"{_f(b['max_abs_weight_delta'])} | {_f(b['max_abs_score_delta'])} | "
+                                     f"{b['rows_exactly_equal']} of {b['rows']} |")
+            lines += ["", "| t | rows used | nearer the asked color under both asks | ask a only | ask b only | neither "
+                      "| largest change of the raw answers |", "|---|---|---|---|---|---|---|"]
+            lines += [f"| {t} | {x['rows']} | {x['both_nearer']} | {x['only_a']} | {x['only_b']} | {x['neither']} | "
+                      f"{_f(x['max_abs_answer_delta'])} |" for t, x in find["by_t"].items()]
+            lines += ["", "| t | engine | rows drawn | rows used | skipped: no pointer | same color | no second "
+                      "candidate |", "|---|---|---|---|---|---|---|"]
+            for t, x in find["by_t"].items():
+                for cls, e in x["per_engine"].items():
+                    lines.append(f"| {t} | {cls} | {e['drawn']} | {e['used']} | {e['skipped_no_pointer']} | "
+                                 f"{e['skipped_same_color']} | {e['skipped_no_candidate']} |")
+                lines.append(f"| {t} | all | {x['rows_drawn']} | {x['rows']} | {x['skipped_no_pointer']} | "
+                             f"{x['skipped_same_color']} | {x['skipped_no_candidate']} |")
         lines += ["", "| t | scenes | serve: old before | serve: new after | same denominator | together: new after | "
                   "other cells unchanged | unturned gate identical | others' change (median) | missing: base | "
                   "unheld: base | tolerance (median / p95) |", "|" + "---|" * 12]

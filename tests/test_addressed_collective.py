@@ -45,6 +45,22 @@ def test_the_entry_point_reaches_the_experiment_and_the_arguments_parse(tmp_path
     _files(tmp_path / "timing")
 
 
+def test_the_eligible_reference_is_one_over_k_and_never_below_the_all_stated_one():
+    for n in (3, 4, 6, 9):
+        for only, held in ((False, ()), (False, A.held_pairs("plus4")), (True, A.held_pairs("plus4"))):
+            pl = MB.pointer_lists(n, 300, 6000 + n, held, only_held=only, distinct=True)
+            el = A.eligible_reference(pl)
+            al = A.blind_reference(pl.cells, pl.colors, pl.points)
+            ks = [int(k) for k, p in zip(pl.eligible.tolist(), pl.pointed.tolist()) if p]
+            assert el["lists"] == al["lists"] == len(ks) == int(pl.pointed.sum())
+            assert {int(k): c for k, c in el["k_histogram"].items()} == {k: ks.count(k) for k in set(ks)}
+            if ks:
+                assert abs(el["mean"] - sum(1 / k for k in ks) / len(ks)) < 1e-12
+                assert el["mean"] >= al["mean"] - 1e-12 and max(ks) <= n - 1
+            print("n", n, "only_held", only, "held", bool(held), ": eligible", el["mean"], "all stated", al["mean"],
+                  "k", el["k_histogram"])
+
+
 def test_parts_write_every_engine_and_their_results(runs):
     r = _files(runs / "parts_T2_0")
     assert [e["cls"] for e in r["engines"]] == [0, 1, None] and all("descended" in e for e in r["engines"])
@@ -70,9 +86,12 @@ def test_compose_writes_the_stored_and_the_pointing_reads_and_repeats_exactly(ru
         for label in r["pointing"].values():
             x = label["4"]
             for key in ("stated_thing_right", "stated_color_right", "pointing_thing_right", "pointing_color_right",
-                        "blind_reference", "distinct_colors"):
+                        "reference_all_stated", "reference_eligible", "distinct_colors"):
                 assert key in x, key
-            assert x["blind_reference"]["mean"] is None or abs(x["blind_reference"]["mean"] - 1 / 3) < 1e-12
+            assert x["reference_all_stated"]["mean"] is None or abs(x["reference_all_stated"]["mean"] - 1 / 3) < 1e-12
+            el = x["reference_eligible"]
+            assert el["lists"] == x["reference_all_stated"]["lists"] == sum(el["k_histogram"].values())
+            assert el["mean"] is None or el["mean"] >= x["reference_all_stated"]["mean"]
     for res in (r, again):                                                     # the clock is the one thing that differs
         for block in [res["stored"]] + list(res["pointing"].values()):
             for x in block.values():
@@ -90,9 +109,23 @@ def test_address_runs_every_read(runs, tmp_path, kind, held, depth):
     else:
         assert r["find"]["vary"] == ("content" if kind == "C2" else "query")
         assert set(r["find"]["by_t"]) == {"0.0", "0.3"}
+        assert r["find"]["k_rows_drawn_per_engine"] == 16
         for x in r["find"]["by_t"].values():
-            for key in ("rows", "skipped_same_color", "skipped_no_candidate", "share_nearer_asked_a", "blocks"):
+            for key in ("rows", "skipped_same_color", "skipped_no_candidate", "share_nearer_asked_a", "blocks",
+                        "rows_drawn", "both_nearer", "only_a", "only_b", "neither", "max_abs_answer_delta",
+                        "per_engine"):
                 assert key in x, key
+            assert x["both_nearer"] + x["only_a"] + x["only_b"] + x["neither"] == x["rows"]
+            assert x["both_nearer"] + x["only_a"] == x["nearer_asked_a"]
+            assert x["rows_drawn"] == 16 * len(x["per_engine"]) == sum(e["drawn"] for e in x["per_engine"].values())
+            assert x["rows"] == sum(e["used"] for e in x["per_engine"].values())
+            for e in x["per_engine"].values():
+                assert e["drawn"] == e["used"] + e["skipped_no_pointer"] + e["skipped_same_color"] + \
+                    e["skipped_no_candidate"]
+            for b in x["blocks"].values():
+                for key in ("max_abs_weight_delta", "max_abs_score_delta", "rows_exactly_equal", "rows"):
+                    assert key in b, key
+                assert 0 <= b["rows_exactly_equal"] <= b["rows"] == x["rows"]
     x = r["by_t"]["0.3"]
     for key in ("serve", "together", "unturned_gate_identical", "neutral", "missing", "unheld", "tolerance"):
         assert key in x, key

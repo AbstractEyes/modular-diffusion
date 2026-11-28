@@ -24,8 +24,8 @@ thing's identity is carried, "address" (the member pairs only), "content" (the r
 A LAYOUT is three long tensors [B, 9]: ``cells`` (the thing 0..8 of each cell, -1 for none), ``colors`` (the color a
 thing is DRAWN in, -1 for none) and ``points`` (-1 when the request states its color, else the class 0..8 of the member
 it ASKS). A pointing request is drawn in the asked member's color and its request token carries no color. A valid
-layout (``check_layout``): a pointing cell holds a request; the asked class differs from the pointing request's class,
-stands exactly once in the scene, and its request states its color (no chains).
+layout (``check_layout``): every value lies in -1..8; a pointing cell holds a request; the asked class differs from the
+pointing request's class, stands exactly once in the scene, and its request states its color (no chains).
 
 MEMBER ADDRESSES. ``address_of(cls)`` = (family, member) = (cls div 3, cls mod 3) for a thing; the null (4, 4) for none.
 A mapping {class: (d0, d1)} (digits 0..3) may place a class at another address; every address below is read from it.
@@ -45,8 +45,9 @@ THE STREAMS (the same for every engine: they belong to the picture). The sequenc
                     thing (zeros where empty). QUERIES: the same, except a pointing request's slot and cell: the phases
                     of the asked thing.
     unturned        a read's switch (``prepare(..., unturned=True)``): the place and member pairs 24-29 are left
-                    unturned (angle 0) on every head, the told head's included; the place levels have no null anchor,
-                    so their unturned pairs carry the angle of digit 0.
+                    unturned (angle 0) on every head, the told head's included: identity "name" then carries no name
+                    phases on any head (no told-head angles at all); the place levels have no null anchor, so their
+                    unturned pairs carry the angle of digit 0.
 
 THE REQUEST TOKEN'S CONTENT [B, 9, width]. width 12: the 12 numbers of ``frame.content_code`` (family, member, color
 high, color low; the color numbers zero for a pointing request). width 18: [own identity 6 | color 6 | asked identity
@@ -97,7 +98,9 @@ requests, the asked class stands once in the list and differs from the asking cl
 ``held_pairs`` (inside it with ``only_held``); each list's valid pair with the smallest key[a, q] points (the asking
 request takes the asked color); a list without a valid pair keeps points -1 and is flagged. With ``distinct``, after
 the keys and before the pointer is chosen: perm [count, 9] (rand), and a list's n requests in their drawn order take
-the first n colors of argsort(perm) (n different colors).
+the first n colors of argsort(perm) (n different colors). Each list also carries its asking cell (-1 for none) and k,
+the number of ELIGIBLE DONORS of that cell (the q of its valid pairs; ``eligible_donors``): given the asking cell, the
+asked request is uniform over them.
 
 THE COLLECTIVE (``MemberCollective``). Each engine runs ONE forward over the scenes in which its class is requested
 (told "all": every request, its visible keys by the rule above; told "own": one row a (scene, request) pair, each pair's
@@ -111,6 +114,9 @@ answer kept on its own cell); the base one forward over the scenes with a reques
     serve       v = base v_0 + sum_i w_i v_i                                       (``multirotary.serve``)
 
 The gate reads the declared address digits through the levels' kernel; it never reads an attention weight.
+``MemberCollective.plan`` builds once a batch what the steps of a sampler share (each engine's rows and inputs, the
+gate's weights); ``part_answers``, ``answer``, ``packed_answer`` and ``contributions`` take it as ``plan`` and build one
+when it is not given; ``sample_lists`` builds one a chunk.
 
 THE ADDRESS READS (no training; FINDING and SERVING are read apart, then together):
     find_read       one attention site of one engine: the input of a block's attention captured once, then the scores
@@ -149,7 +155,7 @@ from torch import Tensor
 from . import frame, scenes
 from . import multirotary as M
 from .blocks import Block, TimeEmbedding, ZeroHead
-from .collective import CTX_DIM, TOKEN_DIM, engine_name, kind_batch, sample
+from .collective import CTX_DIM, TOKEN_DIM, engine_name, kind_batch, start_noise
 from .compat import TIME_FREQ
 from .scenes import CANVAS, CHANNELS, N_CELLS, PATCH, TOKEN_GRID, ScenesBed
 from .spectral import patchify, unpatchify
@@ -241,15 +247,38 @@ def no_points(cells: Tensor) -> Tensor:
     return torch.full_like(torch.as_tensor(cells, dtype=torch.long), -1)
 
 
+N_THINGS, N_COLORS = len(scenes.THINGS), len(scenes.COLORS)
+
+
+def _outside(x: Tensor, top: int) -> Tensor:
+    return (x < -1) | (x >= int(top))
+
+
 def check_layout(cells: Tensor, colors: Tensor, points: Tensor) -> None:
-    """Raise unless the layout is valid (see the module's text)."""
+    """Raise unless the layout is valid (see the module's text). Every rule is folded into one predicate, read once
+    (one wait when the layout is on a card); only a broken layout is read rule by rule, to name the rule."""
     if cells.shape != colors.shape or cells.shape != points.shape or cells.dim() != 2 or cells.shape[1] != N_CELLS:
         raise ValueError("a layout is cells, colors and points, each [B, 9]")
+    pointing = points >= 0
+    same = cells[:, None, :] == points[:, :, None]                       # [B, 9 asking, 9 cells]
+    count = same.sum(dim=-1)
+    asked_points = torch.gather(points, 1, same.long().argmax(dim=-1))
+    bad = (_outside(cells, N_THINGS) | _outside(colors, N_COLORS) | _outside(points, N_THINGS)
+           | ((cells >= 0) != (colors >= 0))
+           | (pointing & ((cells < 0) | (points == cells) | (count != 1) | (asked_points >= 0))))
+    if bool(bad.any()):
+        _layout_fault(cells, colors, points)
+
+
+def _layout_fault(cells: Tensor, colors: Tensor, points: Tensor) -> None:
+    """The rule by rule reading of a broken layout: raises the first rule broken."""
+    if bool(_outside(cells, N_THINGS).any() | _outside(points, N_THINGS).any()):
+        raise ValueError(f"cells and points hold -1 or a class 0..{N_THINGS - 1}")
+    if bool(_outside(colors, N_COLORS).any()):
+        raise ValueError(f"colors hold -1 or a color 0..{N_COLORS - 1}")
     if bool(((cells >= 0) != (colors >= 0)).any()):
         raise ValueError("a cell holds a color exactly when it holds a thing")
     pointing = points >= 0
-    if not bool(pointing.any()):
-        return
     if bool((pointing & (cells < 0)).any()):
         raise ValueError("a pointing cell holds no request")
     if bool((pointing & (points == cells)).any()):
@@ -261,6 +290,15 @@ def check_layout(cells: Tensor, colors: Tensor, points: Tensor) -> None:
     asked_cell = same.long().argmax(dim=-1)
     if bool((pointing & (torch.gather(points, 1, asked_cell) >= 0)).any()):
         raise ValueError("an asked request must state its color (no chains)")
+    raise ValueError("the layout is not valid")
+
+
+def _check_class(value, what: str = "a class") -> int:
+    """``value`` as an int, or a ValueError unless it lies in 0..8."""
+    v = int(value)
+    if not 0 <= v < N_CELLS:
+        raise ValueError(f"{what} is 0..{N_CELLS - 1}, not {v}")
+    return v
 
 
 def cell_tokens(per_cell: Tensor) -> Tensor:
@@ -293,28 +331,46 @@ def _positions(device) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     return rows.to(device), cols.to(device), pcol.to(device), prow.to(device)
 
 
+_NAME_TABLE: Optional[Tensor] = None
+_CONSTANTS: Dict[tuple, dict] = {}
+
+
+def _constants(device) -> dict:
+    """The constant tables of ``prepare`` on ``device``, built once a device and shared (never written to): the
+    sequence's positions and place digits, the sequence's cell index, the default address table, the name table and
+    the digit code."""
+    d = torch.device("cpu") if device is None else torch.device(device)
+    key = (d.type, d.index)
+    got = _CONSTANTS.get(key)
+    if got is None:
+        rows, cols, pcol, prow = _positions(d)
+        got = {"rows": rows, "cols": cols, "pcol": pcol, "prow": prow, "seq_cell": _SEQ_CELL.to(d),
+               "address": address_table(None, d), "names": name_table(d).clone(),
+               "digit": frame.digit_code(3).float().to(d)}
+        _CONSTANTS[key] = got
+    return got
+
+
 def streams(variant: Variant, cells: Tensor, points: Tensor,
             addresses: Optional[Mapping[int, Sequence[int]]] = None) -> dict:
     """The positions and digits of the 153-token sequence: rows, cols [B, 153] float64; key_digits, query_digits
-    {level: [B, 153] long}."""
+    {level: [B, 153] long}. A level whose query digits are the keys' carries the very same tensor in both."""
     dev = cells.device
     b = cells.shape[0]
-    rows, cols, pcol, prow = _positions(dev)
-    seq_cell = _SEQ_CELL.to(dev)
-    place = {"place_column": pcol.expand(b, -1), "place_row": prow.expand(b, -1)}
+    const = _constants(dev)
+    seq_cell = const["seq_cell"]
+    place = {"place_column": const["pcol"].expand(b, -1), "place_row": const["prow"].expand(b, -1)}
     if variant.turn and variant.identity != "name":
-        table = address_table(addresses, dev)
+        table = const["address"] if not addresses else address_table(addresses, dev)
         key_cell = table[_index(cells)]                                   # [B, 9, 2]
         query_cell = table[_index(torch.where(points >= 0, points, cells))]
         key_seq, query_seq = key_cell[:, seq_cell], query_cell[:, seq_cell]       # [B, 153, 2]
     else:
         key_seq = query_seq = torch.full((b, SEQ, 2), NULL, dtype=torch.long, device=dev)
     kd = dict(place, member_0=key_seq[..., 0], member_1=key_seq[..., 1])
-    qd = dict(place, member_0=query_seq[..., 0], member_1=query_seq[..., 1])
-    return {"rows": rows.expand(b, -1), "cols": cols.expand(b, -1), "key_digits": kd, "query_digits": qd}
-
-
-_NAME_TABLE: Optional[Tensor] = None
+    qd = dict(kd) if query_seq is key_seq else dict(place, member_0=query_seq[..., 0], member_1=query_seq[..., 1])
+    return {"rows": const["rows"].expand(b, -1), "cols": const["cols"].expand(b, -1), "key_digits": kd,
+            "query_digits": qd}
 
 
 def name_table(device=None) -> Tensor:
@@ -327,10 +383,26 @@ def name_table(device=None) -> Tensor:
     return _NAME_TABLE.to(device)
 
 
+def _stream_angles(st: dict) -> Tuple[Tensor, Tensor]:
+    """(key angles, query angles) [B, 153, 32] of ``streams``: the query angles are the key angles' very tensor when
+    every level's query digits are the keys' tensors; else the key angles with only the levels whose query digits are
+    other tensors recomputed (the cast to float32 acts number by number, so this is the full computation, bit for bit).
+    The digits come from the tables and are not checked again."""
+    kd, qd = st["key_digits"], st["query_digits"]
+    ka = STRUCTURE.angles(st["rows"], st["cols"], kd, check=False)
+    if all(qd[n] is kd[n] for n in STRUCTURE.names):
+        return ka, ka
+    qa = ka.clone()
+    for lv in STRUCTURE.levels:
+        if qd[lv.name] is not kd[lv.name]:
+            qa[..., list(lv.pairs)] = lv.angles(qd[lv.name], check=False).float()
+    return ka, qa
+
+
 def request_content(variant: Variant, cells: Tensor, colors: Tensor, points: Tensor, told: Tensor) -> Tensor:
     """[B, 9, width] float32: the request tokens' content (see the module's text)."""
     dev = cells.device
-    u = frame.digit_code(3).float().to(dev)
+    u = _constants(dev)["digit"]
     t, k, a = cells.clamp_min(0), colors.clamp_min(0), points.clamp_min(0)
     stated = (points < 0).float()[..., None]
     pointing = (points >= 0).float()[..., None]
@@ -349,7 +421,8 @@ def prepare(variant: Variant, cells: Tensor, colors: Tensor, points: Optional[Te
             addresses: Optional[Mapping[int, Sequence[int]]] = None, unturned: bool = False) -> dict:
     """The tensors ``MemberEngine.forward_tokens`` takes (content, query_angles, key_angles, key_mask, told_angles),
     built on the device of ``cells``. ``told`` [B, 9] bool (default every cell holding a request); ``visible``
-    [B, 144] bool or None (every image token)."""
+    [B, 144] bool or None (every image token). When the queries' digits are the keys' on every level, query_angles is
+    the very tensor key_angles (clone before writing into either)."""
     cells = torch.as_tensor(cells, dtype=torch.long)
     dev = cells.device
     colors = torch.as_tensor(colors, dtype=torch.long).to(dev)
@@ -358,16 +431,20 @@ def prepare(variant: Variant, cells: Tensor, colors: Tensor, points: Optional[Te
     b = cells.shape[0]
     told = (cells >= 0) if told is None else (torch.as_tensor(told).to(dev).bool() & (cells >= 0))
     st = streams(variant, cells, points, addresses)
-    ka = STRUCTURE.angles(st["rows"], st["cols"], st["key_digits"])
-    qa = STRUCTURE.angles(st["rows"], st["cols"], st["query_digits"])
+    ka, qa = _stream_angles(st)
     if unturned:
-        ka, qa = ka.clone(), qa.clone()
+        same = qa is ka
+        ka = ka.clone()
         ka[..., list(UNTURNED_PAIRS)] = 0.0
-        qa[..., list(UNTURNED_PAIRS)] = 0.0
+        if same:
+            qa = ka
+        else:
+            qa = qa.clone()
+            qa[..., list(UNTURNED_PAIRS)] = 0.0
     told_angles = None
-    if variant.identity == "name":
-        names = name_table(dev)
-        seq_cell = _SEQ_CELL.to(dev)
+    if variant.identity == "name" and not unturned:                       # unturned: no name phases on any head
+        const = _constants(dev)
+        names, seq_cell = const["names"], const["seq_cell"]
         kp = names[_index(cells)][:, seq_cell]                            # [B, 153, 8]
         qp = names[_index(torch.where(points >= 0, points, cells))][:, seq_cell]
         tk, tq = ka.clone(), qa.clone()
@@ -612,13 +689,32 @@ class PointerLists(NamedTuple):
     points: Tensor      # [count, 9] long
     pointed: Tensor     # [count] bool: the lists in which a request points
     order: Tensor       # [count, n] long: the requested cells in the order they were drawn
+    asking: Tensor      # [count] long: the pointing request's cell, -1 in a list without a pointer
+    eligible: Tensor    # [count] long: k, the number of eligible donors of the asking cell; 0 without a pointer
+
+
+def _donors(valid: Tensor, asking: Tensor) -> Tensor:
+    """[B] long: the number of cells q with valid[b, asking[b], q] (0 where asking is -1)."""
+    r = torch.arange(valid.shape[0], device=valid.device)
+    k = valid[r, asking.clamp_min(0)].sum(dim=-1)
+    return torch.where(asking >= 0, k, torch.zeros_like(k))
+
+
+def eligible_donors(cells: Tensor, asking: Tensor, held_pairs=(), only_held: bool = False) -> Tensor:
+    """[B] long: for each list, the ELIGIBLE DONORS of its asking cell ``asking`` [B] (-1 for none, giving 0): the
+    requests q such that (asking, q) is a valid pair of ``pointer_lists`` (q's class stands once and differs from the
+    asking class, the pair of classes outside ``held_pairs``, inside it with ``only_held``). Given the asking cell, the
+    asked request of ``pointer_lists`` is uniform over these."""
+    cells = torch.as_tensor(cells, dtype=torch.long)
+    return _donors(_valid_pairs(cells, _held_matrix(held_pairs), only_held), torch.as_tensor(asking, dtype=torch.long))
 
 
 def pointer_lists(n: int, count: int, seed: int, held_pairs=(), only_held: bool = False,
                   distinct: bool = False) -> PointerLists:
     """See the module's text. ``distinct``: before the pointer is chosen, the n requests of each list are recolored
     with n different colors (after the keys, from the same generator: perm [count, 9] = rand; a list's requests in their
-    drawn order take the first n colors of argsort(perm)), so that the other requests all differ in color."""
+    drawn order take the first n colors of argsort(perm)), so that the other requests all differ in color; a
+    RuntimeError if two requests of a list still share a color before the pointer copies one."""
     rl = scenes.request_lists(int(n), int(count), int(seed))
     gen = torch.Generator().manual_seed(int(seed) + 50000)
     keys = torch.rand(int(count), N_CELLS, N_CELLS, generator=gen)
@@ -627,6 +723,11 @@ def pointer_lists(n: int, count: int, seed: int, held_pairs=(), only_held: bool 
         perm = torch.rand(int(count), N_CELLS, generator=gen)
         new = torch.argsort(perm, dim=1, stable=True)[:, :int(n)]                # [count, n] distinct colors
         colors.scatter_(1, rl.order, new)                                          # request j of a list -> new[:, j]
+        req = cells >= 0
+        twice = (colors[:, :, None] == colors[:, None, :]) & req[:, :, None] & req[:, None, :] \
+            & ~torch.eye(N_CELLS, dtype=torch.bool)[None]
+        if bool(twice.any()):
+            raise RuntimeError("distinct colors: two requests of a list share a color")
     valid = _valid_pairs(cells, _held_matrix(held_pairs), only_held)
     pointed = valid.flatten(1).any(dim=1)
     ask_cell, asked_cell = _smallest_pair(valid, keys)
@@ -634,7 +735,8 @@ def pointer_lists(n: int, count: int, seed: int, held_pairs=(), only_held: bool 
     rows = torch.nonzero(pointed, as_tuple=True)[0]
     points[rows, ask_cell[rows]] = cells[rows, asked_cell[rows]]
     colors[rows, ask_cell[rows]] = colors[rows, asked_cell[rows]]
-    return PointerLists(cells, colors, points, pointed, rl.order)
+    asking = torch.where(pointed, ask_cell, torch.full_like(ask_cell, -1))
+    return PointerLists(cells, colors, points, pointed, rl.order, asking, _donors(valid, asking))
 
 
 # ------------------------------------------------------------------ the collective
@@ -677,40 +779,97 @@ class MemberCollective:
         visible = frame.visible_keys(cells, serving) if self.variant.see == "masked" else None
         return prepare(self.variant, cells, colors, points, told, visible, self.addresses, unturned)
 
+    def plan(self, cells: Tensor, colors: Tensor, points: Optional[Tensor] = None,
+             unturned: bool = False) -> "CollectivePlan":
+        """Everything of a batch of layouts that does not change over the steps of a sampler, built once on the
+        device of ``cells``: each engine's rows (taken to the CPU once) and its prepared inputs, and the gate's
+        weights and base weight (computed at their first use). Told "all": the content and angles are prepared once
+        for the whole batch and each engine takes its rows of them with its own key mask (the same numbers as a
+        ``prepare`` of its rows alone: every number of ``prepare`` depends on its own row only)."""
+        cells = torch.as_tensor(cells, dtype=torch.long)
+        dev = cells.device
+        colors = torch.as_tensor(colors, dtype=torch.long).to(dev)
+        points = no_points(cells) if points is None else torch.as_tensor(points, dtype=torch.long).to(dev)
+        cells_cpu = cells.cpu()
+        parts = []
+        if self.variant.told == "all":
+            shared = prepare(self.variant, cells, colors, points, None, None, self.addresses, unturned)
+            told = cells >= 0
+
+            def take(cls: Optional[int], rows_cpu: Tensor) -> dict:
+                rows = rows_cpu.to(dev)
+                sub = cells[rows]
+                img = visible_for(sub, cls) if self.variant.see == "masked" else \
+                    torch.ones(rows.shape[0], IMAGE, dtype=torch.bool, device=dev)
+                ta = shared["told_angles"]
+                prep = {"content": shared["content"][rows], "query_angles": shared["query_angles"][rows],
+                        "key_angles": shared["key_angles"][rows], "key_mask": torch.cat([told[rows], img], dim=1),
+                        "told_angles": None if ta is None else (ta[0][rows], ta[1][rows])}
+                if shared["query_angles"] is shared["key_angles"]:
+                    prep["query_angles"] = prep["key_angles"]
+                return {"rows": rows, "prep": prep}
+
+            present = (cells_cpu[:, :, None] == torch.tensor(self.classes, dtype=torch.long)[None, None, :]).any(dim=1)
+            for i, k in enumerate(self.classes):
+                rows_cpu = torch.nonzero(present[:, i], as_tuple=True)[0]
+                parts.append(take(k, rows_cpu) if rows_cpu.numel() else None)
+            base_rows = torch.nonzero((cells_cpu < 0).any(dim=1), as_tuple=True)[0]
+            base_part = take(None, base_rows) if base_rows.numel() else None
+        else:
+            cell_of = _FRAME.cell.to(dev)
+            for k in self.classes:
+                rows_cpu, cols_cpu = torch.nonzero(cells_cpu == k, as_tuple=True)
+                if rows_cpu.numel() == 0:
+                    parts.append(None)
+                    continue
+                rows, cols = rows_cpu.to(dev), cols_cpu.to(dev)
+                prep = self.engine_inputs(k, cells[rows], colors[rows], points[rows], unturned, cell=cols)
+                sel = cell_of[None] == cols[:, None]                            # [P, 144]: each pair's own tokens
+                p_idx, tok = torch.nonzero(sel, as_tuple=True)
+                parts.append({"rows": rows, "prep": prep, "p_idx": p_idx, "tok": tok})
+            base_rows = torch.nonzero((cells_cpu < 0).any(dim=1), as_tuple=True)[0]
+            base_part = None
+            if base_rows.numel():
+                rows = base_rows.to(dev)
+                base_part = {"rows": rows, "prep": self.engine_inputs(None, cells[rows], colors[rows], points[rows],
+                                                                      unturned)}
+        if base_part is not None and self.base is None:
+            raise ValueError("a scene has cells without a request and the collective has no base")
+        return CollectivePlan(self, cells, colors, points, bool(unturned), parts, base_part)
+
+    def _plan_for(self, plan: Optional["CollectivePlan"], dev, cells, colors, points, unturned) -> "CollectivePlan":
+        if plan is None:
+            return self.plan(torch.as_tensor(cells).to(dev), torch.as_tensor(colors).to(dev),
+                             None if points is None else torch.as_tensor(points).to(dev), unturned)
+        if plan.collective is not self:
+            raise ValueError("the plan was built by another collective")
+        if plan.unturned != bool(unturned):
+            raise ValueError(f"the plan was built with unturned={plan.unturned}, not {bool(unturned)}")
+        return plan
+
     def part_answers(self, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor, points: Optional[Tensor] = None,
-                     unturned: bool = False) -> Tuple[Tensor, Tensor]:
+                     unturned: bool = False, plan: Optional["CollectivePlan"] = None) -> Tuple[Tensor, Tensor]:
         """([M, B, 144, 48] the members' answers in class order, [B, 144, 48] the base's); zeros on the scenes an
-        engine is not run on."""
+        engine is not run on. ``plan`` (``plan``, built from the same layout) saves preparing the inputs again."""
         dev = z.device
-        cells, colors = cells.to(dev), colors.to(dev)
-        points = no_points(cells) if points is None else points.to(dev)
+        plan = self._plan_for(plan, dev, cells, colors, points, unturned)
         b = z.shape[0]
         out = torch.zeros(len(self.classes), b, IMAGE, TOKEN_DIM, device=dev, dtype=z.dtype)
-        cell_of = _FRAME.cell.to(dev)
         for i, k in enumerate(self.classes):
-            eng = self.things[k]
+            part = plan.parts[i]
+            if part is None:
+                continue
+            rows = part["rows"]
+            vt = patchify(self.things[k].forward_tokens(z[rows], t[rows], **part["prep"]), PATCH)
             if self.variant.told == "all":
-                rows = torch.nonzero((cells == k).any(dim=1), as_tuple=True)[0]
-                if rows.numel() == 0:
-                    continue
-                prep = self.engine_inputs(k, cells[rows], colors[rows], points[rows], unturned)
-                out[i, rows] = patchify(eng.forward_tokens(z[rows], t[rows], **prep), PATCH)
-                continue
-            rows, cols = torch.nonzero(cells == k, as_tuple=True)
-            if rows.numel() == 0:
-                continue
-            prep = self.engine_inputs(k, cells[rows], colors[rows], points[rows], unturned, cell=cols)
-            vt = patchify(eng.forward_tokens(z[rows], t[rows], **prep), PATCH)
-            sel = cell_of[None] == cols[:, None]                                # [P, 144]: each pair's own tokens
-            p_idx, tok = torch.nonzero(sel, as_tuple=True)
-            out[i, rows[p_idx], tok] = vt[p_idx, tok]
+                out[i, rows] = vt
+            else:
+                p_idx, tok = part["p_idx"], part["tok"]
+                out[i, rows[p_idx], tok] = vt[p_idx, tok]
         base = torch.zeros(b, IMAGE, TOKEN_DIM, device=dev, dtype=z.dtype)
-        rows = torch.nonzero((cells < 0).any(dim=1), as_tuple=True)[0]
-        if rows.numel():
-            if self.base is None:
-                raise ValueError("a scene has cells without a request and the collective has no base")
-            prep = self.engine_inputs(None, cells[rows], colors[rows], points[rows], unturned)
-            base[rows] = patchify(self.base.forward_tokens(z[rows], t[rows], **prep), PATCH)
+        if plan.base_part is not None:
+            rows = plan.base_part["rows"]
+            base[rows] = patchify(self.base.forward_tokens(z[rows], t[rows], **plan.base_part["prep"]), PATCH)
         return out, base
 
     # -- the gate
@@ -750,35 +909,72 @@ class MemberCollective:
         return g["w"], g["base"]
 
     # -- the serve
-    def answer(self, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor, points: Optional[Tensor] = None) -> Tensor:
-        answers, base_answer = self.part_answers(z, t, cells, colors, points)
-        w, base = self.weights(cells.to(z.device))
+    def answer(self, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor, points: Optional[Tensor] = None,
+               plan: Optional["CollectivePlan"] = None) -> Tensor:
+        plan = self._plan_for(plan, z.device, cells, colors, points, False)
+        answers, base_answer = self.part_answers(z, t, cells, colors, points, plan=plan)
+        w, base = plan.weights()
         v = M.serve(base_answer, answers, w, base)
         return unpatchify(v, (CHANNELS, CANVAS, CANVAS), PATCH, TOKEN_GRID)
 
-    def packed_answer(self, z: Tensor, t: Tensor, cells: Tensor, packed: Tensor) -> Tensor:
+    def packed_answer(self, z: Tensor, t: Tensor, cells: Tensor, packed: Tensor,
+                      plan: Optional["CollectivePlan"] = None) -> Tensor:
         """``answer`` with colors and points packed as [B, 9, 2] (``pack``): the callable ``collective.sample``
         takes, since it slices its colors argument by rows."""
-        return self.answer(z, t, cells, packed[..., 0], packed[..., 1])
+        return self.answer(z, t, cells, packed[..., 0], packed[..., 1], plan=plan)
 
     def contributions(self, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor,
-                      points: Optional[Tensor] = None, unturned: bool = False) -> Tensor:
+                      points: Optional[Tensor] = None, unturned: bool = False,
+                      plan: Optional["CollectivePlan"] = None) -> Tensor:
         """[M + 1, B, 144, 48]: each member's w_i v_i (class order), the base's base v_0 last."""
-        answers, base_answer = self.part_answers(z, t, cells, colors, points, unturned)
-        w, base = self.weights(cells.to(z.device))
+        plan = self._plan_for(plan, z.device, cells, colors, points, unturned)
+        answers, base_answer = self.part_answers(z, t, cells, colors, points, unturned, plan=plan)
+        w, base = plan.weights()
         parts = [w[..., i].to(answers.dtype)[..., None] * answers[i] for i in range(answers.shape[0])]
         parts.append(base.to(base_answer.dtype)[..., None] * base_answer)
         return torch.stack(parts)
+
+
+class CollectivePlan:
+    """What ``MemberCollective.plan`` builds for one batch of layouts: the layout on its device, ``unturned``, one
+    entry a member in class order (None when the engine runs on no scene; else its rows and prepared inputs, and for
+    told "own" the pair and token indices of its own cells), the base's entry, and the gate's weights at first use."""
+
+    def __init__(self, collective: MemberCollective, cells: Tensor, colors: Tensor, points: Tensor, unturned: bool,
+                 parts: list, base_part: Optional[dict]):
+        self.collective, self.cells, self.colors, self.points = collective, cells, colors, points
+        self.unturned, self.parts, self.base_part = unturned, parts, base_part
+        self._weights: Optional[Tuple[Tensor, Tensor]] = None
+
+    def weights(self) -> Tuple[Tensor, Tensor]:
+        """(w [B, 144, M], base [B, 144]): ``MemberCollective.weights`` of the plan's cells, computed once."""
+        if self._weights is None:
+            self._weights = self.collective.weights(self.cells)
+        return self._weights
 
 
 def pack(colors: Tensor, points: Tensor) -> Tensor:
     return torch.stack([torch.as_tensor(colors, dtype=torch.long), torch.as_tensor(points, dtype=torch.long)], dim=-1)
 
 
+@torch.no_grad()
 def sample_lists(col: MemberCollective, cells: Tensor, colors: Tensor, points: Tensor, seed: int, steps: int = 50,
                  device="cpu", chunk: int = 0) -> Tensor:
-    """``collective.sample`` of request lists with their points."""
-    return sample(col.packed_answer, cells, pack(colors, points), seed, steps=steps, device=device, chunk=chunk)
+    """``collective.sample`` of request lists with their points: the same start noise, chunks and Euler steps, with
+    one ``MemberCollective.plan`` a chunk used at every step (the same numbers as preparing every step)."""
+    n = cells.shape[0]
+    z_all = start_noise(n, seed)
+    size = n if not chunk else int(chunk)
+    outs = []
+    for a in range(0, n, max(1, size)):
+        c, k, p = cells[a:a + size].to(device), colors[a:a + size].to(device), points[a:a + size].to(device)
+        z = z_all[a:a + size].to(device)
+        plan = col.plan(c, k, p)
+        for i in range(int(steps)):
+            t = torch.full((z.shape[0],), i / int(steps), device=device)
+            z = z + col.answer(z, t, c, k, p, plan=plan) / int(steps)
+        outs.append(z.cpu())
+    return torch.cat(outs) if outs else z_all
 
 
 # ------------------------------------------------------------------ the address reads
@@ -816,7 +1012,7 @@ def pair_group_scores(q: Tensor, k: Tensor, query_index: int, key_indices: Seque
         for p in members[g]:
             s = s + per[..., p]
         out.append(s)
-    return torch.stack(out, dim=-1)
+    return torch.stack(out, dim=-1).float()
 
 
 @torch.no_grad()
@@ -824,8 +1020,9 @@ def find_read(engine: MemberEngine, variant: Variant, z: Tensor, t: Tensor, cell
               points: Tensor, scene: int, cell: int, ask_a: int, ask_b: int, block: int,
               told: Optional[Tensor] = None, visible: Optional[Tensor] = None,
               addresses: Optional[Mapping[int, Sequence[int]]] = None, vary: str = "query") -> dict:
-    """FIND at one attention site (see the module's text). ``cell`` holds the pointing request; ``ask_a``, ``ask_b``
-    stand once each in the scene. ``told`` and ``visible`` are rows for the one scene ([1, 9], [1, 144]) or None
+    """FIND at one attention site (see the module's text). ``cell`` holds the pointing request (for ``vary`` "query"
+    a ValueError unless it points); ``ask_a`` and ``ask_b``, two different classes, stand once each in the scene;
+    ``variant`` is the engine's own (a ValueError otherwise). ``told`` and ``visible`` are rows for the one scene ([1, 9], [1, 144]) or None
     (every request told; every image token visible).
 
     ``vary`` "query": the two runs differ ONLY in the query angles of the pointing slot and its cell's image tokens
@@ -840,14 +1037,21 @@ def find_read(engine: MemberEngine, variant: Variant, z: Tensor, t: Tensor, cell
     raw answers on the cell's tokens) and inputs_a, inputs_b (the two runs' ``forward_tokens`` inputs)."""
     if vary not in ("query", "content"):
         raise ValueError("vary is 'query' or 'content'")
+    if engine.variant != variant:
+        raise ValueError(f"the engine is of the variant {engine.variant.name}, not {variant.name}")
     if vary == "content" and variant.identity != "content":
         raise ValueError(f"vary='content' reads an identity carried in the content; {variant.name} carries it "
                          f"by {variant.identity!r}")
+    cell = _check_class(cell, "a cell")
+    if _check_class(ask_a, "an asked class") == _check_class(ask_b, "an asked class"):
+        raise ValueError("the two asks name the same class")
     dev = z.device
     s = slice(int(scene), int(scene) + 1)
     c, k, p = cells[s].to(dev).clone(), colors[s].to(dev).clone(), points[s].to(dev).clone()
     if int(c[0, cell]) < 0:
         raise ValueError("the pointing cell holds no request")
+    if vary == "query" and int(p[0, cell]) < 0:
+        raise ValueError("the read cell's request states its color: it does not point")
     slot_a, slot_b = _the_cell_of(c[0], ask_a), _the_cell_of(c[0], ask_b)
     pa, pb = p.clone(), p.clone()
     pa[0, cell], pb[0, cell] = int(ask_a), int(ask_b)
@@ -906,6 +1110,7 @@ def serve_read(col: MemberCollective, part_answers: Tensor, base_answer: Tensor,
     """SERVE (structural): the gate's numbers on ``cell``'s tokens before the edit cells[scene, cell] = new_class,
     after it, and after the reverse edit; the served values from the given answers; the given raw answers on the cell
     (never recomputed)."""
+    cell, new_class = _check_class(cell, "a cell"), _check_class(new_class)
     dev = part_answers.device
     toks = _tokens_of(cell, dev)
     row = cells[int(scene):int(scene) + 1].to(dev).clone()
@@ -952,6 +1157,7 @@ def address_swap(col: MemberCollective, z: Tensor, t: Tensor, cells: Tensor, col
     that pointer asking a class that stands no longer, or twice, or its own)."""
     if gate not in ("aleph", "neutral"):
         raise ValueError("gate is 'aleph' or 'neutral'")
+    cell, new_class = _check_class(cell, "a cell"), _check_class(new_class)
     dev = z.device
     s = slice(int(scene), int(scene) + 1)
     c, k, p = cells[s].to(dev).clone(), colors[s].to(dev).clone(), points[s].to(dev).clone()
@@ -1003,6 +1209,7 @@ def address_swap(col: MemberCollective, z: Tensor, t: Tensor, cells: Tensor, col
 
 def address_missing(col: MemberCollective, cells: Tensor, scene: int, cell: int) -> dict:
     """The request of ``cell`` removed: the gate's numbers on its tokens."""
+    cell = _check_class(cell, "a cell")
     row = cells[int(scene):int(scene) + 1].clone()
     row[0, cell] = -1
     return _gate_on(col, row, _tokens_of(cell, row.device))
@@ -1011,6 +1218,7 @@ def address_missing(col: MemberCollective, cells: Tensor, scene: int, cell: int)
 def address_unheld(col: MemberCollective, cells: Tensor, scene: int, cell: int) -> dict:
     """The request's class placed on the request side at the first address (d0, d1), digits 0..3 in increasing order,
     that no member holds: the gate's numbers on the cell's tokens, with the address used."""
+    cell = _check_class(cell, "a cell")
     row = cells[int(scene):int(scene) + 1].clone()
     cls = int(row[0, cell])
     if cls < 0:
@@ -1031,6 +1239,8 @@ def exchange_read(col_a: MemberCollective, col_b: MemberCollective, z: Tensor, t
     member (and the base, when it is not exchanged) the largest absolute difference of its contribution."""
     if col_a.classes != col_b.classes:
         raise ValueError("the two collectives hold different classes")
+    if bool(_outside(torch.as_tensor(cells), N_THINGS).any()):
+        raise ValueError(f"cells hold -1 or a class 0..{N_THINGS - 1}")
     exchanged = [kc for kc in col_a.classes if col_a.things[kc] is not col_b.things[kc]]
     ca = col_a.contributions(z, t, cells, colors, points)
     cb = col_b.contributions(z, t, cells, colors, points)

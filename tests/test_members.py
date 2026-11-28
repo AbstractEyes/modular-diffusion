@@ -11,7 +11,7 @@ from geolip.modular_diffusion import collective as C
 from geolip.modular_diffusion import frame, scenes
 from geolip.modular_diffusion import members as MB
 from geolip.modular_diffusion import multirotary as M
-from geolip.modular_diffusion.spectral import patchify
+from geolip.modular_diffusion.spectral import patchify, unpatchify
 
 BED = scenes.ScenesBed("F")
 CELL_OF = frame.TokenFrame().cell                                            # [144]
@@ -498,3 +498,367 @@ def test_16_vmap_over_two_stacked_engines_gives_each_engines_own_output(variant)
     diffs = [float((out[i] - want[i]).abs().max()) for i in range(2)]
     print(variant.name, "vmap against each engine's own forward:", diffs)
     assert max(diffs) < 1e-5
+
+
+# ------------------------------------------------------------------ 17. the unturned streams carry no identity
+def _relabeled_pointer_layout():
+    """``_pointer_layout`` with other classes in the same cells (2 -> 0, 5 -> 1, 3 -> 4, 8 -> 6), the same colors, the
+    pointer asking the class that now stands where the square stood."""
+    cells, colors, points = _pointer_layout()
+    rename = {2: 0, 5: 1, 3: 4, 8: 6}
+    c2 = cells.clone()
+    for old, new in rename.items():
+        c2[cells == old] = new
+    p2 = points.clone()
+    p2[0, 0] = rename[int(points[0, 0])]
+    return c2, colors.clone(), p2
+
+
+@pytest.mark.parametrize("name", list(MB.VARIANTS))
+def test_17_unturned_angles_do_not_depend_on_which_classes_stand_in_the_cells(name):
+    v = MB.VARIANTS[name]
+    one, two = _pointer_layout(), _relabeled_pointer_layout()
+    a, b = MB.prepare(v, *one, unturned=True), MB.prepare(v, *two, unturned=True)
+    assert torch.equal(a["query_angles"], b["query_angles"]) and torch.equal(a["key_angles"], b["key_angles"])
+    if a["told_angles"] is not None or b["told_angles"] is not None:
+        assert all(torch.equal(x, y) for x, y in zip(a["told_angles"], b["told_angles"])), f"{name}: told angles"
+    assert a["told_angles"] is None and b["told_angles"] is None, name
+    ta, tb = MB.prepare(v, *one), MB.prepare(v, *two)
+    differ = not (torch.equal(ta["query_angles"], tb["query_angles"]) and torch.equal(ta["key_angles"], tb["key_angles"]))
+    if ta["told_angles"] is not None:
+        differ = differ or not all(torch.equal(x, y) for x, y in zip(ta["told_angles"], tb["told_angles"]))
+    assert differ == (v.turn or v.identity == "name"), name
+
+
+# ------------------------------------------------------------------ 18. values out of range
+def test_18_check_layout_bounds_every_value():
+    cells, colors, points = _pointer_layout()
+    MB.check_layout(cells, colors, points)
+    for which, value in (("cells", 9), ("colors", 9), ("points", 9), ("cells", -2), ("colors", -2), ("points", -2)):
+        c, k, p = cells.clone(), colors.clone(), points.clone()
+        t = {"cells": c, "colors": k, "points": p}[which]
+        if which == "points":
+            t[0, 2] = value                                                    # the diamond's request
+        else:
+            t[0, 8] = value                                                    # the star's cell
+            if which == "cells" and value == -2:
+                k[0, 8] = -1
+        with pytest.raises(ValueError):
+            MB.check_layout(c, k, p)
+
+
+def test_18b_the_reads_refuse_a_class_or_cell_outside_0_to_8():
+    col = _collective(MB.T2)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(180)), torch.tensor([0.5])
+    g = _gen(181)
+    answers, base_answer = torch.randn(9, 1, 144, 48, generator=g), torch.randn(1, 144, 48, generator=g)
+    for bad in (9, -1):
+        with pytest.raises(ValueError):
+            MB.serve_read(col, answers, base_answer, cells, 0, 2, bad)
+        with pytest.raises(ValueError):
+            MB.address_swap(col, z, t, cells, colors, points, 0, 2, bad)
+    with pytest.raises(ValueError):
+        MB.serve_read(col, answers, base_answer, cells, 0, 9, 6)
+    with pytest.raises(ValueError):
+        MB.address_missing(col, cells, 0, 9)
+    with pytest.raises(ValueError):
+        MB.address_unheld(col, cells, 0, 9)
+    bad_cells = cells.clone()
+    bad_cells[0, 1] = 9
+    with pytest.raises(ValueError):
+        MB.exchange_read(col, col, z, t, bad_cells, colors, points)
+
+
+# ------------------------------------------------------------------ 19. find_read refuses what it cannot read
+def test_19_find_read_refuses_another_variant_a_cell_that_does_not_point_and_one_ask_twice():
+    eng = _engine(MB.T2, 2, 0, depth=2)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(190)), torch.tensor([0.3])
+    with pytest.raises(ValueError):
+        MB.find_read(eng, MB.T3, z, t, cells, colors, points, 0, 0, 3, 8, block=1)
+    with pytest.raises(ValueError):
+        MB.find_read(eng, MB.T2, z, t, cells, colors, points, 0, 2, 3, 8, block=1)      # cell 2 states its color
+    with pytest.raises(ValueError):
+        MB.find_read(eng, MB.T2, z, t, cells, colors, points, 0, 0, 3, 3, block=1)
+
+
+def test_19b_pair_group_scores_are_float32():
+    g = _gen(191)
+    q, k = torch.randn(1, 2, 153, 64, generator=g).double(), torch.randn(1, 2, 153, 64, generator=g).double()
+    assert MB.pair_group_scores(q, k, 0, (4, 8)).dtype == torch.float32
+
+
+# ------------------------------------------------------------------ 20. the tests that were missing
+def test_20_save_and_load_keep_the_weights_the_average_the_variant_and_the_birth(tmp_path):
+    for v, cls in ((MB.T2K, 3), (MB.T2, None)):
+        eng = _engine(v, cls, 4, depth=2)
+        avg = {k: x + 0.25 for k, x in eng.state_dict().items()}
+        folder = str(tmp_path / f"{v.name}_{cls}")
+        MB.save_member(eng, folder, average=avg, card={"bed": "F"})
+        raw, mean = MB.load_member(folder, average=False), MB.load_member(folder, average=True)
+        for k, x in eng.state_dict().items():
+            assert torch.equal(raw.state_dict()[k], x) and torch.equal(mean.state_dict()[k], avg[k]), k
+        for e in (raw, mean):
+            assert e.variant == v and e.cls == cls and e.seed == 4 and e.card["bed"] == "F"
+            assert e.settings == eng.settings
+        MB.save_member(eng, folder + "_plain")
+        assert all(torch.equal(MB.load_member(folder + "_plain").state_dict()[k], x) for k, x in eng.state_dict().items())
+
+
+def test_20b_pack_and_sample_lists_shape_seed_and_chunks():
+    col = _collective(MB.T2, classes=range(9))
+    pl = MB.pointer_lists(4, 6, 200, distinct=True)
+    packed = MB.pack(pl.colors, pl.points)
+    assert tuple(packed.shape) == (6, 9, 2) and torch.equal(packed[..., 0], pl.colors)
+    assert torch.equal(packed[..., 1], pl.points) and packed.dtype == torch.long
+    a = MB.sample_lists(col, pl.cells, pl.colors, pl.points, 11, steps=3)
+    b = MB.sample_lists(col, pl.cells, pl.colors, pl.points, 11, steps=3)
+    c = MB.sample_lists(col, pl.cells, pl.colors, pl.points, 11, steps=3, chunk=4)
+    d = MB.sample_lists(col, pl.cells, pl.colors, pl.points, 12, steps=3)
+    assert tuple(a.shape) == (6, 3, 48, 48) and torch.equal(a, b) and not torch.equal(a, d)
+    diff = float((a - c).abs().max())
+    print("sample_lists chunked against unchunked: largest difference", diff, "; equal", torch.equal(a, c))
+    assert diff < 1e-5
+
+
+def test_20c_a_collective_with_its_own_addresses_moves_the_streams_and_the_gate_together():
+    mapping = {0: (0, 1), 1: (0, 0), 2: (3, 3)}                                # 0 and 1 trade; 2 to a free address
+    things = {k: _engine(MB.T2, k, 0) for k in range(9)}
+    base = _engine(MB.T2, None, 0)
+    col = MB.MemberCollective(things, base, MB.T2, addresses=mapping)
+    plain = MB.MemberCollective(things, base, MB.T2)
+    assert col.member_addresses[[0, 1, 2]].tolist() == [[0, 1], [0, 0], [3, 3]]
+    cells, _ = scenes.draw_layouts("mix", 32, _gen(201))
+    w, b = col.weights(cells)
+    w0, b0 = plain.weights(cells)
+    assert torch.equal(w, w0) and torch.equal(b, b0)                           # the owner is the same thing
+    st = MB.streams(MB.T2, cells, MB.no_points(cells), mapping)
+    seq_cell = torch.cat([torch.arange(9), CELL_OF])
+    for i in range(4):
+        for tok in range(153):
+            c = int(cells[i, seq_cell[tok]])
+            want = tuple(mapping.get(c, MB.address_of(c))) if c >= 0 else MB.NULL_ADDRESS
+            assert (int(st["key_digits"]["member_0"][i, tok]), int(st["key_digits"]["member_1"][i, tok])) == want
+    other = dict(mapping)
+    other[2] = (2, 0)                                                          # the requests of 2 at the plus's address
+    wq, _ = col.weights(cells, request_addresses=other)
+    has2 = (cells == 2).any(dim=1)
+    toks2 = cells[:, CELL_OF] == 2
+    assert bool((wq[..., 2][toks2] == 0.0).all()) and bool((wq[..., 6][toks2] > 0.99).all()) and bool(has2.any())
+
+
+def test_20d_the_candidate_form_sums_to_one_and_is_silent_off_the_address():
+    col = MB.MemberCollective(_collective(MB.T2).things, None, MB.T2, form="candidate")
+    cells, _ = scenes.draw_layouts("mix", 64, _gen(210))
+    w, base = col.weights(cells)
+    total = w.sum(dim=-1) + base
+    assert float((total - 1.0).abs().max()) < 1e-12
+    owner = frame.token_owner(cells, [[k] for k in range(9)])
+    off = torch.nn.functional.one_hot(owner, 10)[..., :9] == 0
+    assert bool((w[off] == 0.0).all())
+    assert float((w[~off] - math.sinh(10.0) / (math.sinh(10.0) + math.exp(-10.0))).abs().max()) < 1e-12
+
+
+def test_20f_eligible_donors_are_counted_on_hand_built_lists():
+    def lists(*rows):
+        out = torch.full((len(rows), 9), -1, dtype=torch.long)
+        for i, r in enumerate(rows):
+            out[i, :len(r)] = torch.tensor(r)
+        return out
+
+    cells = lists([0, 1, 1, 2],        # a duplicated class: the two 1s are no donors -> k = 1 (the 2); held: 0
+                  [0, 0, 1, 2],        # the asker's own class twice: the other 0 is no donor -> k = 2; held: 1
+                  [0, 1, 2],           # k = 2; the pair (0, 2) held -> k = 1 (the 1); only held -> 1 (the 2)
+                  [3, 4, 5, 6, 7])     # four donors
+    asking = torch.tensor([0, 0, 0, 0])
+    held = {(0, 2)}
+    assert MB.eligible_donors(cells, asking).tolist() == [1, 2, 2, 4]
+    assert MB.eligible_donors(cells, asking, held).tolist() == [0, 1, 1, 4]
+    assert MB.eligible_donors(cells, asking, held, only_held=True).tolist() == [1, 1, 1, 0]
+    assert MB.eligible_donors(cells, torch.tensor([-1, 1, 2, 4])).tolist() == [0, 2, 2, 4]
+    pl = MB.pointer_lists(4, 300, 230, distinct=True)
+    for i in range(300):
+        if not bool(pl.pointed[i]):
+            assert int(pl.asking[i]) == -1 and int(pl.eligible[i]) == 0
+            continue
+        a = int(pl.asking[i])
+        assert int(pl.points[i, a]) >= 0
+        row = pl.cells[i].tolist()
+        want = sum(1 for q in range(9) if row[q] >= 0 and row[q] != row[a] and row.count(row[q]) == 1)
+        assert int(pl.eligible[i]) == want >= 1
+    assert tuple(pl[:5]) == tuple(MB.PointerLists(*pl)[:5])                   # the first five fields keep their places
+
+
+# ------------------------------------------------------------------ 21. the hoists give the same numbers
+def _reference_streams(variant, cells, points, addresses=None):
+    """``members.streams`` as written before its tables were kept."""
+    b = cells.shape[0]
+    rows, cols, pcol, prow = MB._positions(cells.device)
+    seq_cell = torch.cat([torch.arange(9), CELL_OF])
+    place = {"place_column": pcol.expand(b, -1), "place_row": prow.expand(b, -1)}
+    if variant.turn and variant.identity != "name":
+        table = MB.address_table(addresses)
+        key_seq = table[MB._index(cells)][:, seq_cell]
+        query_seq = table[MB._index(torch.where(points >= 0, points, cells))][:, seq_cell]
+    else:
+        key_seq = query_seq = torch.full((b, 153, 2), 4, dtype=torch.long)
+    kd = dict(place, member_0=key_seq[..., 0], member_1=key_seq[..., 1])
+    qd = dict(place, member_0=query_seq[..., 0], member_1=query_seq[..., 1])
+    return {"rows": rows.expand(b, -1), "cols": cols.expand(b, -1), "key_digits": kd, "query_digits": qd}
+
+
+def _reference_prepare(variant, cells, colors, points=None, told=None, visible=None, addresses=None, unturned=False):
+    """``members.prepare`` as written before the hoists: both angle sets from the full computation with its digit
+    checks, every table built again (and, unturned, no told head: the rule of the module's text)."""
+    points = MB.no_points(cells) if points is None else points
+    MB.check_layout(cells, colors, points)
+    told = (cells >= 0) if told is None else (told.bool() & (cells >= 0))
+    st = _reference_streams(variant, cells, points, addresses)
+    ka = M.PLACE_MEMBER.angles(st["rows"], st["cols"], st["key_digits"])
+    qa = M.PLACE_MEMBER.angles(st["rows"], st["cols"], st["query_digits"])
+    if unturned:
+        ka, qa = ka.clone(), qa.clone()
+        ka[..., list(MB.UNTURNED_PAIRS)] = 0.0
+        qa[..., list(MB.UNTURNED_PAIRS)] = 0.0
+    told_angles = None
+    if variant.identity == "name" and not unturned:
+        names = MB.name_table()
+        seq_cell = torch.cat([torch.arange(9), CELL_OF])
+        kp = names[MB._index(cells)][:, seq_cell]
+        qp = names[MB._index(torch.where(points >= 0, points, cells))][:, seq_cell]
+        tk, tq = ka.clone(), qa.clone()
+        tk[..., list(MB.NAME_PAIRS)] = kp.float()
+        tq[..., list(MB.NAME_PAIRS)] = qp.float()
+        told_angles = (tq, tk)
+    img = torch.ones(cells.shape[0], 144, dtype=torch.bool) if visible is None else visible.bool()
+    return {"content": MB.request_content(variant, cells, colors, points, told), "query_angles": qa,
+            "key_angles": ka, "key_mask": torch.cat([told, img], dim=1), "told_angles": told_angles}
+
+
+def _reference_part_answers(col, z, t, cells, colors, points, unturned=False):
+    """``MemberCollective.part_answers`` as written before the plan: every engine prepared from its own rows."""
+    v = col.variant
+    out = torch.zeros(len(col.classes), z.shape[0], 144, 48)
+    for i, k in enumerate(col.classes):
+        eng = col.things[k]
+        if v.told == "all":
+            rows = torch.nonzero((cells == k).any(dim=1), as_tuple=True)[0]
+            if rows.numel() == 0:
+                continue
+            vis = MB.visible_for(cells[rows], k) if v.see == "masked" else None
+            prep = _reference_prepare(v, cells[rows], colors[rows], points[rows], None, vis, col.addresses, unturned)
+            out[i, rows] = patchify(eng.forward_tokens(z[rows], t[rows], **prep), 4)
+            continue
+        rows, cols = torch.nonzero(cells == k, as_tuple=True)
+        if rows.numel() == 0:
+            continue
+        vis = frame.visible_keys(cells[rows], cols) if v.see == "masked" else None
+        told = torch.nn.functional.one_hot(cols, 9).bool()
+        prep = _reference_prepare(v, cells[rows], colors[rows], points[rows], told, vis, col.addresses, unturned)
+        vt = patchify(eng.forward_tokens(z[rows], t[rows], **prep), 4)
+        p_idx, tok = torch.nonzero(CELL_OF[None] == cols[:, None], as_tuple=True)
+        out[i, rows[p_idx], tok] = vt[p_idx, tok]
+    base = torch.zeros(z.shape[0], 144, 48)
+    rows = torch.nonzero((cells < 0).any(dim=1), as_tuple=True)[0]
+    if rows.numel():
+        if v.told == "all":
+            vis = MB.visible_for(cells[rows], None) if v.see == "masked" else None
+            prep = _reference_prepare(v, cells[rows], colors[rows], points[rows], None, vis, col.addresses, unturned)
+        else:
+            vis = frame.visible_keys(cells[rows], torch.full((rows.numel(),), -1)) if v.see == "masked" else None
+            prep = _reference_prepare(v, cells[rows], colors[rows], points[rows], torch.zeros(rows.numel(), 9,
+                                      dtype=torch.bool), vis, col.addresses, unturned)
+        base[rows] = patchify(col.base.forward_tokens(z[rows], t[rows], **prep), 4)
+    return out, base
+
+
+def _reference_answer(col, z, t, cells, colors, points):
+    answers, base_answer = _reference_part_answers(col, z, t, cells, colors, points)
+    w, base = col.weights(cells)
+    return unpatchify(M.serve(base_answer, answers, w, base), (3, 48, 48), 4, 12)
+
+
+def _same_prep(a, b):
+    for key in ("content", "query_angles", "key_angles", "key_mask"):
+        if not torch.equal(a[key], b[key]):
+            return False
+    if (a["told_angles"] is None) != (b["told_angles"] is None):
+        return False
+    return a["told_angles"] is None or all(torch.equal(x, y) for x, y in zip(a["told_angles"], b["told_angles"]))
+
+
+@pytest.mark.parametrize("name", list(MB.VARIANTS))
+def test_21_prepare_gives_the_numbers_of_the_full_computation(name):
+    v = MB.VARIANTS[name]
+    pl = MB.pointer_lists(5, 24, 240, distinct=True)
+    points = pl.points if v.told == "all" else MB.no_points(pl.cells)
+    told = None if v.told == "all" else torch.nn.functional.one_hot(pl.order[:, 0], 9).bool()
+    vis = MB.visible_for(pl.cells, 3)
+    mapping = {0: (0, 1), 1: (0, 0), 2: (3, 3)}
+    for unturned in (False, True):
+        for addresses in (None, mapping):
+            got = MB.prepare(v, pl.cells, pl.colors, points, told, vis, addresses, unturned)
+            want = _reference_prepare(v, pl.cells, pl.colors, points, told, vis, addresses, unturned)
+            assert _same_prep(got, want), (name, unturned, addresses)
+
+
+@pytest.mark.parametrize("name,depth", [("T1", 1), ("T2", 1), ("T2K", 2), ("T3", 1), ("C2", 1)])
+def test_21b_a_plan_gives_the_answers_of_preparing_every_engine_every_step(name, depth):
+    v = MB.VARIANTS[name]
+    col = _collective(v, depth=depth)
+    pl = MB.pointer_lists(4, 10, 241, distinct=True)
+    points = pl.points if v.told == "all" else MB.no_points(pl.cells)
+    z, t = torch.randn(10, 3, 48, 48, generator=_gen(242)), torch.full((10,), 0.4)
+    with torch.no_grad():
+        for unturned in (False, True):
+            plan = col.plan(pl.cells, pl.colors, points, unturned)
+            got = col.part_answers(z, t, pl.cells, pl.colors, points, unturned, plan=plan)
+            fresh = col.part_answers(z, t, pl.cells, pl.colors, points, unturned)
+            want = _reference_part_answers(col, z, t, pl.cells, pl.colors, points, unturned)
+            for g, f, w in zip(got, fresh, want):
+                assert torch.equal(g, w) and torch.equal(f, w), (name, unturned)
+            c = col.contributions(z, t, pl.cells, pl.colors, points, unturned, plan=plan)
+            w, base = col.weights(pl.cells)
+            parts = [w[..., i].float()[..., None] * want[0][i] for i in range(9)] + [base.float()[..., None] * want[1]]
+            assert torch.equal(c, torch.stack(parts)), (name, unturned)
+        plan = col.plan(pl.cells, pl.colors, points)
+        assert torch.equal(col.answer(z, t, pl.cells, pl.colors, points, plan=plan),
+                           _reference_answer(col, z, t, pl.cells, pl.colors, points))
+        with pytest.raises(ValueError):
+            col.part_answers(z, t, pl.cells, pl.colors, points, True, plan=plan)       # built with unturned=False
+
+
+@pytest.mark.parametrize("name,depth", [("T1", 1), ("T2", 1), ("T2K", 2)])
+def test_21c_sample_lists_with_one_plan_a_chunk_is_the_sampler_preparing_every_step(name, depth, monkeypatch):
+    v = MB.VARIANTS[name]
+    col = _collective(v, depth=depth)
+    pl = MB.pointer_lists(4, 6, 243, distinct=True)
+    points = pl.points if v.told == "all" else MB.no_points(pl.cells)
+    calls = []
+    real = MB.prepare
+    monkeypatch.setattr(MB, "prepare", lambda *a, **k: calls.append(1) or real(*a, **k))
+    got = MB.sample_lists(col, pl.cells, pl.colors, points, 21, steps=3, chunk=4)
+    monkeypatch.setattr(MB, "prepare", real)
+    want = C.sample(lambda z, t, c, k: _reference_answer(col, z, t, c, k[..., 0], k[..., 1]), pl.cells,
+                    MB.pack(pl.colors, points), 21, steps=3, chunk=4)
+    assert torch.equal(got, want)
+    engines_run = 2 * 10 if v.told == "own" else 2                         # a prepare an engine a chunk, or one a chunk
+    print(name, "prepare calls over 2 chunks of 3 steps:", len(calls))
+    assert len(calls) <= engines_run
+
+
+@pytest.mark.parametrize("variant,depth", [(MB.T2K, 2), (MB.C1, 1)])
+def test_20e_find_read_on_the_name_kind_and_on_the_kind_whose_pairs_are_not_turned(variant, depth):
+    eng = _engine(variant, 2, 0, depth=depth)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(220)), torch.tensor([0.3])
+    for block in range(depth):
+        r = MB.find_read(eng, variant, z, t, cells, colors, points, 0, 0, 3, 8, block=block)
+        same = torch.equal(r["weights_a"], r["weights_b"]) and torch.equal(r["answer_a"], r["answer_b"])
+        if variant is MB.C1:
+            assert same and torch.equal(r["scores_a"], r["scores_b"])
+        elif block == MB.TOLD_BLOCK:                                           # the told head reads by name
+            assert not torch.equal(r["scores_a"][MB.TOLD_HEAD], r["scores_b"][MB.TOLD_HEAD])
+            assert torch.equal(r["scores_a"][1], r["scores_b"][1])             # the other head: nothing turned
+        print(variant.name, "block", block, "weights a", r["weights_a"].tolist(), "b", r["weights_b"].tolist())
