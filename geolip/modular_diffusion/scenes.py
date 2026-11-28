@@ -363,12 +363,8 @@ def draw_parameters(b: int, gen: torch.Generator, bed: str) -> Dict[str, Tensor]
     return p
 
 
-def render(cells: Tensor, colors: Tensor, bed: str, gen: torch.Generator, device="cpu",
-           margin: int = MARGIN) -> Tuple[Tensor, Dict[str, Tensor]]:
-    """Render a batch of layouts -> (pixels [B, 3, 48, 48] in 0..1 on ``device``, the draw: shift_x, shift_y, scale,
-    angle (degrees), shade, centers [B, 9, 2] (x, y in pixels), color [B, 9, 3] (the shaded colors), and on bed C tint
-    [B, 3], noise and texture [B, 48, 48] (the texture before any clipping), and ground [B, 3, 48, 48]). The random
-    numbers are drawn on the CPU (``draw_parameters``) before anything is computed."""
+def _render_layout(cells: Tensor, colors: Tensor, margin: int) -> Tuple[Tensor, Tensor, int]:
+    """The layout and the margin of a render, checked."""
     cells = torch.as_tensor(cells, dtype=torch.long)
     colors = torch.as_tensor(colors, dtype=torch.long)
     if cells.dim() != 2 or cells.shape[1] != N_CELLS or colors.shape != cells.shape:
@@ -380,8 +376,53 @@ def render(cells: Tensor, colors: Tensor, bed: str, gen: torch.Generator, device
     margin = int(margin)
     if not 0 <= margin <= CELL:
         raise ValueError("margin is 0..16")
+    return cells, colors, margin
+
+
+DRAWN = ("shift_x", "shift_y", "scale", "angle", "shade")
+DRAWN_C = ("tint", "noise")
+
+
+def render(cells: Tensor, colors: Tensor, bed: str, gen: torch.Generator, device="cpu",
+           margin: int = MARGIN) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """Render a batch of layouts -> (pixels [B, 3, 48, 48] in 0..1 on ``device``, the draw: shift_x, shift_y, scale,
+    angle (degrees), shade, centers [B, 9, 2] (x, y in pixels), color [B, 9, 3] (the shaded colors), and on bed C tint
+    [B, 3], noise and texture [B, 48, 48] (the texture before any clipping), and ground [B, 3, 48, 48]). The random
+    numbers are drawn on the CPU (``draw_parameters``) before anything is computed; then ``render_drawn``."""
+    cells, colors, margin = _render_layout(cells, colors, margin)
+    p = draw_parameters(cells.shape[0], gen, bed)
+    return _render_core(cells, colors, p, bed, device, margin)
+
+
+def render_drawn(cells: Tensor, colors: Tensor, p: Dict[str, Tensor], bed: str, device="cpu",
+                 margin: int = MARGIN, parts: Optional[Sequence[int]] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
+    """``render`` from random numbers already drawn: ``p`` holds what ``draw_parameters`` returns for these B scenes
+    (on the CPU or on ``device``; other keys are ignored) -> what ``render`` returns. Rows drawn by different
+    generators can be concatenated on their first axis (the layouts and every tensor of ``p``) and rendered in one
+    call. Every number of a scene depends on its own row only, EXCEPT bed C's texture: the blur's convolution may round
+    differently with the batch it runs in (by a few 1e-8 on a CPU), so ``parts`` (the row counts of the concatenated
+    parts, in order, summing to B) computes the texture of each part apart, the numbers of a render of that part
+    alone; everything else is computed once for all rows. None: the whole batch is one part."""
+    cells, colors, margin = _render_layout(cells, colors, margin)
+    if parts is not None:
+        parts = [int(k) for k in parts]
+        if any(k < 1 for k in parts) or sum(parts) != cells.shape[0]:
+            raise ValueError("parts are positive row counts that sum to the number of scenes")
+    if bed not in BEDS:
+        raise ValueError(f"the beds are {BEDS}, not {bed!r}")
+    keys = DRAWN + (DRAWN_C if bed == "C" else ())
+    missing = [k for k in keys if k not in p]
+    if missing:
+        raise ValueError(f"the drawn numbers lack {missing}")
     b = cells.shape[0]
-    p = draw_parameters(b, gen, bed)
+    if any(int(p[k].shape[0]) != b for k in keys):
+        raise ValueError("the drawn numbers are for another number of scenes")
+    return _render_core(cells, colors, {k: p[k] for k in keys}, bed, device, margin, parts)
+
+
+def _render_core(cells: Tensor, colors: Tensor, p: Dict[str, Tensor], bed: str, device,
+                 margin: int, parts: Optional[Sequence[int]] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
+    b = cells.shape[0]
     p = {k: v.to(device) for k, v in p.items()}
     cells_d, colors_d = cells.to(device), colors.to(device)
     centers = cell_centers().to(device)
@@ -391,7 +432,10 @@ def render(cells: Tensor, colors: Tensor, bed: str, gen: torch.Generator, device
     if bed == "F":
         ground = torch.full((b, CHANNELS, CANVAS, CANVAS), GROUND, dtype=torch.float32, device=device)
     else:
-        p["texture"] = texture(p["noise"])
+        if parts is None or len(parts) == 1:
+            p["texture"] = texture(p["noise"])
+        else:
+            p["texture"] = torch.cat([texture(x) for x in torch.split(p["noise"], list(parts))])
         ground = p["tint"][:, :, None, None] + p["texture"][:, None]
     p["ground"] = ground
 

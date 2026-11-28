@@ -30,11 +30,14 @@ SDPA runs once a block on the G x B rows together (the leading two axes merged i
 
 THE TRAINER (``train_members``). Engine g is ``members.born(variant, classes[g], seed, dim, heads, depth)``. A step s:
 for EACH engine in turn, gen = ``train.step_generator(seed, s, "cpu")`` (a fresh generator an engine, the same (seed, s)
-for all, the draws of ``collective.train_engine`` for one engine); the rows ``members.member_batch(variant, cls, the
-training bed, batch, gen, p_point, exclude, held_pairs)`` (every draw on the CPU generator, ONLY THE RENDER on the
-training bed's device); then ``collective.noisy(x, gen)`` (noise, then t, drawn on the CPU and moved to the picture's
-device); then ``members.prepare`` on the layout as drawn on the CPU (``cells_cpu`` ...), so that its checks read
-nothing back. The prepared inputs are stacked on G and moved to the device once. One stacked forward; the loss of
+for all, the draws of ``collective.train_engine`` for one engine); the layout ``members.member_layout(variant, cls, the
+training bed, batch, gen, p_point, exclude, held_pairs)`` (every draw on the CPU generator, the render's numbers
+included); then the noise, then t: noise "stream" (the default) draws them from gen on the CPU, as
+``collective.noisy(x, gen)`` does (the numbers of ``member_batch`` then ``noisy``, bit for bit); noise "device" draws
+them on the training device from a fresh ``noise_generator(seed, s, device)`` an engine (so a stacked engine still
+draws what it would draw alone). Then for the whole stack at once on the training device: ONE render of every engine's
+rows (``scenes.render_drawn``), z and the target, and ONE ``members.prepare`` of every engine's layout (checked once on
+the CPU, so that nothing is read back), reshaped to the leading axis G (``stack_step_rows``). One stacked forward; the loss of
 engine g is the masked loss of ``collective.masked_loss`` (per row the sum over its masked tokens of the squared error
 over 48 x the mask's token count, then the mean over rows; the mask's counts checked above zero from the CPU layout: a
 thing's class stands in the row, the base has a free cell); the step's loss is the SUM over g, so each engine's gradient is its own. ONE ``torch.optim.Adam`` over the
@@ -78,7 +81,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from . import members
+from . import members, scenes
 from .collective import OWN_READ_SEED, TOKEN_DIM, _adam_load, _adam_tensors, noisy
 from .compat import TIME_FREQ
 from .members import SLOTS, TOLD_BLOCK, TOLD_HEAD, Variant
@@ -93,6 +96,9 @@ LN_EPS = 1e-6
 READ_CHUNK = 256
 STACK_FILES = ("stack_checkpoint.safetensors", "stack_checkpoint.json")
 STACK_DONE = "stack_train.json"
+NOISES = ("stream", "device")
+NOISE_SEED_OFFSET = 1 << 40           # the step offset of the noise generator of noise "device"
+PHASES = ("layouts", "noise", "render", "prepare", "forward", "backward", "adam_and_averages")
 
 
 # ------------------------------------------------------------------ the stack
@@ -185,14 +191,18 @@ def _held_text(held_pairs) -> str:
 
 
 def member_tag(variant: Variant, cls: Optional[int], bed, seed: int, steps: int, dim: int, heads: int, depth: int,
-               exclude: Optional[int] = None, held_pairs=()) -> str:
+               exclude: Optional[int] = None, held_pairs=(), noise: str = "stream") -> str:
     """A folder name that changes with every argument: variant, class (or base), bed, seed, steps, shape, the excluded
-    class and the held pairs (written out up to four pairs, else their count and checksum)."""
+    class, the held pairs (written out up to four pairs, else their count and checksum) and the noise when it is not
+    "stream" (``_noise<noise>`` at the end)."""
+    if noise not in NOISES:
+        raise ValueError(f"noise is one of {NOISES}, not {noise!r}")
     who = "base" if cls is None else f"c{int(cls)}"
     bed_name = bed.bed if isinstance(bed, ScenesBed) else str(bed)
     ex = "none" if exclude is None else str(int(exclude))
+    tail = "" if noise == "stream" else f"_noise{noise}"
     return (f"{variant.name}_{who}_bed{bed_name}_seed{int(seed)}_steps{int(steps)}_d{int(dim)}h{int(heads)}"
-            f"x{int(depth)}_ex{ex}_held{_held_text(held_pairs)}")
+            f"x{int(depth)}_ex{ex}_held{_held_text(held_pairs)}{tail}")
 
 
 def _batch_args(variant: Variant, exclude, held_pairs) -> Tuple[Optional[int], tuple]:
@@ -251,6 +261,95 @@ def stack_rows(rows: Sequence[dict], device) -> dict:
             "loss_mask": torch.stack([r["loss_mask"] for r in rows]).to(device),
             "inputs": {"content": st("content"), "query_angles": st("query_angles"), "key_angles": st("key_angles"),
                        "key_mask": st("key_mask"), "told_angles": told}}
+
+
+def noise_generator(seed: int, step: int, device) -> torch.Generator:
+    """The generator of a step's noise and t for noise "device": on ``device``, seeded by the derivation of
+    ``train.step_generator`` with the step moved by ``NOISE_SEED_OFFSET``."""
+    return step_generator(int(seed), int(step) + NOISE_SEED_OFFSET, device)
+
+
+def _tick(clock: Optional[dict], key: str, since: float, sync: bool) -> float:
+    """Add the seconds since ``since`` to clock[key] (the card waited for first when ``sync``) -> now."""
+    if clock is None:
+        return since
+    if sync:
+        torch.cuda.synchronize()
+    now = time.perf_counter()
+    clock[key] = clock.get(key, 0.0) + (now - since)
+    return now
+
+
+def stack_step_rows(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBed, seed: int, step: int, n: int,
+                    p_point: float = 0.5, exclude=None, held_pairs=(), device=None, noise: str = "stream",
+                    clock: Optional[dict] = None) -> dict:
+    """The rows of every engine at a step, stacked on G, on ``device`` (default the bed's): for each engine on the CPU,
+    gen = ``step_generator(seed, step, "cpu")``, ``members.member_layout`` (its loss mask checked on the CPU layout),
+    then the noise [n, 3, 48, 48] and t [n]: noise "stream" draws them from gen on the CPU (the numbers of
+    ``step_rows``), noise "device" from a fresh ``noise_generator(seed, step, device)`` an engine, on the device. Then
+    ONE ``scenes.render_drawn`` of all engines' rows on the device, z = (1 - t) noise + t x and target = x - noise (the
+    expressions of ``collective.noisy``; bed C's texture engine by engine, the one piece of the render whose rounding
+    may depend on its batch), and ONE ``members.prepare`` of all engines' layouts on the device (the
+    layouts checked once on the CPU), reshaped to a leading axis of engines; when its query and key angles are one
+    tensor the stacked forward receives that one tensor for both. Nothing is read back from the device. -> the dict of
+    ``stack_rows``. ``clock``: a dict that takes the seconds of the phases "layouts", "noise", "render" and "prepare"
+    (the card waited for at the end of each)."""
+    if noise not in NOISES:
+        raise ValueError(f"noise is one of {NOISES}, not {noise!r}")
+    device = bed.device if device is None else device
+    sync = clock is not None and str(device).startswith("cuda")
+    ex, held = _batch_args(variant, exclude, held_pairs)
+    n, g_count = int(n), len(classes)
+    lays, z0s, ts = [], [], []
+    for cls in classes:
+        a = time.perf_counter()
+        gen = step_generator(int(seed), int(step), "cpu")
+        lay = members.member_layout(variant, cls, bed, n, gen, p_point, ex, held)
+        if not _loss_ok(variant, cls, {"cells_cpu": lay["cells"], "visible_cpu": lay["visible"]}):
+            raise ValueError("a row of the batch has no token in its loss mask")
+        lays.append(lay)
+        a = _tick(clock, "layouts", a, False)
+        if noise == "stream":
+            z0s.append(torch.randn((n, CHANNELS, CANVAS, CANVAS), generator=gen))
+            ts.append(torch.rand(n, generator=gen))
+        else:
+            ng = noise_generator(seed, step, device)
+            z0s.append(torch.randn((n, CHANNELS, CANVAS, CANVAS), generator=ng, device=device))
+            ts.append(torch.rand(n, generator=ng, device=device))
+        _tick(clock, "noise", a, False)
+    a = time.perf_counter()
+
+    def cat(key):
+        return torch.cat([lay[key] for lay in lays])
+
+    cells, colors, points, told = cat("cells"), cat("colors"), cat("points"), cat("told")
+    visible = None if lays[0]["visible"] is None else cat("visible")
+    params = {k: torch.cat([lay["params"][k] for lay in lays]) for k in lays[0]["params"]}
+    loss_mask = torch.stack([lay["loss_mask"] for lay in lays])
+    members.check_layout(cells, colors, points)
+    a = _tick(clock, "layouts", a, False)
+    z0 = torch.stack(z0s).to(device)
+    t = torch.stack(ts).to(device)
+    a = _tick(clock, "noise", a, sync)
+    pixels, _ = scenes.render_drawn(cells, colors, params, bed.bed, device, parts=[n] * g_count)
+    x = scenes.to_model(pixels).view(g_count, n, CHANNELS, CANVAS, CANVAS)
+    tt = t.view(g_count, n, 1, 1, 1)
+    z, target = (1 - tt) * z0 + tt * x, x - z0
+    a = _tick(clock, "render", a, sync)
+    prep = members.prepare(variant, cells.to(device), colors.to(device), points.to(device), told.to(device),
+                           None if visible is None else visible.to(device), check=False)
+
+    def per_engine(v: Tensor) -> Tensor:
+        return v.reshape(g_count, n, *v.shape[1:]).contiguous()
+
+    ka = per_engine(prep["key_angles"])
+    qa = ka if prep["query_angles"] is prep["key_angles"] else per_engine(prep["query_angles"])
+    told_angles = None if prep["told_angles"] is None else tuple(per_engine(v) for v in prep["told_angles"])
+    inputs = {"content": per_engine(prep["content"]), "query_angles": qa, "key_angles": ka,
+              "key_mask": per_engine(prep["key_mask"]), "told_angles": told_angles}
+    out = {"z": z, "t": t, "target": target, "loss_mask": loss_mask.to(device), "inputs": inputs}
+    _tick(clock, "prepare", a, sync)
+    return out
 
 
 def masked_loss_unchecked(v: Tensor, target: Tensor, loss_mask: Tensor) -> Tensor:
@@ -337,38 +436,48 @@ def _write_engine(folder: str, variant: Variant, cls, seed: int, state: Dict[str
 
 def _step(variant: Variant, classes, bed: ScenesBed, seed: int, s: int, batch: int, p_point: float, exclude,
           held, state: Dict[str, Tensor], heads: int, opt, average: Dict[str, Tensor], device, lr: float,
-          warmup: int, rows_clock: Optional[List[float]] = None) -> List[Tensor]:
-    """One training step s of the stack (the learning rate, the rows, the summed loss, Adam, the averages) -> the
-    engines' losses (on the device, not read). ``rows_clock``: a list that takes the seconds spent building and moving
-    the step's rows (drawn on the CPU, rendered on the training bed's device), so that a timing can tell the rows from
-    the forward and backward (on a card the render is queued, so the clock reads the time to queue it)."""
+          warmup: int, rows_clock: Optional[List[float]] = None, noise: str = "stream",
+          clock: Optional[dict] = None) -> List[Tensor]:
+    """One training step s of the stack (the learning rate, the rows of ``stack_step_rows``, the summed loss, Adam,
+    the averages) -> the engines' losses (on the device, not read). ``rows_clock``: a list that takes the seconds spent
+    building the step's rows (without ``clock``, on a card the render is queued, so this reads the time to queue it).
+    ``clock``: a dict that takes the seconds of every phase of ``PHASES``, the card waited for at the end of each."""
+    sync = clock is not None and str(device).startswith("cuda")
     for grp in opt.param_groups:
         grp["lr"] = float(lr) * min(1.0, (s + 1) / max(1, int(warmup)))
     r0 = time.perf_counter()
-    sb = stack_rows(step_rows(variant, classes, bed, seed, s, batch, p_point, exclude, held), device)
+    sb = stack_step_rows(variant, classes, bed, seed, s, batch, p_point, exclude, held, device, noise, clock)
     if rows_clock is not None:
         rows_clock.append(time.perf_counter() - r0)
+    a = time.perf_counter()
     losses = stack_losses(state, heads, sb)
     loss = losses[0]
     for x in losses[1:]:
         loss = loss + x
+    a = _tick(clock, "forward", a, sync)
     opt.zero_grad(set_to_none=True)
     loss.backward()
+    a = _tick(clock, "backward", a, sync)
     opt.step()
     dk = (1 + s) / (s + 8 + 2)
     with torch.no_grad():
         for k in state:
             average[k].copy_(dk * average[k] + (1.0 - dk) * state[k].detach())
+    _tick(clock, "adam_and_averages", a, sync)
     return losses
 
 
 def time_stack(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBed, seed: int = 0, *,
                batch: int = 128, steps: int = 6, from_step: int = 2, p_point: float = 0.5,
                exclude: Optional[int] = None, held_pairs=(), dim: int = 128, heads: int = 2, depth: int = 3,
-               lr: float = 1e-3, warmup: int = 100) -> dict:
+               lr: float = 1e-3, warmup: int = 100, noise: str = "stream", phases: bool = False) -> dict:
     """The seconds a training step of a stack of these engines on ``bed``'s device (the steps of ``train_members``,
     nothing written, no reads): the stamps of every step (the card synchronized at each), the median over the steps
-    from ``from_step`` on, and that median divided by the number of engines."""
+    from ``from_step`` on, and that median divided by the number of engines. ``phases``: also "phases", the median
+    over the same steps of the seconds of each phase of ``PHASES`` (the card waited for at the end of each phase, so
+    those steps are a little slower than unclocked ones)."""
+    if noise not in NOISES:
+        raise ValueError(f"noise is one of {NOISES}, not {noise!r}")
     classes = [None if c is None else int(c) for c in classes]
     device = bed.device
     held = sorted((int(a), int(q)) for a, q in held_pairs)
@@ -379,27 +488,39 @@ def time_stack(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBe
     is_cuda = str(device).startswith("cuda")
     stamps = []
     rows_clock: List[float] = []
+    clocks: List[dict] = []
     for s in range(int(steps)):
+        clock = {} if phases else None
         s0 = time.perf_counter()
         _step(variant, classes, bed, seed, s, int(batch), p_point, exclude, held, state, heads, opt, average,
-              device, lr, warmup, rows_clock)
+              device, lr, warmup, rows_clock, noise, clock)
         if is_cuda:
             torch.cuda.synchronize()
         stamps.append(time.perf_counter() - s0)
+        if phases:
+            clocks.append(clock)
     med = _median(stamps[int(from_step):])
-    return {"engines": len(classes), "batch": int(batch), "steps": int(steps), "from_step": int(from_step),
-            "stamps": stamps, "seconds_a_step_stack": med, "seconds_rows": _median(rows_clock[int(from_step):]),
-            "seconds_a_step_engine": None if med is None else med / len(classes), "device": str(device)}
+    out = {"engines": len(classes), "batch": int(batch), "steps": int(steps), "from_step": int(from_step),
+           "stamps": stamps, "seconds_a_step_stack": med, "seconds_rows": _median(rows_clock[int(from_step):]),
+           "seconds_a_step_engine": None if med is None else med / len(classes), "device": str(device),
+           "noise": noise}
+    if phases:
+        out["phases"] = {k: _median(c.get(k, 0.0) for c in clocks[int(from_step):]) for k in PHASES}
+    return out
 
 
 def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBed, seed: int, out: str, *,
                   steps: int = 3000, batch: int = 128, lr: float = 1e-3, warmup: int = 100, every: int = 250,
                   heldout: int = 2048, save_every: int = 500, p_point: float = 0.5, exclude: Optional[int] = None,
                   held_pairs=(), dim: int = 128, heads: int = 2, depth: int = 3, until: Optional[int] = None,
-                  snapshots: Optional[Sequence[int]] = None, log: Callable[[str], None] = print) -> dict:
+                  snapshots: Optional[Sequence[int]] = None, noise: str = "stream",
+                  log: Callable[[str], None] = print) -> dict:
     """Train the engines of ``classes`` (0..8 and/or None for the base) as one stack (see the module's text) into
     ``out`` -> {"settings", "step", "finished", "engines": [{"cls", "tag", "curve", "newborn_read", "last_read",
-    "descended"}], "seconds_a_step_stack", "seconds_a_step_engine", "state", "average"}."""
+    "descended"}], "seconds_a_step_stack", "seconds_a_step_engine", "state", "average"}. ``noise``: where a step's
+    noise and t are drawn (``stack_step_rows``); it is part of the settings and of the engines' names."""
+    if noise not in NOISES:
+        raise ValueError(f"noise is one of {NOISES}, not {noise!r}")
     classes = [None if c is None else int(c) for c in classes]
     if len(set(classes)) != len(classes) or not classes:
         raise ValueError("a stack holds one engine a class (and at most one base)")
@@ -418,8 +539,8 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
                 "save_every": int(save_every), "p_point": float(p_point), "exclude": exclude, "held_pairs": held,
                 "dim": int(dim), "heads": int(heads), "depth": int(depth), "snapshots": list(snapshots),
                 "average": "g8", "optimizer": "Adam", "betas": list(BETAS), "eps": EPS, "weight_decay": 0.0,
-                "clip": None, "stack": "written-out stacked forward"}
-    tags = [member_tag(variant, c, bed, seed, steps, dim, heads, depth, exclude, held) for c in classes]
+                "clip": None, "stack": "written-out stacked forward", "noise": noise}
+    tags = [member_tag(variant, c, bed, seed, steps, dim, heads, depth, exclude, held, noise) for c in classes]
     os.makedirs(out, exist_ok=True)
     done_path = os.path.join(out, STACK_DONE)
     if os.path.isfile(done_path) and all(os.path.isfile(os.path.join(out, tg, f)) for tg in tags
@@ -459,7 +580,7 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
         curves, step_seconds, done, newborn = ck["curves"], ck["step_seconds"], int(ck["step"]), ck["newborn_reads"]
         log(f"RESUME from step {done:,} of {steps:,}")
     log(f"JOB stack {variant.name} classes {classes} bed {bed.bed} seed {seed}: {steps:,} steps x batch {batch} x "
-        f"{G} engines; {trained:,} trained numbers an engine; pure Adam lr {lr:g}; device {device}")
+        f"{G} engines; {trained:,} trained numbers an engine; pure Adam lr {lr:g}; noise {noise}; device {device}")
     if newborn is None:
         newborn = stack_own_read(average, heads, variant, sets, device)
         for g in range(G):
@@ -481,14 +602,14 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
         rows = []
         per_stack = _median(step_seconds)
         for g, cls in enumerate(classes):
-            tag = member_tag(variant, cls, bed, seed, at, dim, heads, depth, exclude, held)
+            tag = member_tag(variant, cls, bed, seed, at, dim, heads, depth, exclude, held, noise)
             info = {"settings": _engine_settings(variant, cls, bed, seed, at, settings), "curve": curve_upto[g],
                     "newborn_read": newborn[g], "last_read": reads[g], "descended": bool(reads[g] < newborn[g]),
                     "trained": trained, "seconds_a_step_stack": per_stack,
                     "seconds_a_step_engine": None if per_stack is None else per_stack / G,
                     "step_seconds_count": len(step_seconds), "device": str(device), "torch": torch.__version__}
             card = {"bed": bed.bed, "steps": int(at), "seed": int(seed), "p_point": float(p_point), "exclude": exclude,
-                    "held_pairs": held}
+                    "held_pairs": held, "noise": noise}
             _write_engine(os.path.join(out, tag), variant, cls, seed, state, average, g, dim, heads, depth, card, info)
             rows.append({"cls": cls, "tag": tag, "curve": curve_upto[g], "newborn_read": newborn[g],
                          "last_read": reads[g], "descended": bool(reads[g] < newborn[g])})
@@ -500,7 +621,7 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
     for s in range(done, stop):
         s0 = time.perf_counter()
         losses = _step(variant, classes, bed, seed, s, batch, p_point, exclude, held, state, heads, opt, average,
-                       device, lr, warmup)
+                       device, lr, warmup, noise=noise)
         n = s + 1
         read_now = (every and (n % int(every) == 0 or n == steps)) or n in snapshots
         if is_cuda and not read_now:

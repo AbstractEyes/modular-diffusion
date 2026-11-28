@@ -8,9 +8,11 @@ address pairs inside attention, served by the amplitude gate over the same addre
 |----------|--------------------------------------------------------------------------------------------------------|
 | parts    | ``member_train.train_members`` for the engines of ``kind`` and ``classes`` ("0-8,base" or any subset), |
 |          | ``bed``, ``seed``, ``steps``, ``exclude`` (a class, or empty), ``held`` ("" or "plus4": class g never  |
-|          | asks class (g + 4) mod 9), ``p_point``, ``snapshots``, into ``out``                                     |
+|          | asks class (g + 4) mod 9), ``p_point``, ``snapshots``, ``noise`` ("stream" or "device": where a step's |
+|          | noise and t are drawn, ``member_train.stack_step_rows``), into ``out``                                 |
 | timing   | the seconds a step of a stack of G engines for each G of ``stacks``, ``steps`` each with the first     |
-|          | ``from_step`` dropped, on the job's device; nothing is kept but the result                             |
+|          | ``from_step`` dropped, on the job's device, with ``noise``; with ``phases=1`` also the median seconds  |
+|          | of each phase of a step (a table in result.md); nothing is kept but the result                         |
 | compose  | the collective of ``kind`` found under ``parts`` sampled in ``sample_steps`` Euler steps and judged by |
 |          | every folder of ``judge``: (a) the stored lists (``scenes.request_lists(n, count)`` seeded 5000 + n,    |
 |          | start noise seeded 7000 + n, the lists and noise of ``toy_collective``) per n of ``ns``: things right, |
@@ -116,7 +118,7 @@ DEFAULTS = dict(variant="parts", kind="T2", classes="0-8,base", bed="F", seed=0,
                 exclude="", held="", snapshots="", stacks="1,5,10", from_step=2, parts="", judge="", part_steps=3000,
                 ns="1,2,3,4,6,9", pointer_ns="3,4,6,9", count=500, chunk=128, sample_steps=50, sheet=1,
                 ts="0.1,0.3", k=64, twin_seed=1, swap_class=-1, exact_lists=64, device="cpu", det="on", threads=4,
-                out="")
+                noise="stream", phases=1, out="")
 LIST_SEED, NOISE_SEED = 5000, 7000
 POINTER_SEED, POINTER_NOISE, POINTER_NOISE_HELD = 6000, 7500, 7600
 FIND_SEED, SCENE_SEED, TOLERANCE_SEED = 30000, 31000, 31500
@@ -182,7 +184,7 @@ def load_collective(a: dict, seed: Optional[int] = None, twin: Optional[Dict[Opt
     for cls in parse_classes(a["classes"]):
         s = int(twin.get(cls, seed))
         tag = MT.member_tag(variant, cls, a["bed"], s, int(a["part_steps"]), int(a["dim"]), int(a["heads"]),
-                            int(a["depth"]), _exclude(a), held_pairs(a["held"]))
+                            int(a["depth"]), _exclude(a), held_pairs(a["held"]), str(a["noise"]))
         if tag not in index:
             raise FileNotFoundError(f"no finished engine {tag} under {a['parts']}")
         path = index[tag]
@@ -629,7 +631,7 @@ def _run_parts(a: dict, log) -> dict:
                          batch=int(a["batch"]), lr=float(a["lr"]), warmup=int(a["warmup"]), every=int(a["every"]),
                          heldout=int(a["heldout"]), save_every=int(a["save_every"]), p_point=float(a["p_point"]),
                          exclude=_exclude(a), held_pairs=held_pairs(a["held"]), dim=int(a["dim"]),
-                         heads=int(a["heads"]), depth=int(a["depth"]), snapshots=snaps, log=log)
+                         heads=int(a["heads"]), depth=int(a["depth"]), snapshots=snaps, noise=str(a["noise"]), log=log)
     return {"kind": variant.name, "finished": r.get("finished"), "engines": r.get("engines"),
             "seconds_a_step_stack": r.get("seconds_a_step_stack"), "seconds_a_step_engine": r.get("seconds_a_step_engine"),
             "trained": r.get("trained")}
@@ -646,9 +648,11 @@ def _run_timing(a: dict, log) -> dict:
         r = MT.time_stack(variant, pool[:g], bed, int(a["seed"]), batch=int(a["batch"]), steps=int(a["steps"]),
                           from_step=int(a["from_step"]), p_point=float(a["p_point"]), exclude=_exclude(a),
                           held_pairs=held_pairs(a["held"]), dim=int(a["dim"]), heads=int(a["heads"]),
-                          depth=int(a["depth"]))
+                          depth=int(a["depth"]), noise=str(a["noise"]), phases=bool(int(a["phases"])))
         rows.append(r)
         log(f"timing G={g}: {r['seconds_a_step_stack']} s a step of the stack, {r['seconds_a_step_engine']} an engine")
+        if r.get("phases"):
+            log(f"timing G={g} phases (median seconds): " + ", ".join(f"{k} {v:.4f}" for k, v in r["phases"].items()))
     return {"kind": variant.name, "timing": rows}
 
 
@@ -684,6 +688,13 @@ def _text(result: dict) -> str:
         lines += ["| engines | batch | seconds a step (stack) | seconds a step (engine) |", "|---|---|---|---|"]
         lines += [f"| {r['engines']} | {r['batch']} | {_f(r['seconds_a_step_stack'])} | {_f(r['seconds_a_step_engine'])} |"
                   for r in result["timing"]]
+        timed = [r for r in result["timing"] if r.get("phases")]
+        if timed:
+            names = list(timed[0]["phases"])
+            lines += ["", f"PHASES (median seconds a step, the card waited for after each; noise "
+                      f"{timed[0].get('noise')})", "", "| engines | " + " | ".join(names) + " |",
+                      "|---|" + "---|" * len(names)]
+            lines += [f"| {r['engines']} | " + " | ".join(_f(r["phases"][k]) for k in names) + " |" for r in timed]
     elif v == "compose":
         lines += ["THE STORED LISTS", "", "| n | things right | se | whole scenes right | colors right |",
                   "|---|---|---|---|---|"]
@@ -774,7 +785,8 @@ def main(argv=(), **overrides) -> dict:
     with determinism.mode(a["det"]) as det:
         result = RUNNERS[a["variant"]](a, log)
         det.record(result)
-    result.update({"experiment": EXPERIMENT, "variant": a["variant"], "args": {k: a[k] for k in sorted(a)},
+    result.update({"experiment": EXPERIMENT, "variant": a["variant"], "noise": str(a["noise"]),
+                   "args": {k: a[k] for k in sorted(a)},
                    "version": __version__, "torch": torch.__version__, "seconds": time.time() - t0})
     with open(os.path.join(a["out"], "result.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(result, fh, indent=1, default=str)

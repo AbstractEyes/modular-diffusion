@@ -83,8 +83,9 @@ THE TRAINING ROWS (``member_batch``), every draw from the CPU generator given, i
                      ``held_pairs``. Where v < p_point and a valid pair exists, the valid pair with the smallest
                      keys2[a, q] points (the asking request takes the asked color). The asked may be the own request
                      when it states its color; the asking may be another request of class cls;
-                 (4) the render of the finished layout (``scenes.render``: shifts, scales, angles, shades, and on bed C
-                     the tint and the noise).
+                 (4) the render of the finished layout (the draws of ``scenes.render``: shifts, scales, angles, shades,
+                     and on bed C the tint and the noise; ``member_layout`` stops after these draws and
+                     ``scenes.render_drawn`` renders them).
                  told: every request; visible ("masked"): the cells whose request is of class cls and the request-free
                  cells ("open": every token); the loss: every cell whose request is of class cls
     told "all", the base
@@ -155,7 +156,7 @@ from torch import Tensor
 from . import frame, scenes
 from . import multirotary as M
 from .blocks import Block, TimeEmbedding, ZeroHead
-from .collective import CTX_DIM, TOKEN_DIM, engine_name, kind_batch, start_noise
+from .collective import CTX_DIM, TOKEN_DIM, _hidden, _own_cell, engine_name, start_noise
 from .compat import TIME_FREQ
 from .scenes import CANVAS, CHANNELS, N_CELLS, PATCH, TOKEN_GRID, ScenesBed
 from .spectral import patchify, unpatchify
@@ -418,16 +419,19 @@ def request_content(variant: Variant, cells: Tensor, colors: Tensor, points: Ten
 
 def prepare(variant: Variant, cells: Tensor, colors: Tensor, points: Optional[Tensor] = None,
             told: Optional[Tensor] = None, visible: Optional[Tensor] = None,
-            addresses: Optional[Mapping[int, Sequence[int]]] = None, unturned: bool = False) -> dict:
+            addresses: Optional[Mapping[int, Sequence[int]]] = None, unturned: bool = False,
+            check: bool = True) -> dict:
     """The tensors ``MemberEngine.forward_tokens`` takes (content, query_angles, key_angles, key_mask, told_angles),
     built on the device of ``cells``. ``told`` [B, 9] bool (default every cell holding a request); ``visible``
     [B, 144] bool or None (every image token). When the queries' digits are the keys' on every level, query_angles is
-    the very tensor key_angles (clone before writing into either)."""
+    the very tensor key_angles (clone before writing into either). ``check=False`` skips ``check_layout`` (for a caller
+    that checked the same layout on the CPU, so that nothing is read back from a card)."""
     cells = torch.as_tensor(cells, dtype=torch.long)
     dev = cells.device
     colors = torch.as_tensor(colors, dtype=torch.long).to(dev)
     points = no_points(cells) if points is None else torch.as_tensor(points, dtype=torch.long).to(dev)
-    check_layout(cells, colors, points)
+    if check:
+        check_layout(cells, colors, points)
     b = cells.shape[0]
     told = (cells >= 0) if told is None else (torch.as_tensor(told).to(dev).bool() & (cells >= 0))
     st = streams(variant, cells, points, addresses)
@@ -600,29 +604,49 @@ def _smallest_pair(valid: Tensor, keys: Tensor) -> Tuple[Tensor, Tensor]:
     return pick // N_CELLS, pick % N_CELLS
 
 
-def member_batch(variant: Variant, cls: Optional[int], bed: ScenesBed, n: int, gen: torch.Generator,
-                 p_point: float = 0.5, exclude: Optional[int] = None, held_pairs=()) -> dict:
-    """The training rows of an engine (see the module's text for the draw order) -> x, cells, colors, points, told,
-    visible, loss_mask, hidden, params, pointing [n] bool (the rows whose own request points), can_point [n] bool
-    (the rows with a candidate for it), other_pointing [n] bool (the rows in which another request points) and
-    other_can_point [n] bool (the rows with a valid pair for it); and the layout on the CPU as drawn: cells_cpu,
-    colors_cpu, points_cpu, told_cpu and visible_cpu (None for "open"), so that a trainer can prepare its inputs
-    without reading anything back from the bed's device (for told "own" these are copies of the stored rows' tensors,
-    taken back from the bed's device)."""
-    dev = bed.device
+LAYOUT_FLAGS = ("pointing", "can_point", "other_pointing", "other_can_point")
+
+
+def _own_layout(cls: Optional[int], bed_name: str, n: int, gen: torch.Generator) -> dict:
+    """The CPU part of ``collective.kind_batch("addressed_thing", cls)`` (``"addressed_base"`` for the base) in its
+    order of draws: the layouts, the render's numbers, then the hidden cells; and its told, key and loss masks."""
+    if cls is None:
+        engine_name("addressed_base", None)
+        cells, colors = scenes.draw_layouts("empty", n, gen)
+        params = scenes.draw_parameters(n, gen, bed_name)
+        told = torch.zeros(n, N_CELLS, dtype=torch.bool)
+        hidden = _hidden(None, n, gen)
+        visible = frame.visible_keys(cells, torch.full((n,), -1, dtype=torch.long), hidden)
+        loss_mask = visible.clone()
+    else:
+        engine_name("addressed_thing", cls)
+        cells, colors = scenes.draw_layouts("one", n, gen, only_class=int(cls))
+        params = scenes.draw_parameters(n, gen, bed_name)
+        own = _own_cell(cells)
+        told = torch.nn.functional.one_hot(own, N_CELLS).bool()
+        hidden = _hidden(own, n, gen)
+        visible = frame.visible_keys(cells, own, hidden)
+        loss_mask = _FRAME.cell[None] == own[:, None]
+    none = torch.zeros(n, dtype=torch.bool)
+    return {"cells": cells, "colors": colors, "points": no_points(cells), "told": told, "visible": visible,
+            "loss_mask": loss_mask, "hidden": hidden, "params": params, "pointing": none, "can_point": none,
+            "other_pointing": none, "other_can_point": none}
+
+
+def member_layout(variant: Variant, cls: Optional[int], bed, n: int, gen: torch.Generator, p_point: float = 0.5,
+                  exclude: Optional[int] = None, held_pairs=()) -> dict:
+    """Everything of an engine's training rows that is drawn and decided on the CPU, in the order of draws of
+    ``member_batch`` (the render's random numbers included, by ``scenes.draw_parameters``) -> CPU tensors: cells,
+    colors, points, told [n, 9]; visible [n, 144] bool (None for "open"); loss_mask [n, 144] bool; hidden [n, 9] bool
+    (told "own"; None otherwise); the flags pointing, can_point, other_pointing, other_can_point [n] bool; params (the
+    render's drawn numbers). ``bed`` is a ``ScenesBed`` or a bed's name. ``member_batch`` is this layout, then
+    ``scenes.render_drawn`` on the bed's device, then the moves."""
+    bed_name = bed.bed if isinstance(bed, ScenesBed) else str(bed)
     n = int(n)
     if variant.told == "own":
         if exclude is not None or held_pairs:
             raise ValueError("told 'own' rows are the stored rows: no clutter to exclude, no pointers")
-        kb = kind_batch("addressed_thing" if cls is not None else "addressed_base", cls, bed, n, gen)
-        none = torch.zeros(n, dtype=torch.bool, device=dev)
-        cells_cpu = kb["cells"].cpu().clone()                    # the stored path: these are copies back from the bed
-        return {"x": kb["x"], "cells": kb["cells"], "colors": kb["colors"], "points": no_points(kb["cells"]),
-                "told": kb["told"], "visible": kb["key_mask"], "loss_mask": kb["loss_mask"], "hidden": kb["hidden"],
-                "params": kb["params"], "pointing": none, "can_point": none, "other_pointing": none,
-                "other_can_point": none, "cells_cpu": cells_cpu, "colors_cpu": kb["colors"].cpu().clone(),
-                "points_cpu": no_points(cells_cpu), "told_cpu": kb["told"].cpu().clone(),
-                "visible_cpu": kb["key_mask"].cpu().clone()}
+        return _own_layout(cls, bed_name, n, gen)
     if exclude is not None and cls is not None and int(exclude) == int(cls):
         raise ValueError("an engine's own class cannot be excluded from its clutter")
     r = torch.arange(n)
@@ -668,18 +692,37 @@ def member_batch(variant: Variant, cls: Optional[int], bed: ScenesBed, n: int, g
     ro = r[other]
     points[ro, ask[other]] = cells[ro, asked[other]]
     colors[ro, ask[other]] = colors[ro, asked[other]]
-    pixels, params = scenes.render(cells, colors, bed.bed, gen, dev)                     # (4)
-    cpu = {"cells_cpu": cells.clone(), "colors_cpu": colors.clone(), "points_cpu": points.clone(),
-           "told_cpu": cells >= 0,
-           "visible_cpu": visible_for(cells, cls) if variant.see == "masked" else None}
-    cells, colors, points = cells.to(dev), colors.to(dev), points.to(dev)
-    told = cells >= 0
-    mine = cell_tokens(cells < 0) if cls is None else cell_tokens(cells == int(cls))
-    visible = visible_for(cells, cls) if variant.see == "masked" else None
-    return dict({"x": scenes.to_model(pixels), "cells": cells, "colors": colors, "points": points, "told": told,
-                 "visible": visible, "loss_mask": mine, "hidden": None, "params": params,
-                 "pointing": pointing.to(dev), "can_point": can.to(dev), "other_pointing": other.to(dev),
-                 "other_can_point": other_can.to(dev)}, **cpu)
+    params = scenes.draw_parameters(n, gen, bed_name)                                    # (4)
+    return {"cells": cells, "colors": colors, "points": points, "told": cells >= 0,
+            "visible": visible_for(cells, cls) if variant.see == "masked" else None,
+            "loss_mask": cell_tokens(cells < 0) if cls is None else cell_tokens(cells == int(cls)), "hidden": None,
+            "params": params, "pointing": pointing, "can_point": can, "other_pointing": other,
+            "other_can_point": other_can}
+
+
+def member_batch(variant: Variant, cls: Optional[int], bed: ScenesBed, n: int, gen: torch.Generator,
+                 p_point: float = 0.5, exclude: Optional[int] = None, held_pairs=()) -> dict:
+    """The training rows of an engine (see the module's text for the draw order) -> x, cells, colors, points, told,
+    visible, loss_mask, hidden, params, pointing [n] bool (the rows whose own request points), can_point [n] bool
+    (the rows with a candidate for it), other_pointing [n] bool (the rows in which another request points) and
+    other_can_point [n] bool (the rows with a valid pair for it), on the bed's device; and the layout on the CPU as
+    drawn: cells_cpu, colors_cpu, points_cpu, told_cpu and visible_cpu (None for "open"), so that a trainer can
+    prepare its inputs without reading anything back from the bed's device. It is ``member_layout``, then
+    ``scenes.render_drawn`` on the bed's device, then the moves (told "own": the numbers of
+    ``collective.kind_batch``)."""
+    dev = bed.device
+    lay = member_layout(variant, cls, bed, n, gen, p_point, exclude, held_pairs)
+    pixels, params = scenes.render_drawn(lay["cells"], lay["colors"], lay["params"], bed.bed, dev)
+    visible = lay["visible"]
+    out = {"x": scenes.to_model(pixels), "cells": lay["cells"].to(dev), "colors": lay["colors"].to(dev),
+           "points": lay["points"].to(dev), "told": lay["told"].to(dev),
+           "visible": None if visible is None else visible.to(dev), "loss_mask": lay["loss_mask"].to(dev),
+           "hidden": None if lay["hidden"] is None else lay["hidden"].to(dev), "params": params}
+    out.update({k: lay[k].to(dev) for k in LAYOUT_FLAGS})
+    out.update({"cells_cpu": lay["cells"].clone(), "colors_cpu": lay["colors"].clone(),
+                "points_cpu": lay["points"].clone(), "told_cpu": lay["told"].clone(),
+                "visible_cpu": None if visible is None else visible.clone()})
+    return out
 
 
 # ------------------------------------------------------------------ request lists that point

@@ -862,3 +862,117 @@ def test_20e_find_read_on_the_name_kind_and_on_the_kind_whose_pairs_are_not_turn
             assert not torch.equal(r["scores_a"][MB.TOLD_HEAD], r["scores_b"][MB.TOLD_HEAD])
             assert torch.equal(r["scores_a"][1], r["scores_b"][1])             # the other head: nothing turned
         print(variant.name, "block", block, "weights a", r["weights_a"].tolist(), "b", r["weights_b"].tolist())
+
+
+# ------------------------------------------------------------------ the rows split into the CPU layout and the render
+def _reference_member_batch(variant, cls, bed, n, gen, p_point=0.5, exclude=None, held_pairs=()):
+    """A copy of ``members.member_batch`` as it was before the split into ``member_layout`` and the render."""
+    dev = bed.device
+    n = int(n)
+    if variant.told == "own":
+        if exclude is not None or held_pairs:
+            raise ValueError("told 'own' rows are the stored rows: no clutter to exclude, no pointers")
+        kb = C.kind_batch("addressed_thing" if cls is not None else "addressed_base", cls, bed, n, gen)
+        none = torch.zeros(n, dtype=torch.bool, device=dev)
+        cells_cpu = kb["cells"].cpu().clone()
+        return {"x": kb["x"], "cells": kb["cells"], "colors": kb["colors"], "points": MB.no_points(kb["cells"]),
+                "told": kb["told"], "visible": kb["key_mask"], "loss_mask": kb["loss_mask"], "hidden": kb["hidden"],
+                "params": kb["params"], "pointing": none, "can_point": none, "other_pointing": none,
+                "other_can_point": none, "cells_cpu": cells_cpu, "colors_cpu": kb["colors"].cpu().clone(),
+                "points_cpu": MB.no_points(cells_cpu), "told_cpu": kb["told"].cpu().clone(),
+                "visible_cpu": kb["key_mask"].cpu().clone()}
+    if exclude is not None and cls is not None and int(exclude) == int(cls):
+        raise ValueError("an engine's own class cannot be excluded from its clutter")
+    N = MB.N_CELLS
+    r = torch.arange(n)
+    if cls is not None:
+        oc, ok = scenes.draw_layouts("one", n, gen, only_class=int(cls))
+        cells, colors = scenes.draw_layouts("mix", n, gen)
+        own = (oc >= 0).long().argmax(dim=1)
+        cells[r, own] = int(cls)
+        colors[r, own] = ok[r, own]
+    else:
+        cells, colors = scenes.draw_layouts("mix", n, gen)
+        empty = torch.randint(0, N, (n,), generator=gen)
+        cells[r, empty] = -1
+        colors[r, empty] = -1
+    if exclude is not None:
+        drop = cells == int(exclude)
+        cells[drop] = -1
+        colors[drop] = -1
+    points = MB.no_points(cells)
+    pointing = torch.zeros(n, dtype=torch.bool)
+    can = torch.zeros(n, dtype=torch.bool)
+    if cls is not None:
+        u = torch.rand(n, generator=gen)
+        keys = torch.rand(n, N, generator=gen)
+        count = (cells[:, :, None] == cells[:, None, :]).sum(dim=-1)
+        cand = (cells >= 0) & (cells != int(cls)) & (count == 1) & \
+            ~MB._held_asked(int(cls), held_pairs)[MB._index(cells)]
+        can = cand.any(dim=1)
+        pointing = (u < float(p_point)) & can
+        pick = torch.where(cand, keys, torch.full_like(keys, 2.0)).argmin(dim=1)
+        rp = r[pointing]
+        points[rp, own[pointing]] = cells[rp, pick[pointing]]
+        colors[rp, own[pointing]] = colors[rp, pick[pointing]]
+    asking_ok = (cells >= 0) & (points < 0)
+    if cls is not None:
+        asking_ok[r, own] = False
+        asking_ok[rp, pick[pointing]] = False
+    v = torch.rand(n, generator=gen)
+    keys2 = torch.rand(n, N, N, generator=gen)
+    valid = MB._valid_pairs(cells, MB._held_matrix(held_pairs), False, asking_ok, points < 0)
+    other_can = valid.flatten(1).any(dim=1)
+    other = (v < float(p_point)) & other_can
+    ask, asked = MB._smallest_pair(valid, keys2)
+    ro = r[other]
+    points[ro, ask[other]] = cells[ro, asked[other]]
+    colors[ro, ask[other]] = colors[ro, asked[other]]
+    pixels, params = scenes.render(cells, colors, bed.bed, gen, dev)
+    cpu = {"cells_cpu": cells.clone(), "colors_cpu": colors.clone(), "points_cpu": points.clone(),
+           "told_cpu": cells >= 0,
+           "visible_cpu": MB.visible_for(cells, cls) if variant.see == "masked" else None}
+    cells, colors, points = cells.to(dev), colors.to(dev), points.to(dev)
+    told = cells >= 0
+    mine = MB.cell_tokens(cells < 0) if cls is None else MB.cell_tokens(cells == int(cls))
+    visible = MB.visible_for(cells, cls) if variant.see == "masked" else None
+    return dict({"x": scenes.to_model(pixels), "cells": cells, "colors": colors, "points": points, "told": told,
+                 "visible": visible, "loss_mask": mine, "hidden": None, "params": params,
+                 "pointing": pointing.to(dev), "can_point": can.to(dev), "other_pointing": other.to(dev),
+                 "other_can_point": other_can.to(dev)}, **cpu)
+
+
+def _same_rows(got, want, what):
+    assert sorted(got) == sorted(want), what
+    for k in want:
+        if k == "params":
+            assert sorted(got[k]) == sorted(want[k]), what
+            for q in want[k]:
+                assert torch.equal(got[k][q], want[k][q]), (what, k, q)
+        elif want[k] is None:
+            assert got[k] is None, (what, k)
+        else:
+            assert torch.equal(got[k], want[k]), (what, k)
+
+
+@pytest.mark.parametrize("name", list(MB.VARIANTS))
+@pytest.mark.parametrize("bed_name", scenes.BEDS)
+def test_22_member_batch_is_bit_for_bit_the_rows_before_the_split(name, bed_name):
+    variant, bed = MB.VARIANTS[name], scenes.ScenesBed(bed_name)
+    settings = [dict()] if variant.told == "own" else \
+        [dict(), dict(p_point=1.0, exclude=7, held_pairs=((3, 5), (5, 3), (0, 1))), dict(p_point=0.0)]
+    for cls in (3, 0, None):
+        for i, kw in enumerate(settings):
+            seed = 2200 + 10 * i + (9 if cls is None else cls)
+            got = MB.member_batch(variant, cls, bed, 19, _gen(seed), **kw)
+            gen = _gen(seed)
+            want = _reference_member_batch(variant, cls, bed, 19, gen, **kw)
+            _same_rows(got, want, (name, bed_name, cls, i))
+            # the layout alone: CPU tensors, and the generator left where the rows leave it
+            g2 = _gen(seed)
+            lay = MB.member_layout(variant, cls, bed, 19, g2, **kw)
+            assert torch.equal(torch.rand(4, generator=g2), torch.rand(4, generator=gen))
+            for k, v in lay.items():
+                for x in (v.values() if isinstance(v, dict) else [v]):
+                    assert x is None or x.device.type == "cpu", k
+            assert torch.equal(lay["loss_mask"], want["loss_mask"].cpu())

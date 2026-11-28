@@ -142,3 +142,26 @@ def test_exchange_is_exact_at_one_step_and_over_the_chain(runs, tmp_path):
     assert r["one_step"]["0.3"]["exchanged"] == [0] and all(v == 0.0 for v in r["one_step"]["0.3"]["others"].values())
     assert r["chain"]["largest_outside"] == 0.0 and r["chain"]["largest_outside_unclamped"] == 0.0
     print("chain: exchanged cells", r["chain"]["exchanged_cells"], "differing", r["chain"]["exchanged_cells_differing"])
+
+
+def test_engines_trained_with_device_noise_are_found_by_that_noise_only(tmp_path):
+    from geolip.modular_diffusion.config import parse
+    folder = tmp_path / "parts_device"
+    r = A.main(variant="parts", kind="T2", seed=0, noise="device", out=str(folder), **TINY)
+    assert r["noise"] == "device" and _files(folder)["noise"] == "device"
+    assert all(e["tag"].endswith("_noisedevice") for e in r["engines"])
+    for e in r["engines"]:
+        tj = json.load(open(folder / e["tag"] / "train.json", encoding="utf-8"))
+        assert tj["settings"]["noise"] == "device"
+    a = parse(A.DEFAULTS, (), **dict(TINY, kind="T2", seed=0, parts=str(folder), noise="device"))
+    col, used = A.load_collective(a)
+    assert [u["cls"] for u in used] == [0, 1, None] and col.base is not None and col.classes == [0, 1]
+    a_stream = parse(A.DEFAULTS, (), **dict(TINY, kind="T2", seed=0, parts=str(folder), noise="stream"))
+    with pytest.raises(FileNotFoundError) as err:
+        A.load_collective(a_stream)
+    assert "T2_c0_bedF_seed0_steps2_d64h1x1_exnone_heldnone" in str(err.value)
+    assert "_noisedevice" not in str(err.value).split(" under ")[0]
+    t = A.main(variant="timing", kind="T2", stacks="1", steps=3, from_step=1, batch=2, dim=64, heads=1, depth=1,
+               noise="device", out=str(tmp_path / "timing"))
+    assert t["noise"] == "device" and t["timing"][0]["noise"] == "device" and t["timing"][0]["phases"]
+    assert "PHASES" in open(tmp_path / "timing" / "result.md", encoding="utf-8").read()

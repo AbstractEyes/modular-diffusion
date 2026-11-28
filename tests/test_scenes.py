@@ -300,3 +300,136 @@ def test_request_lists_are_fixed_by_their_seed():
         c = scenes.request_lists(n, seed=1)
         assert not torch.equal(a.cells, c.cells)
     assert not torch.equal(scenes.request_lists(4).cells, scenes.request_lists(4, seed=5003).cells)
+
+
+# ------------------------------------------------------------------ the render split into its draws and the drawing
+def _reference_render(cells, colors, bed, gen, device="cpu", margin=scenes.MARGIN):
+    """A copy of ``scenes.render`` as it was before the split into ``draw_parameters`` and ``render_drawn``."""
+    S = scenes
+    cells = torch.as_tensor(cells, dtype=torch.long)
+    colors = torch.as_tensor(colors, dtype=torch.long)
+    if cells.dim() != 2 or cells.shape[1] != S.N_CELLS or colors.shape != cells.shape:
+        raise ValueError("a layout is cells [B, 9] and colors [B, 9]")
+    if bool(((cells >= 0) != (colors >= 0)).any()):
+        raise ValueError("a cell holds a color exactly when it holds a thing")
+    if bool((cells >= len(S.THINGS)).any()) or bool((colors >= len(S.COLORS)).any()):
+        raise ValueError("things and colors are 0..8")
+    margin = int(margin)
+    if not 0 <= margin <= S.CELL:
+        raise ValueError("margin is 0..16")
+    b = cells.shape[0]
+    p = S.draw_parameters(b, gen, bed)
+    p = {k: v.to(device) for k, v in p.items()}
+    cells_d, colors_d = cells.to(device), colors.to(device)
+    centers = S.cell_centers().to(device)
+    p["centers"] = torch.stack([centers[:, 0] + p["shift_x"], centers[:, 1] + p["shift_y"]], dim=-1)
+    table = torch.tensor(S.COLOR_VALUES, dtype=torch.float32, device=device)
+    p["color"] = (table[colors_d.clamp_min(0)] + p["shade"]).clamp(0.0, 1.0)
+    if bed == "F":
+        ground = torch.full((b, S.CHANNELS, S.CANVAS, S.CANVAS), S.GROUND, dtype=torch.float32, device=device)
+    else:
+        p["texture"] = S.texture(p["noise"])
+        ground = p["tint"][:, :, None, None] + p["texture"][:, None]
+    p["ground"] = ground
+    w = S.CELL + 2 * margin
+    side = S.CANVAS + 2 * margin
+    cov_sum = torch.zeros(b, side, side, dtype=torch.float32, device=device)
+    colored = torch.zeros(b, S.CHANNELS, side, side, dtype=torch.float32, device=device)
+    item_b, item_c = torch.nonzero(cells_d >= 0, as_tuple=True)
+    if item_b.numel():
+        things = cells_d[item_b, item_c]
+        cx, cy = p["centers"][item_b, item_c, 0], p["centers"][item_b, item_c, 1]
+        ang = torch.deg2rad(p["angle"][item_b, item_c])
+        ca, sa = torch.cos(ang), torch.sin(ang)
+        scale = p["scale"][item_b, item_c]
+        local = torch.arange(w, dtype=torch.float32, device=device) - margin + 0.5
+        xs = (item_c % S.CELLS).float()[:, None] * S.CELL + local[None]
+        ys = (item_c // S.CELLS).float()[:, None] * S.CELL + local[None]
+        dx = (xs - cx[:, None])[:, None, :]
+        dy = (ys - cy[:, None])[:, :, None]
+        px = ca[:, None, None] * dx + sa[:, None, None] * dy
+        py = -sa[:, None, None] * dx + ca[:, None, None] * dy
+        cov = torch.zeros(item_b.shape[0], w, w, dtype=torch.float32, device=device)
+        for t in range(len(S.THINGS)):
+            sel = torch.nonzero(things == t, as_tuple=True)[0]
+            if sel.numel():
+                cov[sel] = S.coverage(S.thing_distance(t, px[sel], py[sel], scale[sel]))
+        col = p["color"][item_b, item_c]
+        for c in range(S.N_CELLS):
+            sel = torch.nonzero(item_c == c, as_tuple=True)[0]
+            if sel.numel():
+                bs = item_b[sel]
+                y0, x0 = (c // S.CELLS) * S.CELL, (c % S.CELLS) * S.CELL
+                cov_sum[bs, y0:y0 + w, x0:x0 + w] += cov[sel]
+                colored[bs, :, y0:y0 + w, x0:x0 + w] += cov[sel][:, None] * col[sel][:, :, None, None]
+    m = margin
+    cs = cov_sum[:, m:m + S.CANVAS, m:m + S.CANVAS]
+    pixels = colored[:, :, m:m + S.CANVAS, m:m + S.CANVAS] + (1.0 - cs)[:, None] * ground
+    return pixels.clamp(0.0, 1.0), p
+
+
+def _same_render(a, b):
+    (pa, qa), (pb, qb) = a, b
+    assert torch.equal(pa, pb)
+    assert sorted(qa) == sorted(qb)
+    for k in qa:
+        assert torch.equal(qa[k], qb[k]), k
+
+
+_LAYOUTS = (("empty", {}), ("one", {}), ("mix", {}), ("composed", {"count": 9}), ("composed", {"count": 2}))
+
+
+@pytest.mark.parametrize("bed", scenes.BEDS)
+def test_render_is_bit_for_bit_the_render_before_the_split(bed):
+    for i, (kind, kw) in enumerate(_LAYOUTS):
+        for margin in (scenes.MARGIN, 3):
+            cells, colors = scenes.draw_layouts(kind, 37, _gen(900 + i), **kw)
+            got = scenes.render(cells, colors, bed, _gen(950 + i), margin=margin)
+            want = _reference_render(cells, colors, bed, _gen(950 + i), margin=margin)
+            _same_render(got, want)
+            # render_drawn of the drawn numbers, on the CPU or already moved: the same
+            p = scenes.draw_parameters(37, _gen(950 + i), bed)
+            _same_render(scenes.render_drawn(cells, colors, p, bed, margin=margin), want)
+            _same_render(scenes.render_drawn(cells, colors, {k: v.clone() for k, v in p.items()}, bed,
+                                             margin=margin), want)
+    # the bed's batches, which the stored experiments use, are the old ones
+    sb = scenes.ScenesBed(bed)
+    a = sb.train_batch("mix", 23, _gen(5))
+    gen = _gen(5)
+    cells, colors = scenes.draw_layouts("mix", 23, gen)
+    pix, par = _reference_render(cells, colors, bed, gen)
+    assert torch.equal(a.x, scenes.to_model(pix)) and all(torch.equal(a.params[k], par[k]) for k in par)
+
+
+@pytest.mark.parametrize("bed", scenes.BEDS)
+def test_render_drawn_of_concatenated_rows_is_the_concatenation_of_each_parts_render(bed):
+    parts = []
+    for i, (n, (kind, kw)) in enumerate(zip((5, 1, 17, 64, 3), _LAYOUTS)):
+        gen = _gen(1200 + i)
+        cells, colors = scenes.draw_layouts(kind, n, gen, **kw)
+        parts.append((cells, colors, scenes.draw_parameters(n, gen, bed)))
+    each = [scenes.render_drawn(c, k, p, bed) for c, k, p in parts]
+    cells = torch.cat([c for c, _, _ in parts])
+    colors = torch.cat([k for _, k, _ in parts])
+    p = {key: torch.cat([q[key] for _, _, q in parts]) for key in parts[0][2]}
+    # bed C's texture (a convolution) may round differently with its batch: it is computed part by part
+    sizes = [c.shape[0] for c, _, _ in parts]
+    for kw in ([{"parts": sizes}, {}] if bed == "F" else [{"parts": sizes}]):
+        whole_pixels, whole_params = scenes.render_drawn(cells, colors, p, bed, **kw)
+        assert torch.equal(whole_pixels, torch.cat([x for x, _ in each])), kw
+        assert sorted(whole_params) == sorted(each[0][1])
+        for key in whole_params:
+            assert torch.equal(whole_params[key], torch.cat([q[key] for _, q in each])), (key, kw)
+
+
+def test_render_drawn_refuses_numbers_that_do_not_fit():
+    cells, colors = scenes.draw_layouts("one", 4, _gen(1))
+    p = scenes.draw_parameters(4, _gen(2), "F")
+    with pytest.raises(ValueError):
+        scenes.render_drawn(cells, colors, p, "C")                         # bed C needs the tint and the noise
+    with pytest.raises(ValueError):
+        scenes.render_drawn(cells[:3], colors[:3], p, "F")
+    with pytest.raises(ValueError):
+        scenes.render_drawn(cells, colors, p, "G")
+    with pytest.raises(ValueError):
+        scenes.render_drawn(cells, colors, p, "F", parts=[2, 1])
