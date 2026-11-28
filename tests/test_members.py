@@ -1,0 +1,469 @@
+"""Members of the addressed collective (CPU, small batches): their birth and the bridge to the stored rotary engine,
+padding slots, the training rows, the streams, the told head, the request content, the gate against the integer owner,
+the address reads, request lists that point, and a forward of fixed shape under vmap."""
+import copy
+import math
+
+import pytest
+import torch
+
+from geolip.modular_diffusion import collective as C
+from geolip.modular_diffusion import frame, scenes
+from geolip.modular_diffusion import members as MB
+from geolip.modular_diffusion import multirotary as M
+from geolip.modular_diffusion.spectral import patchify
+
+BED = scenes.ScenesBed("F")
+CELL_OF = frame.TokenFrame().cell                                            # [144]
+
+
+def _gen(seed):
+    return torch.Generator().manual_seed(seed)
+
+
+def _wake(engine, seed):
+    """A nonzero head and modulation, so that an engine's answers carry its inputs."""
+    g = _gen(seed)
+    with torch.no_grad():
+        for p in (engine.head.proj.weight, engine.head.proj.bias):
+            p.copy_(torch.randn(p.shape, generator=g) * 0.05)
+        for blk in engine.blocks:
+            w = blk.modulation[1].weight
+            w.copy_(torch.randn(w.shape, generator=g) * 0.02)
+    return engine.eval()
+
+
+def _engine(variant, cls, seed, depth=1):
+    return _wake(MB.born(variant, cls, seed, depth=depth), 1000 + 17 * seed + (cls if cls is not None else 9))
+
+
+def _collective(variant, seed=0, depth=1, swap=None, classes=range(9)):
+    things = {k: _engine(variant, k, seed + (50 if swap == k else 0), depth) for k in classes}
+    return MB.MemberCollective(things, _engine(variant, None, seed, depth), variant)
+
+
+def _place_only_angles(b):
+    """[b, 153, 32]: the anchored rotary's angles (``multirotary.PLACE_ONLY``) for 9 request slots at their cells'
+    centers with their cells' digits, then the 144 image tokens at (iy, ix) with their cells' digits."""
+    s = torch.arange(9)
+    idx = torch.arange(144)
+    rows = torch.cat([(s // 3 * 4).double() + 1.5, (idx // 12).double()])
+    cols = torch.cat([(s % 3 * 4).double() + 1.5, (idx % 12).double()])
+    dcol = torch.cat([s % 3, (idx % 12) // 4])
+    drow = torch.cat([s // 3, (idx // 12) // 4])
+    ang = M.PLACE_ONLY.angles(rows[None], cols[None], {"place_column": dcol[None], "place_row": drow[None]})
+    return ang.expand(b, -1, -1).contiguous()
+
+
+def _pointer_layout():
+    """One scene: cell 0 a crescent (2) that points at the square (3, address (1, 0)) of cell 4; a star (8, address
+    (2, 2)) in cell 8 also stands once; a diamond (5) in cell 2; the rest empty."""
+    cells = torch.full((1, 9), -1, dtype=torch.long)
+    colors = torch.full((1, 9), -1, dtype=torch.long)
+    for c, (thing, color) in {0: (2, 1), 2: (5, 6), 4: (3, 1), 8: (8, 4)}.items():
+        cells[0, c], colors[0, c] = thing, color
+    points = MB.no_points(cells)
+    points[0, 0] = 3
+    return cells, colors, points
+
+
+# ------------------------------------------------------------------ 1. birth
+def test_1_a_t1_engine_is_born_equal_to_the_stored_rotary_engine():
+    for cls, kind in ((3, "addressed_thing"), (None, "addressed_base")):
+        a = MB.born(MB.T1, cls, 7)
+        b = C.born(kind, cls, 7, read="rotary")
+        sa, sb = a.state_dict(), b.state_dict()
+        assert list(sa) == list(sb)
+        for k in sa:
+            assert torch.equal(sa[k], sb[k]), k
+
+
+# ------------------------------------------------------------------ 2. the bridge at step 1
+def test_2_the_bridge_a_t1_engine_on_place_only_angles_is_the_stored_rotary_engine():
+    """EQUAL: the weights (loaded key for key), the request content (the 12 numbers of frame.content_code on the own
+    slot), the request token's place in the rotary (its cell's center, its cell's digits on the anchored rotary), the
+    image tokens' rotary and the key mask over the image tokens. DIFFERENT: the new sequence carries eight more slots,
+    all invisible keys; a key masked out has softmax weight exactly 0, so nothing reads them, and the head reads the
+    image tokens only. What remains is the order of float32 sums over a longer sequence."""
+    stored = C.born("addressed_thing", 5, 3, read="rotary")
+    g = _gen(20)
+    with torch.no_grad():
+        stored.head.proj.weight.copy_(torch.randn(stored.head.proj.weight.shape, generator=g) * 0.05)
+        stored.head.proj.bias.copy_(torch.randn(stored.head.proj.bias.shape, generator=g) * 0.05)
+    eng = MB.MemberEngine(MB.T1)
+    eng.load_state_dict(stored.state_dict(), strict=True)
+    stored.eval(), eng.eval()
+    b = C.kind_batch("addressed_thing", 5, BED, 6, _gen(21))
+    z, t, _ = C.noisy(b["x"], _gen(22))
+    prep = MB.prepare(MB.T1, b["cells"], b["colors"], None, b["told"], b["key_mask"])
+    ang = _place_only_angles(6)
+    with torch.no_grad():
+        got = eng.forward_tokens(z, t, prep["content"], ang, ang, prep["key_mask"])
+        want = stored(z, t, b["cells"], b["colors"], b["told"], b["key_mask"])
+    diff = float((got - want).abs().max())
+    print("bridge: largest |new - stored| =", diff, "; largest |stored| =", float(want.abs().max()))
+    assert diff < 1e-5
+
+
+# ------------------------------------------------------------------ 3. padding slots
+def test_3_a_padding_slot_changes_no_number_of_the_output():
+    eng = _engine(MB.T2, 4, 0, depth=2)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(30)), torch.tensor([0.4])
+    prep = MB.prepare(MB.T2, cells, colors, points)
+    pad = [c for c in range(9) if int(cells[0, c]) < 0]
+    other = dict(prep)
+    g = _gen(31)
+    content = prep["content"].clone()
+    content[0, pad] = torch.randn(len(pad), 18, generator=g) * 3
+    qa, ka = prep["query_angles"].clone(), prep["key_angles"].clone()
+    qa[0, pad] = torch.rand(len(pad), 32, generator=g) * 6
+    ka[0, pad] = torch.rand(len(pad), 32, generator=g) * 6
+    other.update(content=content, query_angles=qa, key_angles=ka)
+    with torch.no_grad():
+        a = eng.forward_tokens(z, t, **prep)
+        b = eng.forward_tokens(z, t, **other)
+    assert torch.equal(a, b)                                                   # bit for bit
+
+
+# ------------------------------------------------------------------ 4. the rows of T1 are the stored rows
+def test_4_member_batch_of_t1_is_kind_batch_for_the_same_generator():
+    for cls, kind in ((2, "addressed_thing"), (None, "addressed_base")):
+        mb = MB.member_batch(MB.T1, cls, BED, 20, _gen(40))
+        kb = C.kind_batch(kind, cls, BED, 20, _gen(40))
+        assert (torch.equal(mb["x"], kb["x"]) and torch.equal(mb["cells"], kb["cells"])
+                and torch.equal(mb["colors"], kb["colors"]) and torch.equal(mb["visible"], kb["key_mask"])
+                and torch.equal(mb["loss_mask"], kb["loss_mask"]) and bool((mb["points"] == -1).all())), kind
+
+
+# ------------------------------------------------------------------ 5. the rows of the told-all variants
+def test_5_member_batch_told_all_keeps_its_rules():
+    cls, ex = 4, 7
+    held = {(4, 0), (4, 1), (4, 2)}
+    n = 600
+    mb = MB.member_batch(MB.T2, cls, BED, n, _gen(50), exclude=ex, held_pairs=held)
+    cells, colors, points = mb["cells"], mb["colors"], mb["points"]
+    assert bool((cells == cls).any(1).all()) and not bool((cells == ex).any())
+    assert torch.equal(mb["loss_mask"], (cells == cls)[:, CELL_OF])
+    assert torch.equal(mb["visible"], ((cells == cls) | (cells < 0))[:, CELL_OF])
+    MB.check_layout(cells, colors, points)                                     # every layout valid
+    can = torch.zeros(n, dtype=torch.bool)
+    for i in range(n):
+        row = cells[i].tolist()
+        cand = [c for c in range(9) if row[c] >= 0 and row[c] != cls and row.count(row[c]) == 1
+                and (cls, row[c]) not in held]
+        can[i] = bool(cand)
+        _check_pointers(cells[i], colors[i], points[i], held)
+        count = int((points[i] >= 0).sum())
+        assert count == int(mb["pointing"][i]) + int(mb["other_pointing"][i])
+    assert torch.equal(can, mb["can_point"]) and not bool((mb["pointing"] & ~can).any())
+    frac = float(mb["pointing"][can].float().mean())
+    m = int(can.sum())
+    print("rows with a candidate", m, "of", n, "; pointing among them", frac)
+    assert abs(frac - 0.5) < 4 * math.sqrt(0.25 / m)
+    oc = mb["other_can_point"]
+    assert not bool((mb["other_pointing"] & ~oc).any())
+    ofrac, om = float(mb["other_pointing"][oc].float().mean()), int(oc.sum())
+    print("rows with a valid other pair", om, "of", n, "; another request points in", ofrac)
+    assert abs(ofrac - 0.5) < 4 * math.sqrt(0.25 / om)
+    base = MB.member_batch(MB.T2, None, BED, 300, _gen(51), exclude=ex, held_pairs=held)
+    MB.check_layout(base["cells"], base["colors"], base["points"])
+    assert bool((base["cells"] < 0).any(1).all()) and not bool(base["pointing"].any())
+    assert not bool((base["cells"] == ex).any())
+    assert torch.equal(base["loss_mask"], (base["cells"] < 0)[:, CELL_OF])
+    for i in range(300):
+        _check_pointers(base["cells"][i], base["colors"][i], base["points"][i], held)
+        assert int((base["points"][i] >= 0).sum()) == int(base["other_pointing"][i])
+    boc = base["other_can_point"]
+    bfrac, bm = float(base["other_pointing"][boc].float().mean()), int(boc.sum())
+    print("base: rows with a valid pair", bm, "of 300 ; pointing in", bfrac)
+    assert abs(bfrac - 0.5) < 4 * math.sqrt(0.25 / bm)
+    again = MB.member_batch(MB.T2, cls, BED, n, _gen(50), exclude=ex, held_pairs=held)
+    assert all(torch.equal(mb[k], again[k]) for k in ("x", "cells", "colors", "points", "pointing", "other_pointing"))
+    assert MB.member_batch(MB.T3, cls, BED, 4, _gen(52))["visible"] is None
+
+
+def _check_pointers(cells_row, colors_row, points_row, held):
+    """Every pointer of one row: the asked class differs from the asking one and stands once, the asked request states
+    its color (an asked request never points), the pair is not held, the asking request is drawn in the asked color."""
+    row = cells_row.tolist()
+    for a in range(9):
+        if int(points_row[a]) < 0:
+            continue
+        q = row.index(int(points_row[a]))
+        assert row[q] != row[a] and row.count(row[q]) == 1 and int(points_row[q]) == -1
+        assert (row[a], row[q]) not in held and int(colors_row[a]) == int(colors_row[q])
+
+
+def test_5b_a_things_row_can_hold_two_pointers_at_once_and_stays_valid():
+    mb = MB.member_batch(MB.T2, 4, BED, 600, _gen(53))
+    both = mb["pointing"] & mb["other_pointing"]
+    rows = torch.nonzero(both, as_tuple=True)[0]
+    print("rows with two pointers:", rows.numel(), "of 600")
+    assert rows.numel() > 0 and bool(((mb["points"][rows] >= 0).sum(1) == 2).all())
+    MB.prepare(MB.T2, mb["cells"][rows], mb["colors"][rows], mb["points"][rows])     # check_layout inside: no raise
+
+
+# ------------------------------------------------------------------ 6. the streams
+def test_6_the_streams_keys_queries_and_their_independence_of_the_engine():
+    pl = MB.pointer_lists(4, 40, 600)
+    rows = torch.nonzero(pl.pointed, as_tuple=True)[0][:12]
+    cells, colors, points = pl.cells[rows], pl.colors[rows], pl.points[rows]
+    st = MB.streams(MB.T2, cells, points)
+    kd, qd = st["key_digits"], st["query_digits"]
+    seq_cell = torch.cat([torch.arange(9), CELL_OF])
+    for i in range(cells.shape[0]):
+        for tok in range(153):
+            c = int(seq_cell[tok])
+            want_k = MB.address_of(int(cells[i, c]))
+            asked = int(points[i, c])
+            want_q = MB.address_of(asked) if asked >= 0 else want_k
+            assert (int(kd["member_0"][i, tok]), int(kd["member_1"][i, tok])) == want_k
+            assert (int(qd["member_0"][i, tok]), int(qd["member_1"][i, tok])) == want_q
+    for v in (MB.C1, MB.C2, MB.T2K):
+        s2 = MB.streams(v, cells, points)
+        for d in (s2["key_digits"], s2["query_digits"]):
+            assert bool((d["member_0"] == 4).all()) and bool((d["member_1"] == 4).all()), v.name
+    present = sorted({int(x) for x in cells[0][cells[0] >= 0].tolist()})
+    assert len(present) >= 2
+    col = _collective(MB.T2, classes=present[:2])
+    a, b = (col.engine_inputs(k, cells[:1], colors[:1], points[:1]) for k in col.classes)
+    assert all(torch.equal(a[k], b[k]) for k in ("content", "query_angles", "key_angles"))
+
+
+# ------------------------------------------------------------------ 7. the told head of T2K
+def test_7_the_told_head_turns_only_the_name_pairs_and_a_pointer_asks_by_the_asked_name():
+    cells, colors, points = _pointer_layout()
+    prep = MB.prepare(MB.T2K, cells, colors, points)
+    tq, tk = prep["told_angles"]
+    names = list(MB.NAME_PAIRS)
+    rest = [p for p in range(32) if p not in names]
+    for told, plain in ((tq, prep["query_angles"]), (tk, prep["key_angles"])):
+        assert torch.equal(told[..., rest], plain[..., rest])
+        assert not torch.equal(told[..., names], plain[..., names])
+    assert torch.equal(tq[0, 0, names], tk[0, 4, names])                       # the pointer asks the square's name
+    for other in (2, 8):
+        assert not torch.equal(tq[0, 0, names], tk[0, other, names])
+    for tok in range(144):                                                     # the pointing cell's image tokens ask too
+        if int(CELL_OF[tok]) == 0:
+            assert torch.equal(tq[0, 9 + tok, names], tk[0, 4, names])
+
+
+# ------------------------------------------------------------------ 8. the request content
+def test_8_the_content_no_color_on_a_pointer_identity_only_where_its_variant_puts_it():
+    cells, colors, points = _pointer_layout()
+    u = frame.digit_code(3).float()
+    for v in MB.VARIANTS.values():
+        told = cells >= 0                                                      # every request, T1 included
+        c = MB.request_content(v, cells, colors, points, told)
+        assert float(c[0, 0, 6:12].abs().max()) == 0.0, v.name                # no color on the pointing request
+        assert float(c[0, 4, 6:12].abs().max()) > 0.0, v.name                 # a stated color is there
+        if v.identity in ("address", "name"):
+            assert float(c[..., :6].abs().max()) == 0.0 and float(c[..., 12:].abs().max()) == 0.0, v.name
+        if v.identity == "content":
+            asked = torch.cat([u[3 // 3], u[3 % 3]])
+            assert torch.equal(c[0, 0, 12:], asked)
+            assert float(c[0, 1:, 12:].abs().max()) == 0.0                    # only the pointing request
+        assert float(c[0, cells[0] < 0].abs().max()) == 0.0, v.name           # padding slots: zero
+
+
+# ------------------------------------------------------------------ 9. the gate is the integer owner
+def test_9_the_weights_are_the_one_hot_owner_and_serve_is_the_selection():
+    col = _collective(MB.T2)
+    cells, _ = scenes.draw_layouts("mix", 64, _gen(90))
+    w, base = col.weights(cells)
+    owner = frame.token_owner(cells, [[k] for k in range(9)])
+    one = torch.nn.functional.one_hot(owner, 10).double()
+    assert torch.equal(w[one[..., :9] == 0], torch.zeros_like(w[one[..., :9] == 0]))
+    assert float((w - one[..., :9]).abs().max()) < 1e-8 and float((base - one[..., 9]).abs().max()) < 1e-8
+    g = _gen(91)
+    v0, vs = torch.randn(64, 144, 48, generator=g), torch.randn(9, 64, 144, 48, generator=g)
+    got = M.serve(v0, vs, w, base)
+    allv = torch.cat([vs, v0[None]])
+    sel = allv[owner, torch.arange(64)[:, None], torch.arange(144)[None]]
+    rel = float((got - sel).abs().max() / sel.abs().max())
+    print("serve against the selection, relative:", rel)
+    assert rel < 1e-7
+
+
+# ------------------------------------------------------------------ 10. the swap, the two together
+def test_10_address_swap_moves_the_gate_on_its_cell_only_and_the_unturned_control_keeps_the_gate():
+    col = _collective(MB.T3)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(100)), torch.tensor([0.5])
+    cell, old, new = 2, 5, 6                                                   # the diamond becomes a plus
+    r = MB.address_swap(col, z, t, cells, colors, points, 0, cell, new)
+    i_old, i_new = col.classes.index(old), col.classes.index(new)
+    wb, wa = r["before"]["gate"]["w"], r["after"]["gate"]["w"]
+    th = math.tanh(10.0)                                                       # one owner at u = U: tanh(U), to rounding
+    assert float((wb[:, i_old] - th).abs().max()) < 1e-12 and bool((wb[:, i_new] == 0.0).all())
+    assert float((wa[:, i_new] - th).abs().max()) < 1e-12 and bool((wa[:, i_old] == 0.0).all())
+    off = CELL_OF != cell
+    assert torch.equal(r["before"]["w_all"][off], r["after"]["w_all"][off])
+    print("looks of the old engine before / after:", r["before"]["looks_old"].tolist(), r["after"]["looks_old"].tolist())
+    print("looks of the new engine before / after:", r["before"]["looks_new"].tolist(), r["after"]["looks_new"].tolist())
+    print("other members' relative change:", r["other_relative_change"])
+    u = MB.address_swap(col, z, t, cells, colors, points, 0, cell, new, turn=False)
+    for tag in ("before", "after"):
+        assert torch.equal(u[tag]["w_all"], r[tag]["w_all"])
+    n = MB.address_swap(col, z, t, cells, colors, points, 0, cell, new, gate="neutral")
+    assert tuple(n["before"]["answers"].shape) == (9, 16, 48) and "gate" not in n["before"]
+
+
+def test_10b_address_swap_refuses_a_scene_whose_pointer_asks_the_old_or_the_new_class_before_any_forward():
+    col = _collective(MB.T3)
+    cells, colors, points = _pointer_layout()                                  # cell 0 asks the square (3) of cell 4
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(101)), torch.tensor([0.5])
+    calls = []
+    engines = list(col.things.values()) + [col.base]
+    hooks = [e.blocks[0].register_forward_pre_hook(lambda m, a: calls.append(1)) for e in engines]   # blocks run
+    try:
+        for cell, new in ((4, 6), (2, 3)):                                     # asks the old class; asks the new one
+            with pytest.raises(ValueError, match="would break a pointer"):
+                MB.address_swap(col, z, t, cells, colors, points, 0, cell, new)
+    finally:
+        for h in hooks:
+            h.remove()
+    assert calls == []
+
+
+# ------------------------------------------------------------------ 11. FIND at one site
+def test_11_find_read_differs_only_on_the_member_groups_and_unit_vectors_score_the_kernel():
+    eng = _engine(MB.T2, 2, 0, depth=2)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(110)), torch.tensor([0.3])
+    r = MB.find_read(eng, MB.T2, z, t, cells, colors, points, 0, 0, 3, 8, block=1)
+    member = [MB.GROUPS.index("member_0"), MB.GROUPS.index("member_1")]
+    others = [i for i in range(len(MB.GROUPS)) if i not in member]
+    assert torch.equal(r["scores_a"][..., others], r["scores_b"][..., others])
+    assert not torch.equal(r["scores_a"][..., member], r["scores_b"][..., member])
+    print("softmax weights on (square, star), asking the square:", r["weights_a"].tolist(), "the star:",
+          r["weights_b"].tolist(), "; answers differ by", float((r["answer_a"] - r["answer_b"]).abs().max()))
+    # q = k = 1 on the first number of each pair of one member level, 0 elsewhere. A turned pair scores
+    # cos(angle_q - angle_k) = cos(w_k (a - b)); over the level's two pairs (k = 1, 2, modulus 5) the sum is 2 when the
+    # query's digit a equals the key's digit b and -1/2 otherwise. The pointing slot (0) asks the square, (1, 0); the
+    # square's slot (4) holds (1, 0), the star's slot (8) holds (2, 2): on either level, 2 for the square and -1/2 for
+    # the star. The groups are reported divided by sqrt(64) = 8.
+    prep = MB.prepare(MB.T2, cells, colors, points)
+    for name in ("member_0", "member_1"):
+        v = torch.zeros(1, 2, 153, 64)
+        v[..., list(M.PLACE_MEMBER.level(name).pairs)] = 1.0
+        q, k = MB.block_rotary(prep, 1)(v, v)
+        sc = MB.pair_group_scores(q, k, 0, (4, 8))[0, :, :, MB.GROUPS.index(name)] * 8
+        assert float((sc[:, 0] - 2.0).abs().max()) < 1e-5 and float((sc[:, 1] + 0.5).abs().max()) < 1e-5, name
+
+
+def test_11b_find_read_vary_content_changes_only_the_pointing_slots_asked_identity():
+    eng = _engine(MB.C2, 2, 0, depth=2)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(111)), torch.tensor([0.3])
+    r = MB.find_read(eng, MB.C2, z, t, cells, colors, points, 0, 0, 3, 8, block=1, vary="content")
+    a, b = r["inputs_a"], r["inputs_b"]
+    assert torch.equal(a["query_angles"], b["query_angles"]) and torch.equal(a["key_angles"], b["key_angles"])
+    diff = a["content"] != b["content"]
+    where = torch.nonzero(diff)
+    print("content entries that differ (scene, slot, number):", where.tolist())
+    assert bool(diff.any()) and bool((where[:, 1] == 0).all()) and bool((where[:, 2] >= 12).all())
+    with pytest.raises(ValueError):
+        MB.find_read(eng, MB.T2, z, t, cells, colors, points, 0, 0, 3, 8, block=1, vary="content")
+
+
+# ------------------------------------------------------------------ 12. SERVE, structural
+def test_12_serve_read_keeps_the_given_answers_one_denominator_and_the_reverse_edit_restores_every_number():
+    col = _collective(MB.T2)
+    cells, _, _ = _pointer_layout()
+    g = _gen(120)
+    answers, base_answer = torch.randn(9, 1, 144, 48, generator=g), torch.randn(1, 144, 48, generator=g)
+    r = MB.serve_read(col, answers, base_answer, cells, 0, 2, 6)
+    toks = torch.nonzero(CELL_OF == 2, as_tuple=True)[0]
+    assert torch.equal(r["answers"], answers[:, 0, toks]) and torch.equal(r["base_answer"], base_answer[0, toks])
+    assert torch.equal(r["before"]["denominator"], r["after"]["denominator"])
+    assert all(torch.equal(r["before"][k], r["reverse"][k]) for k in r["before"])
+
+
+# ------------------------------------------------------------------ 13. one engine exchanged
+@pytest.mark.parametrize("variant", [MB.T1, MB.T2, MB.T3])
+def test_13_exchanging_one_engine_changes_no_other_members_contribution(variant):
+    pl = MB.pointer_lists(4, 6, 130)
+    points = pl.points if variant.told == "all" else MB.no_points(pl.cells)
+    colors = pl.colors
+    k = int(pl.cells[0][pl.cells[0] >= 0][0])
+    z, t = torch.randn(6, 3, 48, 48, generator=_gen(131)), torch.full((6,), 0.45)
+    col_a = _collective(variant)
+    twin = {c: (_engine(variant, k, 50) if c == k else e) for c, e in col_a.things.items()}   # one engine replaced
+    col_b = MB.MemberCollective(twin, col_a.base, variant)
+    r = MB.exchange_read(col_a, col_b, z, t, pl.cells, colors, points)
+    print(variant.name, "exchanged", r["exchanged"], "others", r["others"])
+    assert r["exchanged"] == [k] and all(v == 0.0 for v in r["others"].values())
+
+
+# ------------------------------------------------------------------ 14. silence off the address
+def test_14_an_unheld_address_or_a_removed_request_leaves_its_cell_to_the_base():
+    col = _collective(MB.T2)
+    cells, _, _ = _pointer_layout()
+    for r in (MB.address_unheld(col, cells, 0, 2), MB.address_missing(col, cells, 0, 2)):
+        assert bool((r["w"] == 0.0).all()) and bool((r["base"] == 1.0).all())
+
+
+# ------------------------------------------------------------------ 15. request lists that point
+def test_15_pointer_lists_obey_the_rules_and_the_held_pairs():
+    held = {(a, q) for a in range(9) for q in range(9) if (a + 2 * q) % 4 == 0 and a != q}
+    for only in (False, True):
+        pl = MB.pointer_lists(5, 200, 150, held_pairs=held, only_held=only)
+        base = scenes.request_lists(5, 200, 150)
+        assert torch.equal(pl.cells, base.cells)
+        for i in range(200):
+            row = pl.cells[i].tolist()
+            ps = [c for c in range(9) if int(pl.points[i, c]) >= 0]
+            assert len(ps) == (1 if bool(pl.pointed[i]) else 0)
+            if not ps:
+                assert torch.equal(pl.colors[i], base.colors[i])
+                continue
+            (a,) = ps
+            q = row.index(int(pl.points[i, a]))
+            assert row[q] != row[a] and row.count(row[q]) == 1 and int(pl.points[i, q]) == -1
+            assert ((row[a], row[q]) in held) == only
+            assert int(pl.colors[i, a]) == int(base.colors[i, q])
+        print("only_held", only, ": lists pointed", int(pl.pointed.sum()), "of 200")
+
+
+# ------------------------------------------------------------------ 16. a forward of fixed shape
+@pytest.mark.parametrize("variant", [MB.T2, MB.T2K])
+def test_16_vmap_over_two_stacked_engines_gives_each_engines_own_output(variant):
+    from torch.func import functional_call, stack_module_state, vmap
+    e1, e2 = _engine(variant, 1, 0, depth=2), _engine(variant, 1, 1, depth=2)
+    class Tokens(torch.nn.Module):                                             # functional_call runs forward()
+        def __init__(self, engine):
+            super().__init__()
+            self.engine = engine
+
+        def forward(self, *args):
+            return self.engine.forward_tokens(*args)
+
+    params, buffers = stack_module_state([Tokens(e1), Tokens(e2)])
+    shell = Tokens(copy.deepcopy(e1))
+    batches = []
+    for s in (160, 161):
+        mb = MB.member_batch(variant, 1, BED, 3, _gen(s))
+        z, t, _ = C.noisy(mb["x"], _gen(s + 10))
+        prep = MB.prepare(variant, mb["cells"], mb["colors"], mb["points"], mb["told"], mb["visible"])
+        batches.append((z, t, prep))
+
+    def stack(key):
+        return torch.stack([b[2][key] for b in batches])
+
+    told = None if batches[0][2]["told_angles"] is None else tuple(
+        torch.stack([b[2]["told_angles"][j] for b in batches]) for j in range(2))
+    Z, T = torch.stack([b[0] for b in batches]), torch.stack([b[1] for b in batches])
+
+    def one(p, bu, z, t, content, qa, ka, km, ta):
+        return functional_call(shell, (p, bu), (z, t, content, qa, ka, km, ta))
+
+    with torch.no_grad():
+        dims = (0,) * 8 + ((None if told is None else 0),)
+        out = vmap(one, in_dims=dims)(params, buffers, Z, T, stack("content"), stack("query_angles"), stack("key_angles"),
+                        stack("key_mask"), told)
+        want = [e.forward_tokens(b[0], b[1], **b[2]) for e, b in zip((e1, e2), batches)]
+    diffs = [float((out[i] - want[i]).abs().max()) for i in range(2)]
+    print(variant.name, "vmap against each engine's own forward:", diffs)
+    assert max(diffs) < 1e-5

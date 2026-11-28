@@ -210,8 +210,9 @@ class Structure:
 
 
 def _tables(ang: Tensor) -> Tuple[Tensor, Tensor]:
-    """[B, N, P] angles -> (cos, sin) [B, 1, N, 2 P] in the rotate-half layout (as ``rotary.anchored_rotary``)."""
-    a = torch.cat([ang, ang], dim=-1)[:, None]
+    """[..., N, P] angles -> (cos, sin) [..., 1, N, 2 P] in the rotate-half layout (as ``rotary.anchored_rotary``): the
+    head axis is put before the token axis, whatever stands in front."""
+    a = torch.cat([ang, ang], dim=-1).unsqueeze(-3)
     return a.cos(), a.sin()
 
 
