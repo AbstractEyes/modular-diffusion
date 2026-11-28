@@ -321,6 +321,35 @@ def test_10_address_swap_moves_the_gate_on_its_cell_only_and_the_unturned_contro
     assert tuple(n["before"]["answers"].shape) == (9, 16, 48) and "gate" not in n["before"]
 
 
+@pytest.mark.parametrize("variant", [MB.T1, MB.T2, MB.T3])
+def test_10c_the_neutral_swap_runs_the_old_and_the_new_engine_on_the_edited_cell_on_both_sides(variant):
+    col = _collective(variant)
+    cells, colors, points = _pointer_layout()
+    if variant.told == "own":
+        points = MB.no_points(cells)
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(101)), torch.tensor([0.5])
+    cell, old, new = 2, 5, 6                       # the diamond stands once; no plus stands before the swap
+    assert int((cells == old).sum()) == 1 and int((cells == new).sum()) == 0
+    n = MB.address_swap(col, z, t, cells, colors, points, 0, cell, new, gate="neutral")
+    after = cells.clone()
+    after[0, cell] = new
+    toks = CELL_OF == cell
+    for tag, layout in (("before", cells), ("after", after)):
+        for cls in (old, new):
+            i = col.classes.index(cls)
+            prep = col.engine_inputs(cls, layout, colors, points, cell=torch.tensor([cell]))
+            own = patchify(col.things[cls].forward_tokens(z, t, **prep), 4)[0, toks]
+            got = n[tag]["answers"][i]
+            assert bool((got != 0).any()), (variant.name, tag, cls)
+            assert torch.equal(got, own), (variant.name, tag, cls)
+    # the other members' answers are those of the collective's own parts on each side
+    for tag, layout in (("before", cells), ("after", after)):
+        answers, _ = col.part_answers(z, t, layout, colors, points)
+        for i, cls in enumerate(col.classes):
+            if cls not in (old, new):
+                assert torch.equal(n[tag]["answers"][i], answers[i, 0, toks]), (variant.name, tag, cls)
+
+
 def test_10b_address_swap_refuses_a_scene_whose_pointer_asks_the_old_or_the_new_class_before_any_forward():
     col = _collective(MB.T3)
     cells, colors, points = _pointer_layout()                                  # cell 0 asks the square (3) of cell 4
@@ -862,6 +891,20 @@ def test_20e_find_read_on_the_name_kind_and_on_the_kind_whose_pairs_are_not_turn
             assert not torch.equal(r["scores_a"][MB.TOLD_HEAD], r["scores_b"][MB.TOLD_HEAD])
             assert torch.equal(r["scores_a"][1], r["scores_b"][1])             # the other head: nothing turned
         print(variant.name, "block", block, "weights a", r["weights_a"].tolist(), "b", r["weights_b"].tolist())
+
+
+@pytest.mark.parametrize("variant,vary", [(MB.T2, "query"), (MB.T2K, "query"), (MB.C2, "content")])
+def test_20g_find_read_of_every_block_at_once_is_the_reads_of_one_block_at_a_time(variant, vary):
+    eng = _engine(variant, 2, 0, depth=3)
+    cells, colors, points = _pointer_layout()
+    z, t = torch.randn(1, 3, 48, 48, generator=_gen(230)), torch.tensor([0.3])
+    whole = MB.find_read(eng, variant, z, t, cells, colors, points, 0, 0, 3, 8, None, vary=vary)
+    assert sorted(whole["by_block"]) == [0, 1, 2]
+    for block in range(3):
+        one = MB.find_read(eng, variant, z, t, cells, colors, points, 0, 0, 3, 8, block, vary=vary)
+        for key in ("scores_a", "scores_b", "weights_a", "weights_b"):
+            assert torch.equal(whole["by_block"][block][key], one[key]), (variant.name, block, key)
+        assert torch.equal(whole["answer_a"], one["answer_a"]) and torch.equal(whole["answer_b"], one["answer_b"])
 
 
 # ------------------------------------------------------------------ the rows split into the CPU layout and the render

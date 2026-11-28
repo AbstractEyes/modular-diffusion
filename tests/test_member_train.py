@@ -228,7 +228,8 @@ def test_7b_one_step_of_the_stack_leaves_the_weights_of_the_step_built_engine_by
         average = {k: v.detach().clone() for k, v in state.items()}
         for s in range(2):
             if build == "now":
-                T._step(variant, classes, bed, 5, s, 6, 0.5, None, [], state, 2, opt, average, "cpu", 1e-3, 2)
+                T._step(variant, classes, bed, 5, s, 6, 0.5, None, [], state, 2, opt, average, "cpu", 1e-3, 2,
+                        group=len(classes))                             # the single stacked pass
             else:
                 for grp in opt.param_groups:
                     grp["lr"] = 1e-3 * min(1.0, (s + 1) / 2)
@@ -305,3 +306,234 @@ def test_7e_the_phase_clock_names_every_phase():
     assert list(r["phases"]) == list(T.PHASES) and all(v >= 0 for v in r["phases"].values())
     assert r["noise"] == "device" and "phases" not in T.time_stack(MB.T2, (0,), BED, 0, batch=2, steps=2, from_step=1,
                                                                     dim=64, heads=1, depth=1)
+
+
+@pytest.mark.parametrize("variant", [MB.T1, MB.T2, MB.T2K])
+def test_7f_the_cross_attention_without_its_all_true_mask_gives_the_same_output_and_gradients(variant, monkeypatch):
+    classes = (2, 6, None)
+    engines = [_wake(MB.born(variant, c, 0, depth=3), 40 + i) for i, c in enumerate(classes)]
+    sb = T.stack_step_rows(variant, classes, BED, 0, 0, 8)
+    real = T._sdpa
+
+    def masked(q, k, v, mask):                       # the form before: one context key under an all-True mask
+        if mask is None:
+            mask = torch.ones(q.shape[0], q.shape[1], 1, 1, 1, dtype=torch.bool)
+        return real(q, k, v, mask)
+
+    results = []
+    for fn in (real, masked):
+        monkeypatch.setattr(T, "_sdpa", fn)
+        state = {k: v.clone().requires_grad_(True) for k, v in T.stack_state(engines).items()}
+        out = T.stacked_forward(state, 2, sb["z"], sb["t"], **sb["inputs"])
+        sum(T.masked_loss_unchecked(out[g], sb["target"][g], sb["loss_mask"][g]) for g in range(3)).backward()
+        results.append((out.detach(), {k: v.grad.clone() for k, v in state.items()}))
+    (oa, ga), (ob, gb) = results
+    assert torch.equal(oa, ob) and all(torch.equal(ga[k], gb[k]) for k in ga)
+
+
+# ------------------------------------------------------------------ 7g. the engines run forward and backward in groups
+def _reference_step(variant, classes, bed, seed, s, batch, p_point, exclude, held, state, heads, opt, average, device,
+                    lr, warmup):
+    """A copy of ``_step`` as it was before the groups: one stacked pass of every engine."""
+    for grp in opt.param_groups:
+        grp["lr"] = float(lr) * min(1.0, (s + 1) / max(1, int(warmup)))
+    sb = T.stack_step_rows(variant, classes, bed, seed, s, batch, p_point, exclude, held, device, "stream", None)
+    losses = T.stack_losses(state, heads, sb)
+    loss = losses[0]
+    for x in losses[1:]:
+        loss = loss + x
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    opt.step()
+    dk = (1 + s) / (s + 8 + 2)
+    with torch.no_grad():
+        for k in state:
+            average[k].copy_(dk * average[k] + (1.0 - dk) * state[k].detach())
+    return losses
+
+
+def _fresh(engines):
+    state = {k: v.clone().requires_grad_(True) for k, v in T.stack_state(engines).items()}
+    opt = torch.optim.Adam(list(state.values()), lr=1e-3, betas=T.BETAS, eps=T.EPS, weight_decay=0.0)
+    return state, opt, {k: v.detach().clone() for k, v in state.items()}
+
+
+def test_7g_group_of_every_engine_is_the_single_stacked_pass_bit_for_bit():
+    variant, classes, bed = MB.T2, (1, 8, None), scenes.ScenesBed("F")
+    engines = [_wake(MB.born(variant, c, 0, depth=2), 80 + i) for i, c in enumerate(classes)]
+    (sa, oa, aa), (sb_, ob, ab) = _fresh(engines), _fresh(engines)
+    for s in range(2):
+        la = T._step(variant, classes, bed, 5, s, 6, 0.5, None, [], sa, 2, oa, aa, "cpu", 1e-3, 2, group=3)
+        lb = _reference_step(variant, classes, bed, 5, s, 6, 0.5, None, [], sb_, 2, ob, ab, "cpu", 1e-3, 2)
+        assert all(torch.equal(x, y) for x, y in zip(la, lb))
+    assert all(torch.equal(sa[k], sb_[k]) and torch.equal(aa[k], ab[k]) for k in sa)
+    for pa, pb in zip(oa.param_groups[0]["params"], ob.param_groups[0]["params"]):
+        qa, qb = oa.state[pa], ob.state[pb]
+        assert sorted(qa) == sorted(qb) and all(torch.equal(qa[k], qb[k]) for k in qa)
+
+
+@pytest.mark.parametrize("noise", ["stream", "device"])
+@pytest.mark.parametrize("bed_name", scenes.BEDS)
+@pytest.mark.parametrize("variant", [MB.T1, MB.T2, MB.T2K])
+def test_7h_with_group_1_a_stacked_engine_trains_exactly_as_its_solo_run(variant, bed_name, noise):
+    """The steps of ``train_members`` (``_step``), in memory: three steps of a stack of a thing and the base against
+    each engine's solo stack."""
+    bed = scenes.ScenesBed(bed_name)
+    depth = 2 if variant is MB.T2K else 1
+    classes = (3, None)
+
+    def run(cls_list):
+        engines = [MB.born(variant, c, 0, 128, 2, depth) for c in cls_list]
+        state, opt, average = _fresh(engines)
+        losses = []
+        for s in range(3):
+            losses.append([float(x) for x in T._step(variant, list(cls_list), bed, 0, s, 4, 0.5, None, [], state, 2,
+                                                       opt, average, "cpu", 1e-3, 2, noise=noise, group=1)])
+        return state, average, losses
+
+    both = run(classes)
+    for g, cls in enumerate(classes):
+        solo = run((cls,))
+        for k in both[0]:
+            assert torch.equal(both[0][k][g], solo[0][k][0]), (k, g)
+            assert torch.equal(both[1][k][g], solo[1][k][0]), (k, g)
+        assert [x[g] for x in both[2]] == [x[0] for x in solo[2]]
+
+
+def test_7i_a_bad_group_is_refused_and_another_group_is_another_stack(tmp_path):
+    for bad in (0, 3, -1):
+        with pytest.raises(ValueError):
+            T.train_members(MB.T2, (3, None), BED, 0, str(tmp_path / f"bad{bad}"), steps=2, **dict(KW, group=bad))
+        with pytest.raises(ValueError):
+            T.time_stack(MB.T2, (3, None), BED, 0, batch=2, steps=2, dim=64, heads=1, depth=1, group=bad)
+    one = T.train_members(MB.T2, (3, None), BED, 0, str(tmp_path / "g"), steps=2, until=1, **dict(KW, group=1))
+    assert one["settings"]["group"] == 1
+    with pytest.raises(ValueError, match="other settings"):
+        T.train_members(MB.T2, (3, None), BED, 0, str(tmp_path / "g"), steps=2, **dict(KW, group=2))
+    done = T.train_members(MB.T2, (3, None), BED, 0, str(tmp_path / "h"), steps=2, **dict(KW, group=2))
+    assert all("group" not in r["tag"] for r in done["engines"])
+    with pytest.raises(ValueError, match="other settings"):
+        T.train_members(MB.T2, (3, None), BED, 0, str(tmp_path / "h"), steps=2, **dict(KW, group=1))
+
+
+# ------------------------------------------------------------------ 8. restarts with held pairs
+def _plus4():
+    from geolip.modular_diffusion.experiments.addressed_collective import held_pairs
+    return held_pairs("plus4")
+
+
+def _same_state(a, b):
+    return all(torch.equal(a["state"][k], b["state"][k]) and torch.equal(a["average"][k], b["average"][k])
+               for k in a["state"])
+
+
+def test_8_a_finished_run_with_held_pairs_started_again_finds_itself_finished(tmp_path):
+    kw = dict(KW, held_pairs=_plus4())
+    first = T.train_members(MB.T2, (2, None), BED, 0, str(tmp_path / "s"), steps=3, **kw)
+    calls = []
+    again = T.train_members(MB.T2, (2, None), BED, 0, str(tmp_path / "s"), steps=3,
+                            **dict(kw, log=lambda s: calls.append(s)))
+    assert again.get("restored") and any(s.startswith("FINISHED already") for s in calls)
+    assert [r["last_read"] for r in again["engines"]] == [r["last_read"] for r in first["engines"]]
+    assert [r["tag"] for r in again["engines"]] == [r["tag"] for r in first["engines"]]
+
+
+def test_8b_a_run_with_held_pairs_stopped_and_started_again_reaches_the_unbroken_runs_numbers(tmp_path):
+    kw = dict(KW, held_pairs=_plus4())
+    whole = T.train_members(MB.T2, (5, None), BED, 1, str(tmp_path / "whole"), steps=4, **kw)
+    part = T.train_members(MB.T2, (5, None), BED, 1, str(tmp_path / "part"), steps=4, until=2, **kw)
+    assert not part["finished"]
+    rest = T.train_members(MB.T2, (5, None), BED, 1, str(tmp_path / "part"), steps=4, **kw)
+    assert rest["finished"] and _same_state(whole, rest)
+
+
+# ------------------------------------------------------------------ 8c. the own read's chunks prepared once
+def _reference_stack_own_read(state, heads, variant, sets, device):
+    """A copy of ``stack_own_read`` as it was before its chunks were prepared once (inputs prepared at every read)."""
+    totals = [0.0] * len(sets)
+    rows = 0
+    for c in range(len(sets[0])):
+        parts = []
+        for s in sets:
+            ch = s[c]
+            b = ch["batch"]
+            parts.append({"z": ch["z"], "t": ch["t"], "target": ch["target"], "loss_mask": ch["loss_mask"],
+                          "loss_ok": ch["loss_ok"],
+                          "prep": MB.prepare(variant, b["cells_cpu"], b["colors_cpu"], b["points_cpu"], b["told_cpu"],
+                                             b["visible_cpu"])})
+        sb = T.stack_rows(parts, device)
+        m = parts[0]["z"].shape[0]
+        with torch.no_grad():
+            for g, loss in enumerate(T.stack_losses(state, heads, sb)):
+                totals[g] += float(loss) * m
+        rows += m
+    return [x / max(1, rows) for x in totals]
+
+
+@pytest.mark.parametrize("variant", [MB.T1, MB.T2, MB.T2K, MB.C1])
+def test_8c_the_own_read_from_chunks_prepared_once_is_the_read_prepared_each_time(variant):
+    classes = (4, None)
+    engines = [_wake(MB.born(variant, c, 0, depth=2), 70 + i) for i, c in enumerate(classes)]
+    state = T.stack_state(engines)
+    sets = T.own_read_sets(variant, classes, BED, 300, 0.5, None, ())          # two chunks: 256 and 44
+    chunks = T.own_read_chunks(sets, "cpu")
+    want = _reference_stack_own_read(state, 2, variant, sets, "cpu")
+    assert T.stack_own_read(state, 2, variant, sets, "cpu", chunks) == want
+    assert T.stack_own_read(state, 2, variant, sets, "cpu") == want
+    shared = not variant.turn or variant.identity == "name"
+    assert all((c["inputs"]["query_angles"] is c["inputs"]["key_angles"]) == shared for c in chunks)
+
+
+# ------------------------------------------------------------------ 9. checkpoint generations
+def _generations(folder):
+    return sorted(f for f in os.listdir(folder) if f.startswith("stack_checkpoint") and f.endswith(".safetensors"))
+
+
+def _kill_once(monkeypatch, which, at_call):
+    """os.replace raises once, at the at_call-th rename whose destination is the record (which="record") or the
+    stack's tensor file (which="tensors"): a job killed at that point."""
+    real = os.replace
+    seen = [0]
+
+    def replace(src, dst):
+        base = os.path.basename(str(dst))
+        hit = base == "stack_checkpoint.json" if which == "record" else \
+            (base.startswith("stack_checkpoint") and base.endswith(".safetensors"))
+        if hit:
+            seen[0] += 1
+            if seen[0] == at_call:
+                raise OSError("killed")
+        return real(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_9_a_clean_save_leaves_one_generation_named_by_its_record(tmp_path):
+    import json
+    folder = tmp_path / "g"
+    T.train_members(MB.T2, (5,), BED, 1, str(folder), steps=3, until=2, **dict(KW, save_every=1))
+    gens = _generations(folder)
+    record = json.load(open(folder / "stack_checkpoint.json", encoding="utf-8"))
+    assert gens == ["stack_checkpoint_2.safetensors"] and record["tensors"] == gens[0] and record["step"] == 2
+
+
+@pytest.mark.parametrize("which", ["record", "tensors"])
+def test_9b_a_job_killed_inside_a_save_resumes_from_the_previous_generation(tmp_path, monkeypatch, which):
+    kw = dict(KW, save_every=1)
+    whole = T.train_members(MB.T2, (5, None), BED, 1, str(tmp_path / "whole"), steps=4, **kw)
+    _kill_once(monkeypatch, which, 3)                                      # inside the save of step 3
+    with pytest.raises(OSError):
+        T.train_members(MB.T2, (5, None), BED, 1, str(tmp_path / "killed"), steps=4, **kw)
+    monkeypatch.undo()
+    rest = T.train_members(MB.T2, (5, None), BED, 1, str(tmp_path / "killed"), steps=4, **kw)
+    assert rest["finished"] and _same_state(whole, rest), which
+    assert _generations(tmp_path / "killed") == ["stack_checkpoint_4.safetensors"]
+
+
+def test_9c_a_record_naming_a_missing_file_is_a_clear_error(tmp_path):
+    folder = tmp_path / "m"
+    T.train_members(MB.T2, (5,), BED, 1, str(folder), steps=3, until=2, **KW)
+    for f in _generations(folder):
+        os.remove(folder / f)
+    with pytest.raises(FileNotFoundError, match="stack_checkpoint_2.safetensors"):
+        T.train_members(MB.T2, (5,), BED, 1, str(folder), steps=3, **KW)

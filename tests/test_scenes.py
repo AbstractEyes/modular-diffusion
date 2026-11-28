@@ -433,3 +433,19 @@ def test_render_drawn_refuses_numbers_that_do_not_fit():
         scenes.render_drawn(cells, colors, p, "G")
     with pytest.raises(ValueError):
         scenes.render_drawn(cells, colors, p, "F", parts=[2, 1])
+
+
+@pytest.mark.parametrize("bed", scenes.BEDS)
+def test_render_drawn_of_a_cpu_layout_with_a_device_given_is_the_reference_render(bed):
+    """The layout on the CPU, the device named (here the CPU: the card's path is not run by this test)."""
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    for i, (kind, kw) in enumerate(_LAYOUTS):
+        cells, colors = scenes.draw_layouts(kind, 29, _gen(1300 + i), **kw)
+        want = _reference_render(cells, colors, bed, _gen(1350 + i), device=device)
+        p = scenes.draw_parameters(29, _gen(1350 + i), bed)
+        got = scenes.render_drawn(cells, colors, p, bed, device=device)
+        assert got[0].device.type == device.type
+        _same_render(got, want)
+        moved = scenes.render_drawn(cells.to(device), colors.to(device), {k: v.to(device) for k, v in p.items()},
+                                    bed, device=device)
+        _same_render(moved, want)

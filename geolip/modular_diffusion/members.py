@@ -1060,7 +1060,7 @@ def pair_group_scores(q: Tensor, k: Tensor, query_index: int, key_indices: Seque
 
 @torch.no_grad()
 def find_read(engine: MemberEngine, variant: Variant, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor,
-              points: Tensor, scene: int, cell: int, ask_a: int, ask_b: int, block: int,
+              points: Tensor, scene: int, cell: int, ask_a: int, ask_b: int, block: Optional[int],
               told: Optional[Tensor] = None, visible: Optional[Tensor] = None,
               addresses: Optional[Mapping[int, Sequence[int]]] = None, vary: str = "query") -> dict:
     """FIND at one attention site (see the module's text). ``cell`` holds the pointing request (for ``vary`` "query"
@@ -1077,7 +1077,9 @@ def find_read(engine: MemberEngine, variant: Variant, z: Tensor, t: Tensor, cell
 
     Returns the groups' names, the candidate slots, scores_a and scores_b [heads, 2, 8], weights_a and weights_b
     [heads, 2] (the softmax weight of the pointing slot's query on each candidate), answer_a and answer_b [16, 48] (the
-    raw answers on the cell's tokens) and inputs_a, inputs_b (the two runs' ``forward_tokens`` inputs)."""
+    raw answers on the cell's tokens) and inputs_a, inputs_b (the two runs' ``forward_tokens`` inputs). ``block=None``
+    reads EVERY block from the same two forwards: by_block {block: scores_a, scores_b, weights_a, weights_b} in place
+    of the four (the numbers of a call per block)."""
     if vary not in ("query", "content"):
         raise ValueError("vary is 'query' or 'content'")
     if engine.variant != variant:
@@ -1109,34 +1111,44 @@ def find_read(engine: MemberEngine, variant: Variant, z: Tensor, t: Tensor, cell
             prep_b["told_angles"] = (prep_b0["told_angles"][0], prep_a["told_angles"][1])
     else:
         prep_b = dict(prep_a, content=prep_b0["content"])
-    attn = engine.blocks[int(block)].attn
+    blocks = list(range(len(engine.blocks))) if block is None else [int(block)]
 
-    def run(prep: dict) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
-        captured = {}
-
-        def hook(module, args):
-            captured["x"], captured["mask"] = args[0].detach(), (args[2] if len(args) > 2 else None)
-
-        handle = attn.register_forward_pre_hook(hook)
+    def run(prep: dict) -> Tuple[Tensor, Dict[int, Tuple[Tensor, Optional[Tensor]]]]:
+        captured: Dict[int, Tuple[Tensor, Optional[Tensor]]] = {}
+        handles = []
+        for b_ in blocks:
+            def hook(module, args, b_=b_):
+                captured[b_] = (args[0].detach(), (args[2] if len(args) > 2 else None))
+            handles.append(engine.blocks[b_].attn.register_forward_pre_hook(hook))
         try:
             out = engine.forward_tokens(z[s], t[s], **prep)
         finally:
-            handle.remove()
-        return out, captured["x"], captured["mask"]
+            for h in handles:
+                h.remove()
+        return out, captured
 
-    out_a, x_a, km = run(prep_a)
-    out_b, x_b, _ = run(prep_b)
-    if vary == "query":
-        x_b = x_a                                       # one captured input; only the query angles differ
+    out_a, cap_a = run(prep_a)
+    out_b, cap_b = run(prep_b)
     result = {"groups": GROUPS, "candidates": (slot_a, slot_b), "vary": vary, "inputs_a": prep_a, "inputs_b": prep_b}
-    for tag, prep, x in (("a", prep_a, x_a), ("b", prep_b, x_b)):
-        n = x.shape[1]
-        qkv = attn.qkv(x).view(1, n, 3, attn.num_heads, attn.head_dim).permute(2, 0, 3, 1, 4)
-        rot = block_rotary(prep, block)
-        q, kk = rot(qkv[0], qkv[1])
-        result["scores_" + tag] = pair_group_scores(q, kk, int(cell), (slot_a, slot_b))[0]
-        wts = M.attention_weights(attn, x, rot, km)                             # [1, H, N, N]
-        result["weights_" + tag] = wts[0, :, int(cell)][:, [slot_a, slot_b]]
+    by_block = {}
+    for b_ in blocks:
+        attn = engine.blocks[b_].attn
+        x_a, km = cap_a[b_]
+        x_b = x_a if vary == "query" else cap_b[b_][0]   # "query": one captured input; only the query angles differ
+        r_b = {}
+        for tag, prep, x in (("a", prep_a, x_a), ("b", prep_b, x_b)):
+            n = x.shape[1]
+            qkv = attn.qkv(x).view(1, n, 3, attn.num_heads, attn.head_dim).permute(2, 0, 3, 1, 4)
+            rot = block_rotary(prep, b_)
+            q, kk = rot(qkv[0], qkv[1])
+            r_b["scores_" + tag] = pair_group_scores(q, kk, int(cell), (slot_a, slot_b))[0]
+            wts = M.attention_weights(attn, x, rot, km)                         # [1, H, N, N]
+            r_b["weights_" + tag] = wts[0, :, int(cell)][:, [slot_a, slot_b]]
+        by_block[b_] = r_b
+    if block is None:
+        result["by_block"] = by_block
+    else:
+        result.update(by_block[int(block)])
     toks = _tokens_of(cell, dev)
     result["answer_a"] = patchify(out_a, PATCH)[0, toks]
     result["answer_b"] = patchify(out_b, PATCH)[0, toks]
@@ -1195,7 +1207,9 @@ def _looks(col: MemberCollective, cls: int, z: Tensor, t: Tensor, c: Tensor, k: 
 def address_swap(col: MemberCollective, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor, points: Tensor,
                  scene: int, cell: int, new_class: int, turn: bool = True, gate: str = "aleph") -> dict:
     """The swap of one request's thing (see the module's text); ``turn=False`` runs the engines unturned, ``gate=
-    "neutral"`` returns the raw answers on the cell in place of the gate's numbers and the contributions. A scene in
+    "neutral"`` returns the raw answers on the cell in place of the gate's numbers and the contributions: the old and
+    the new class's engines run on the edited cell before and after (the inputs of ``_looks``, whether or not their
+    class stands in the scene), every other member as the collective's parts answer. A scene in
     which a pointer asks the old or the new class is refused with a ValueError before any forward (the swap would leave
     that pointer asking a class that stands no longer, or twice, or its own)."""
     if gate not in ("aleph", "neutral"):
@@ -1223,7 +1237,15 @@ def address_swap(col: MemberCollective, z: Tensor, t: Tensor, cells: Tensor, col
               "looks_new": _looks(col, int(new_class), z[s], t[s], cc, k, p, cell, unturned)}
         answers, base_answer = col.part_answers(z[s], t[s], cc, k, p, unturned)
         if gate == "neutral":
-            st["answers"] = answers[:, 0, toks]
+            raw = answers[:, 0, toks].clone()
+            # the old and the new class's engines on the edited cell on BOTH sides, whether or not their class stands
+            # there (the inputs of ``_looks``): a part not run would read as zeros
+            for kc in (old, int(new_class)):
+                if kc in col.things:
+                    prep = col.engine_inputs(kc, cc, k, p, unturned, cell=torch.tensor([int(cell)], device=dev))
+                    raw[col.classes.index(kc)] = patchify(col.things[kc].forward_tokens(z[s], t[s], **prep),
+                                                          PATCH)[0, toks]
+            st["answers"] = raw
             st["base_answer"] = base_answer[0, toks]
         else:
             g = col.gate_parts(cc)

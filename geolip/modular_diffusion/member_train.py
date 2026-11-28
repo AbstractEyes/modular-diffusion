@@ -42,16 +42,23 @@ engine g is the masked loss of ``collective.masked_loss`` (per row the sum over 
 over 48 x the mask's token count, then the mean over rows; the mask's counts checked above zero from the CPU layout: a
 thing's class stands in the row, the base has a free cell); the step's loss is the SUM over g, so each engine's gradient is its own. ONE ``torch.optim.Adam`` over the
 stacked leaves (betas 0.9 / 0.999, eps 1e-8, no weight decay, no clipping) at lr min(1, (s + 1) / warmup) x lr; Adam acts
-element by element, so a stacked engine's update is the one it would get alone. The averaged weights "g8", element by
+element by element, so a stacked engine's update is the one it would get alone. THE GROUPS (``group``, default 1):
+the rows are built once for the stack; after ``zero_grad`` the forward and backward run on each run of ``group``
+consecutive engines (a slice of the state and of the rows, its summed loss backward into the stacked leaves), then
+ONE Adam step; ``group`` = the number of engines is the single stacked pass, bit for bit. With group 1 an engine's
+arithmetic does not depend on the other engines: a stacked engine's training is EXACTLY its solo run (torch.equal
+on the CPU for kinds T1, T2 and T2K, both beds, both noises; ``tests/test_member_train.py``). The averaged weights "g8", element by
 element: after step k, avg <- d_k avg + (1 - d_k) w, d_k = (1 + k) / (k + 10). Nothing in a step reads a number back
-from the card, except the losses at the curve's steps and at the snapshots, and for the told "own" variant the stored
-rows' small layout tensors (``collective.kind_batch`` builds them on the bed's device; ``member_batch`` copies them).
+from the card, and ``train_members`` waits for the card only at its read points: the curve's steps (the losses and the
+own reads), the snapshots, the saves and the last step run. THE SECONDS A STEP it records are the wall time between
+two read points (the reads and saves themselves left out) divided by the number of steps between them, one such value
+for each of those steps; ``time_stack`` waits for the card after every step (and after every phase when asked).
 
 THE OWN READ of engine g: ``heldout`` rows of its own batch law with their noise and t, drawn once from a CPU generator
 seeded ``collective.OWN_READ_SEED`` in chunks of 256 (each chunk's rows, then noise, then t, as
 ``collective.own_read_set``; rendered on the training bed's device, where the pictures, noise and targets stay), read
-with the averaged weights through the stack (one stacked forward a chunk, the inputs prepared from the CPU layouts at
-the read): the newborn read first, then every ``every`` steps and at the end. The curve of
+with the averaged weights through the stack (one stacked forward a chunk; the inputs prepared from the CPU layouts
+once, when the sets are built, and every chunk stacked and kept on the device, ``own_read_chunks``): the newborn read first, then every ``every`` steps and at the end. The curve of
 engine g: [{"step", "loss" (its own loss at that step), "own_read"}].
 
 SNAPSHOTS: at each step k of ``snapshots`` (increasing, below ``steps``; (1500, 3000) by default when steps is 6000),
@@ -59,13 +66,19 @@ every engine's folder is written with k as its steps (in its folder name and car
 read of step k. The learning rate after warm-up does not depend on the run's length and a step's rows depend only on
 (seed, step), so a snapshot at step k is the result of a run of k steps.
 
-FILES: engine g in ``<out>/<member_tag(...)>/``: engine.safetensors, engine_avg.safetensors, engine.json (through
-``members.save_member``; the card: bed, steps, seed, p_point, exclude, held_pairs) and train.json (the settings, the
-curve, newborn_read, last_read, descended, trained numbers, seconds a step of the stack and of an engine, device, torch
-version). The stack: ``<out>/stack_checkpoint.safetensors`` and ``stack_checkpoint.json`` every ``save_every`` steps
-and at the last step run (parameters, averages, the optimizer's state, the curves, the step); a job started again on
-the same folder continues from it, bit for bit on the CPU; ``<out>/stack_train.json`` marks a finished stack, which is
-read back.
+FILES: engine g in ``<out>/<member_tag(...)>/``, in this order: engine.safetensors, engine_avg.safetensors, engine.json
+(through ``members.save_member``; the card: bed, steps, seed, p_point, exclude, held_pairs, noise), then train.json
+LAST (written to train.json.part and renamed; the settings, the curve, newborn_read, last_read, descended, trained
+numbers, seconds a step of the stack and of an engine, device, torch version): a folder counts as a finished engine
+only when its train.json is there. Snapshots are written the same way. THE STACK'S CHECKPOINT, every ``save_every``
+steps and at the last step run, one GENERATION a save: the tensors (parameters, averages, the optimizer's state) to
+``stack_checkpoint_<step>.safetensors`` (written to a ``.part`` name, then renamed), THEN the record
+``stack_checkpoint.json`` (the settings, the step, the name of that tensor file, the curves; to ``.part``, renamed
+LAST), then the older generations' tensor files are removed. A job killed anywhere in a save leaves the previous record
+naming the previous, whole file. A job started again on the same folder loads the file its record names (a record
+naming a missing file is an error) and continues, bit for bit on the CPU. The settings are compared as JSON reads them
+back. ``<out>/stack_train.json`` (written after every engine's folder, renamed into place) marks a finished stack,
+which is read back.
 """
 from __future__ import annotations
 
@@ -94,7 +107,13 @@ BETAS = (0.9, 0.999)
 EPS = 1e-8
 LN_EPS = 1e-6
 READ_CHUNK = 256
-STACK_FILES = ("stack_checkpoint.safetensors", "stack_checkpoint.json")
+STACK_FILES = ("stack_checkpoint_<step>.safetensors", "stack_checkpoint.json")
+_GENERATION = re.compile(r"stack_checkpoint(_\d+)?\.safetensors(\.part)?")
+
+
+def checkpoint_name(step: int) -> str:
+    """The tensor file of the stack's checkpoint generation of ``step``."""
+    return f"stack_checkpoint_{int(step)}.safetensors"
 STACK_DONE = "stack_train.json"
 NOISES = ("stream", "device")
 NOISE_SEED_OFFSET = 1 << 40           # the step offset of the noise generator of noise "device"
@@ -132,11 +151,12 @@ def _ln(x: Tensor) -> Tensor:
     return F.layer_norm(x, (x.shape[-1],), eps=LN_EPS)
 
 
-def _sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Tensor) -> Tensor:
-    """Attention on [G, B, heads, N, hd] with a bool mask [G, B, 1, N, L]: one call on the G x B rows."""
+def _sdpa(q: Tensor, k: Tensor, v: Tensor, mask: Optional[Tensor]) -> Tensor:
+    """Attention on [G, B, heads, N, hd] with a bool mask [G, B, 1, N, L] (None: every key): one call on the G x B
+    rows."""
     g, b = q.shape[:2]
     y = F.scaled_dot_product_attention(q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1),
-                                       attn_mask=mask.flatten(0, 1))
+                                       attn_mask=None if mask is None else mask.flatten(0, 1))
     return y.view(g, b, *y.shape[1:])
 
 
@@ -156,7 +176,6 @@ def stacked_forward(state: Dict[str, Tensor], heads: int, z: Tensor, t: Tensor, 
     e = _lin(F.silu(_lin(torch.cat([torch.sin(arg), torch.cos(arg)], dim=-1), state, "time.mlp.0")), state,
              "time.mlp.2")                                                             # [G, B, d]
     ctx = _lin(torch.zeros(g, b, 1, state["ctx_in.weight"].shape[-1], device=z.device, dtype=z.dtype), state, "ctx_in")
-    ctx_mask = torch.ones(g, b, 1, 1, 1, dtype=torch.bool, device=z.device)
     eye = torch.eye(n, dtype=torch.bool, device=z.device)
     allowed = key_mask.to(device=z.device, dtype=torch.bool)[:, :, None, None, :] | eye
     rot = angle_rotary(query_angles, key_angles)
@@ -172,7 +191,7 @@ def stacked_forward(state: Dict[str, Tensor], heads: int, z: Tensor, t: Tensor, 
         y = _ln(h) * (1 + ds2) + dh2
         cq = _lin(y, state, p + "cross.q").view(g, b, n, heads, hd).transpose(2, 3)
         kv = _lin(ctx, state, p + "cross.kv").view(g, b, 1, 2, heads, hd).permute(3, 0, 1, 4, 2, 5)
-        catt = _sdpa(cq, kv[0], kv[1], ctx_mask).transpose(2, 3).reshape(g, b, n, d)
+        catt = _sdpa(cq, kv[0], kv[1], None).transpose(2, 3).reshape(g, b, n, d)     # one valid context token
         h = h + _lin(catt, state, p + "cross.out")
         y = _ln(h) * (1 + ds3) + dh3
         h = h + _lin(F.gelu(_lin(y, state, p + "mlp.0"), approximate="tanh"), state, p + "mlp.2")
@@ -361,6 +380,26 @@ def masked_loss_unchecked(v: Tensor, target: Tensor, loss_mask: Tensor) -> Tenso
     return per.mean()
 
 
+def check_group(group, engines: int) -> int:
+    """``group`` as an int, or a ValueError unless 1 <= group <= the number of engines."""
+    g = int(group)
+    if not 1 <= g <= int(engines):
+        raise ValueError(f"group is 1 .. {int(engines)} (the engines of the stack), not {group}")
+    return g
+
+
+def slice_rows(sb: dict, a: int, b: int) -> dict:
+    """The stacked rows of engines a .. b - 1 (views); when the query and key angles are one tensor, one view for
+    both."""
+    inp = sb["inputs"]
+    ka = inp["key_angles"][a:b]
+    qa = ka if inp["query_angles"] is inp["key_angles"] else inp["query_angles"][a:b]
+    told = None if inp["told_angles"] is None else tuple(x[a:b] for x in inp["told_angles"])
+    return {"z": sb["z"][a:b], "t": sb["t"][a:b], "target": sb["target"][a:b], "loss_mask": sb["loss_mask"][a:b],
+            "inputs": {"content": inp["content"][a:b], "query_angles": qa, "key_angles": ka,
+                       "key_mask": inp["key_mask"][a:b], "told_angles": told}}
+
+
 def stack_losses(state: Dict[str, Tensor], heads: int, sb: dict) -> List[Tensor]:
     v = stacked_forward(state, heads, sb["z"], sb["t"], **sb["inputs"])
     return [masked_loss_unchecked(v[g], sb["target"][g], sb["loss_mask"][g]) for g in range(v.shape[0])]
@@ -383,25 +422,35 @@ def own_read_sets(variant: Variant, classes, bed: ScenesBed, n: int, p_point: fl
             chunks.append({"batch": {k2: b[k2] for k2 in ("cells_cpu", "colors_cpu", "points_cpu", "told_cpu",
                                                            "visible_cpu")},
                            "z": z, "t": t, "target": target, "loss_mask": b["loss_mask"],
-                           "loss_ok": _loss_ok(variant, cls, b)})
+                           "loss_ok": _loss_ok(variant, cls, b), "prep": _prepare_cpu(variant, b)})
         out.append(chunks)
     return out
 
 
+def own_read_chunks(sets: list, device) -> List[dict]:
+    """The held-out chunks of every engine stacked on G and moved to ``device`` once (``stack_rows`` of each chunk's
+    rows and the inputs prepared when the sets were built); when every engine's query and key angles are one tensor,
+    the stack holds one tensor for both (the same numbers, half the memory)."""
+    out = []
+    for c in range(len(sets[0])):
+        parts = [s[c] for s in sets]
+        sb = stack_rows(parts, device)
+        if all(p["prep"]["query_angles"] is p["prep"]["key_angles"] for p in parts):
+            sb["inputs"]["query_angles"] = sb["inputs"]["key_angles"]
+        sb["rows"] = int(parts[0]["z"].shape[0])
+        out.append(sb)
+    return out
+
+
 @torch.no_grad()
-def stack_own_read(state: Dict[str, Tensor], heads: int, variant: Variant, sets: list, device) -> List[float]:
-    """The masked loss of each engine on its held-out set (the mean over its rows), one stacked forward a chunk."""
+def stack_own_read(state: Dict[str, Tensor], heads: int, variant: Variant, sets: list, device,
+                   chunks: Optional[List[dict]] = None) -> List[float]:
+    """The masked loss of each engine on its held-out set (the mean over its rows), one stacked forward a chunk;
+    ``chunks``: ``own_read_chunks(sets, device)`` built once (built here when not given)."""
     totals = [0.0] * len(sets)
     rows = 0
-    for c in range(len(sets[0])):
-        parts = []
-        for s in sets:
-            ch = s[c]
-            b = ch["batch"]
-            parts.append({"z": ch["z"], "t": ch["t"], "target": ch["target"], "loss_mask": ch["loss_mask"],
-                          "loss_ok": ch["loss_ok"], "prep": _prepare_cpu(variant, b)})
-        sb = stack_rows(parts, device)
-        m = parts[0]["z"].shape[0]
+    for sb in (own_read_chunks(sets, device) if chunks is None else chunks):
+        m = sb["rows"]
         for g, loss in enumerate(stack_losses(state, heads, sb)):
             totals[g] += float(loss) * m
         rows += m
@@ -437,11 +486,14 @@ def _write_engine(folder: str, variant: Variant, cls, seed: int, state: Dict[str
 def _step(variant: Variant, classes, bed: ScenesBed, seed: int, s: int, batch: int, p_point: float, exclude,
           held, state: Dict[str, Tensor], heads: int, opt, average: Dict[str, Tensor], device, lr: float,
           warmup: int, rows_clock: Optional[List[float]] = None, noise: str = "stream",
-          clock: Optional[dict] = None) -> List[Tensor]:
+          clock: Optional[dict] = None, group: int = 1) -> List[Tensor]:
     """One training step s of the stack (the learning rate, the rows of ``stack_step_rows``, the summed loss, Adam,
     the averages) -> the engines' losses (on the device, not read). ``rows_clock``: a list that takes the seconds spent
     building the step's rows (without ``clock``, on a card the render is queued, so this reads the time to queue it).
-    ``clock``: a dict that takes the seconds of every phase of ``PHASES``, the card waited for at the end of each."""
+    ``clock``: a dict that takes the seconds of every phase of ``PHASES``, the card waited for at the end of each
+    (the groups' forwards and backwards added up). ``group``: the forward and backward run on runs of ``group``
+    consecutive engines (a slice of the state and of the rows), each run's summed loss backward into the stacked
+    leaves, then ONE Adam step; group = the number of engines is the single stacked pass."""
     sync = clock is not None and str(device).startswith("cuda")
     for grp in opt.param_groups:
         grp["lr"] = float(lr) * min(1.0, (s + 1) / max(1, int(warmup)))
@@ -449,15 +501,25 @@ def _step(variant: Variant, classes, bed: ScenesBed, seed: int, s: int, batch: i
     sb = stack_step_rows(variant, classes, bed, seed, s, batch, p_point, exclude, held, device, noise, clock)
     if rows_clock is not None:
         rows_clock.append(time.perf_counter() - r0)
-    a = time.perf_counter()
-    losses = stack_losses(state, heads, sb)
-    loss = losses[0]
-    for x in losses[1:]:
-        loss = loss + x
-    a = _tick(clock, "forward", a, sync)
+    g_count = len(classes)
+    group = check_group(group, g_count)
     opt.zero_grad(set_to_none=True)
-    loss.backward()
-    a = _tick(clock, "backward", a, sync)
+    losses: List[Tensor] = []
+    for a0 in range(0, g_count, group):
+        b0 = min(g_count, a0 + group)
+        a = time.perf_counter()
+        if a0 == 0 and b0 == g_count:                        # the whole stack: one pass, nothing sliced
+            part = stack_losses(state, heads, sb)
+        else:
+            part = stack_losses({k: v[a0:b0] for k, v in state.items()}, heads, slice_rows(sb, a0, b0))
+        loss = part[0]
+        for x in part[1:]:
+            loss = loss + x
+        a = _tick(clock, "forward", a, sync)
+        loss.backward()                                      # the gradients accumulate in the stacked leaves
+        _tick(clock, "backward", a, sync)
+        losses += part
+    a = time.perf_counter()
     opt.step()
     dk = (1 + s) / (s + 8 + 2)
     with torch.no_grad():
@@ -470,7 +532,8 @@ def _step(variant: Variant, classes, bed: ScenesBed, seed: int, s: int, batch: i
 def time_stack(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBed, seed: int = 0, *,
                batch: int = 128, steps: int = 6, from_step: int = 2, p_point: float = 0.5,
                exclude: Optional[int] = None, held_pairs=(), dim: int = 128, heads: int = 2, depth: int = 3,
-               lr: float = 1e-3, warmup: int = 100, noise: str = "stream", phases: bool = False) -> dict:
+               lr: float = 1e-3, warmup: int = 100, noise: str = "stream", phases: bool = False,
+               group: int = 1) -> dict:
     """The seconds a training step of a stack of these engines on ``bed``'s device (the steps of ``train_members``,
     nothing written, no reads): the stamps of every step (the card synchronized at each), the median over the steps
     from ``from_step`` on, and that median divided by the number of engines. ``phases``: also "phases", the median
@@ -479,6 +542,7 @@ def time_stack(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBe
     if noise not in NOISES:
         raise ValueError(f"noise is one of {NOISES}, not {noise!r}")
     classes = [None if c is None else int(c) for c in classes]
+    group = check_group(group, len(classes))
     device = bed.device
     held = sorted((int(a), int(q)) for a, q in held_pairs)
     engines = [members.born(variant, c, seed, dim, heads, depth) for c in classes]
@@ -493,7 +557,7 @@ def time_stack(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBe
         clock = {} if phases else None
         s0 = time.perf_counter()
         _step(variant, classes, bed, seed, s, int(batch), p_point, exclude, held, state, heads, opt, average,
-              device, lr, warmup, rows_clock, noise, clock)
+              device, lr, warmup, rows_clock, noise, clock, group)
         if is_cuda:
             torch.cuda.synchronize()
         stamps.append(time.perf_counter() - s0)
@@ -503,7 +567,7 @@ def time_stack(variant: Variant, classes: Sequence[Optional[int]], bed: ScenesBe
     out = {"engines": len(classes), "batch": int(batch), "steps": int(steps), "from_step": int(from_step),
            "stamps": stamps, "seconds_a_step_stack": med, "seconds_rows": _median(rows_clock[int(from_step):]),
            "seconds_a_step_engine": None if med is None else med / len(classes), "device": str(device),
-           "noise": noise}
+           "noise": noise, "group": group}
     if phases:
         out["phases"] = {k: _median(c.get(k, 0.0) for c in clocks[int(from_step):]) for k in PHASES}
     return out
@@ -513,15 +577,17 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
                   steps: int = 3000, batch: int = 128, lr: float = 1e-3, warmup: int = 100, every: int = 250,
                   heldout: int = 2048, save_every: int = 500, p_point: float = 0.5, exclude: Optional[int] = None,
                   held_pairs=(), dim: int = 128, heads: int = 2, depth: int = 3, until: Optional[int] = None,
-                  snapshots: Optional[Sequence[int]] = None, noise: str = "stream",
+                  snapshots: Optional[Sequence[int]] = None, noise: str = "stream", group: int = 1,
                   log: Callable[[str], None] = print) -> dict:
     """Train the engines of ``classes`` (0..8 and/or None for the base) as one stack (see the module's text) into
     ``out`` -> {"settings", "step", "finished", "engines": [{"cls", "tag", "curve", "newborn_read", "last_read",
     "descended"}], "seconds_a_step_stack", "seconds_a_step_engine", "state", "average"}. ``noise``: where a step's
-    noise and t are drawn (``stack_step_rows``); it is part of the settings and of the engines' names."""
+    noise and t are drawn (``stack_step_rows``); it is part of the settings and of the engines' names. ``group``: the
+    engines run forward and backward ``group`` at a time (``_step``); part of the settings, not of the names."""
     if noise not in NOISES:
         raise ValueError(f"noise is one of {NOISES}, not {noise!r}")
     classes = [None if c is None else int(c) for c in classes]
+    group = check_group(group, len(classes))
     if len(set(classes)) != len(classes) or not classes:
         raise ValueError("a stack holds one engine a class (and at most one base)")
     steps, batch = int(steps), int(batch)
@@ -534,12 +600,15 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
     held = sorted((int(a), int(q)) for a, q in held_pairs)
     device = bed.device
     G = len(classes)
-    settings = {"variant": variant.settings(), "classes": classes, "bed": bed.bed, "seed": int(seed), "steps": steps,
-                "batch": batch, "lr": float(lr), "warmup": int(warmup), "every": int(every), "heldout": int(heldout),
-                "save_every": int(save_every), "p_point": float(p_point), "exclude": exclude, "held_pairs": held,
-                "dim": int(dim), "heads": int(heads), "depth": int(depth), "snapshots": list(snapshots),
-                "average": "g8", "optimizer": "Adam", "betas": list(BETAS), "eps": EPS, "weight_decay": 0.0,
-                "clip": None, "stack": "written-out stacked forward", "noise": noise}
+    held_lists = [[a, q] for a, q in held]
+    # the settings as JSON reads them back (lists, never tuples), so that a restart compares like with like
+    settings = json.loads(json.dumps({
+        "variant": variant.settings(), "classes": classes, "bed": bed.bed, "seed": int(seed), "steps": steps,
+        "batch": batch, "lr": float(lr), "warmup": int(warmup), "every": int(every), "heldout": int(heldout),
+        "save_every": int(save_every), "p_point": float(p_point), "exclude": exclude, "held_pairs": held_lists,
+        "dim": int(dim), "heads": int(heads), "depth": int(depth), "snapshots": list(snapshots), "average": "g8",
+        "optimizer": "Adam", "betas": list(BETAS), "eps": EPS, "weight_decay": 0.0, "clip": None,
+        "stack": "written-out stacked forward", "noise": noise, "group": group}))
     tags = [member_tag(variant, c, bed, seed, steps, dim, heads, depth, exclude, held, noise) for c in classes]
     os.makedirs(out, exist_ok=True)
     done_path = os.path.join(out, STACK_DONE)
@@ -552,7 +621,7 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
         log(f"FINISHED already: {out}")
         stored["restored"] = True
         return stored
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import load as load_bytes, save_file
     engines = [members.born(variant, c, seed, dim, heads, depth) for c in classes]
     trained = int(sum(p.numel() for p in engines[0].parameters()))
     state = {k: v.to(device).requires_grad_(True) for k, v in stack_state(engines).items()}
@@ -561,6 +630,7 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
     opt = torch.optim.Adam(params, lr=float(lr), betas=BETAS, eps=EPS, weight_decay=0.0)
     average = {k: v.detach().clone() for k, v in state.items()}
     sets = own_read_sets(variant, classes, bed, heldout, p_point, exclude, held)
+    read_chunks = own_read_chunks(sets, device)                    # prepared and moved once, kept on the device
     curves: List[List[dict]] = [[] for _ in classes]
     step_seconds: List[float] = []
     done = 0
@@ -571,7 +641,12 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
             ck = json.load(fh)
         if ck["settings"] != settings:
             raise ValueError(f"the stack checkpoint in {out} was made with other settings")
-        tensors = load_file(os.path.join(out, STACK_FILES[0]))
+        named = ck.get("tensors")
+        if not named or not os.path.isfile(os.path.join(out, named)):
+            raise FileNotFoundError(f"the stack checkpoint record in {out} names the tensor file {named!r}, which is "
+                                    "not there")
+        with open(os.path.join(out, named), "rb") as fh:         # read whole, not mapped: the file can be removed
+            tensors = load_bytes(fh.read())
         with torch.no_grad():
             for k in names:
                 state[k].copy_(tensors["param." + k].to(device))
@@ -582,7 +657,7 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
     log(f"JOB stack {variant.name} classes {classes} bed {bed.bed} seed {seed}: {steps:,} steps x batch {batch} x "
         f"{G} engines; {trained:,} trained numbers an engine; pure Adam lr {lr:g}; noise {noise}; device {device}")
     if newborn is None:
-        newborn = stack_own_read(average, heads, variant, sets, device)
+        newborn = stack_own_read(average, heads, variant, sets, device, read_chunks)
         for g in range(G):
             curves[g].append({"step": 0, "loss": None, "own_read": newborn[g]})
         log("newborn own reads " + " ".join(f"{x:.6f}" for x in newborn))
@@ -591,12 +666,16 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
         tensors, groups = _adam_tensors(opt, params)
         tensors.update({"param." + k: v.detach().cpu().contiguous() for k, v in state.items()})
         tensors.update({"avg." + k: v.detach().cpu().contiguous() for k, v in average.items()})
-        save_file(tensors, os.path.join(out, STACK_FILES[0]) + ".part")
-        os.replace(os.path.join(out, STACK_FILES[0]) + ".part", os.path.join(out, STACK_FILES[0]))
+        name = checkpoint_name(step)
+        save_file(tensors, os.path.join(out, name) + ".part")
+        os.replace(os.path.join(out, name) + ".part", os.path.join(out, name))
         with open(ck_json + ".part", "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"settings": settings, "step": step, "param_groups": groups, "curves": curves,
+            json.dump({"settings": settings, "step": step, "tensors": name, "param_groups": groups, "curves": curves,
                        "step_seconds": step_seconds, "newborn_reads": newborn, "names": names}, fh)
-        os.replace(ck_json + ".part", ck_json)
+        os.replace(ck_json + ".part", ck_json)                         # the record last: it names a whole file
+        for f in os.listdir(out):
+            if f != name and _GENERATION.fullmatch(f):
+                os.remove(os.path.join(out, f))
 
     def write_engines(at: int, reads: List[float], curve_upto: List[List[dict]]) -> List[dict]:
         rows = []
@@ -609,7 +688,7 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
                     "seconds_a_step_engine": None if per_stack is None else per_stack / G,
                     "step_seconds_count": len(step_seconds), "device": str(device), "torch": torch.__version__}
             card = {"bed": bed.bed, "steps": int(at), "seed": int(seed), "p_point": float(p_point), "exclude": exclude,
-                    "held_pairs": held, "noise": noise}
+                    "held_pairs": held_lists, "noise": noise}
             _write_engine(os.path.join(out, tag), variant, cls, seed, state, average, g, dim, heads, depth, card, info)
             rows.append({"cls": cls, "tag": tag, "curve": curve_upto[g], "newborn_read": newborn[g],
                          "last_read": reads[g], "descended": bool(reads[g] < newborn[g])})
@@ -618,18 +697,23 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
     stop = steps if until is None else min(int(until), steps)
     is_cuda = str(device).startswith("cuda")
     t0 = time.time()
+    mark, since = time.perf_counter(), done
     for s in range(done, stop):
-        s0 = time.perf_counter()
         losses = _step(variant, classes, bed, seed, s, batch, p_point, exclude, held, state, heads, opt, average,
-                       device, lr, warmup, noise=noise)
+                       device, lr, warmup, noise=noise, group=group)
         n = s + 1
         read_now = (every and (n % int(every) == 0 or n == steps)) or n in snapshots
-        if is_cuda and not read_now:
+        save_now = bool(save_every) and n % int(save_every) == 0 and n != stop
+        if not (read_now or save_now or n == stop):
+            continue                                                 # no wait for the card between the read points
+        if is_cuda:
             torch.cuda.synchronize()
+        per_step = (time.perf_counter() - mark) / (n - since)
+        step_seconds.extend([per_step] * (n - since))
+        since = n
         loss_v = [float(x.detach()) for x in losses] if read_now else None
-        step_seconds.append(time.perf_counter() - s0)
         if read_now:
-            reads = stack_own_read(average, heads, variant, sets, device)
+            reads = stack_own_read(average, heads, variant, sets, device, read_chunks)
             for g in range(G):
                 curves[g].append({"step": n, "loss": loss_v[g], "own_read": reads[g]})
             spent = time.time() - t0
@@ -639,13 +723,14 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
             if n in snapshots:
                 write_engines(n, reads, [[c for c in cv if c["step"] <= n] for cv in curves])
                 log(f"SNAPSHOT at step {n:,}")
-        if save_every and n % int(save_every) == 0 and n != stop:
+        if save_now:
             checkpoint(n)
+        mark = time.perf_counter()                                   # the reads and saves are not step time
     checkpoint(stop)
     result = {"settings": settings, "step": stop, "finished": stop >= steps}
     if stop >= steps:
         last = curves[0][-1]["step"] == steps
-        reads = [cv[-1]["own_read"] for cv in curves] if last else stack_own_read(average, heads, variant, sets, device)
+        reads = [cv[-1]["own_read"] for cv in curves] if last else stack_own_read(average, heads, variant, sets, device, read_chunks)
         rows = write_engines(steps, reads, curves)
         per_stack = _median(step_seconds)
         result.update({"engines": rows, "trained": trained, "seconds_a_step_stack": per_stack,

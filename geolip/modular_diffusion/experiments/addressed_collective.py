@@ -9,7 +9,11 @@ address pairs inside attention, served by the amplitude gate over the same addre
 | parts    | ``member_train.train_members`` for the engines of ``kind`` and ``classes`` ("0-8,base" or any subset), |
 |          | ``bed``, ``seed``, ``steps``, ``exclude`` (a class, or empty), ``held`` ("" or "plus4": class g never  |
 |          | asks class (g + 4) mod 9), ``p_point``, ``snapshots``, ``noise`` ("stream" or "device": where a step's |
-|          | noise and t are drawn, ``member_train.stack_step_rows``), into ``out``                                 |
+|          | noise and t are drawn, ``member_train.stack_step_rows``), into ``out``; ``until`` (0 = none): stop     |
+|          | after that step, keeping the stack checkpoint; the same job started again without it resumes; ``group``|
+|          | (default 1): the engines run forward and backward that many at a time (``member_train._step``)         |
+| same     | ``same_engines`` of the two job folders of ``parts`` ("<a>,<b>"): whether they hold the same engines   |
+|          | bit for bit (every engine's weights and averaged weights); the report goes to ``out``                  |
 | timing   | the seconds a step of a stack of G engines for each G of ``stacks``, ``steps`` each with the first     |
 |          | ``from_step`` dropped, on the job's device, with ``noise``; with ``phases=1`` also the median seconds  |
 |          | of each phase of a step (a table in result.md); nothing is kept but the result                         |
@@ -21,7 +25,8 @@ address pairs inside attention, served by the amplitude gate over the same addre
 |          | ``only_held=True``; start noise seeded 7500 + n and 7600 + n; n of ``pointer_ns``): on the requests    |
 |          | that state their color, thing right and color right; on the pointing request, its thing right and its |
 |          | color right (the judged color of its cell is the asked request's); beside it THE TWO ADDRESS-BLIND     |
-|          | REFERENCES of the very lists used; a sheet                                                             |
+|          | REFERENCES of the very lists used, and the pointing request's reads BY k (the eligible requests of its |
+|          | list, ``pointing_by_k``, with 1 / k beside them); a sheet                                              |
 | address  | the address reads at the noise levels 0 and ``ts`` (FIND, SERVE, the two together with their two       |
 |          | controls, a missing and an unheld address, the tolerance control)                                       |
 | exchange | ``members.exchange_read`` between the collective and the same collective with the engine of            |
@@ -112,13 +117,13 @@ from .toy_collective import (exchange_exact, index_engines, judge_folders, judge
                              picture_reads, real_pixels, weights_sha256, write_sheet)
 
 EXPERIMENT = "addressed_collective"
-VARIANTS = ("parts", "timing", "compose", "address", "exchange")
+VARIANTS = ("parts", "timing", "compose", "address", "exchange", "same")
 DEFAULTS = dict(variant="parts", kind="T2", classes="0-8,base", bed="F", seed=0, steps=3000, dim=128, heads=2,
                 depth=3, batch=128, lr=1e-3, warmup=100, every=250, heldout=2048, save_every=500, p_point=0.5,
                 exclude="", held="", snapshots="", stacks="1,5,10", from_step=2, parts="", judge="", part_steps=3000,
                 ns="1,2,3,4,6,9", pointer_ns="3,4,6,9", count=500, chunk=128, sample_steps=50, sheet=1,
                 ts="0.1,0.3", k=64, twin_seed=1, swap_class=-1, exact_lists=64, device="cpu", det="on", threads=4,
-                noise="stream", phases=1, out="")
+                noise="stream", phases=1, until=0, group=1, out="")
 LIST_SEED, NOISE_SEED = 5000, 7000
 POINTER_SEED, POINTER_NOISE, POINTER_NOISE_HELD = 6000, 7500, 7600
 FIND_SEED, SCENE_SEED, TOLERANCE_SEED = 30000, 31000, 31500
@@ -231,20 +236,42 @@ def blind_reference(cells: torch.Tensor, colors: torch.Tensor, points: torch.Ten
     return {"mean": sum(vals) / len(vals) if vals else None, "lists": len(vals)}
 
 
-def pointing_reads(judge, pixels: torch.Tensor, cells, colors, points) -> dict:
-    """The judge's reads of pictures of lists that point: on the stating requests, thing right and color right; on the
-    pointing request, thing right, color right (the asked color) and both."""
+def pointing_reads(judge, pixels: torch.Tensor, cells, colors, points, eligible=None) -> dict:
+    """The judge's reads of pictures of lists that point (``pointing_reads_of`` of the judge's predictions)."""
     pt, pc = SJ.predict(judge, S.to_model(pixels))
-    s = SR.score_cells(pt, pc, cells.to(pt.device), colors.to(pt.device))
-    points = points.to(pt.device)
+    return pointing_reads_of(pt, pc, cells, colors, points, eligible)
+
+
+def pointing_reads_of(pred_things, pred_colors, cells, colors, points, eligible=None) -> dict:
+    """Reads of a judge's predictions ([L, 9] things and colors) on lists that point: on the stating requests, thing
+    right and color right; on the pointing request, thing right, color right (the asked color) and both. With
+    ``eligible`` ([L] long, ``PointerLists.eligible``): also "pointing_by_k", the pointing request's three reads on the
+    lists of each k that occurs among the pointed lists ({str(k): {"lists", "pointing_thing_right",
+    "pointing_color_right", "pointing_both_right", "one_over_k"}}, k in increasing order)."""
+    pt = torch.as_tensor(pred_things)
+    s = SR.score_cells(pt, pred_colors, torch.as_tensor(cells).to(pt.device), torch.as_tensor(colors).to(pt.device))
+    points = torch.as_tensor(points).to(pt.device)
     stated = s["requested"] & (points < 0)
     ptg = s["requested"] & (points >= 0)
-    return {"stated_thing_right": SR.rate(s["thing_right"][stated]),
-            "stated_color_right": SR.rate(s["color_right"][stated]),
-            "pointing_thing_right": SR.rate(s["thing_right"][ptg]),
-            "pointing_color_right": SR.rate(s["color_right"][ptg]),
-            "pointing_both_right": SR.rate((s["thing_right"] & s["color_right"])[ptg]),
-            "lists": int(cells.shape[0]), "pointed": int(ptg.any(dim=1).sum())}
+    both = s["thing_right"] & s["color_right"]
+    out = {"stated_thing_right": SR.rate(s["thing_right"][stated]),
+           "stated_color_right": SR.rate(s["color_right"][stated]),
+           "pointing_thing_right": SR.rate(s["thing_right"][ptg]),
+           "pointing_color_right": SR.rate(s["color_right"][ptg]),
+           "pointing_both_right": SR.rate(both[ptg]),
+           "lists": int(torch.as_tensor(cells).shape[0]), "pointed": int(ptg.any(dim=1).sum())}
+    if eligible is not None:
+        el = torch.as_tensor(eligible, dtype=torch.long).to(pt.device)
+        pointed = ptg.any(dim=1)
+        by_k = {}
+        for k in sorted({int(x) for x in el[pointed].tolist()}):
+            sel = ptg & (pointed & (el == k))[:, None]
+            by_k[str(k)] = {"lists": int((pointed & (el == k)).sum()),
+                            "pointing_thing_right": SR.rate(s["thing_right"][sel]),
+                            "pointing_color_right": SR.rate(s["color_right"][sel]),
+                            "pointing_both_right": SR.rate(both[sel]), "one_over_k": 1.0 / k if k else None}
+        out["pointing_by_k"] = by_k
+    return out
 
 
 def _judges(a: dict):
@@ -288,7 +315,8 @@ def _run_compose(a: dict, log) -> dict:
                 pl = MB.pointer_lists(n, count, POINTER_SEED + n, held, only_held=only, distinct=True)
                 z = MB.sample_lists(col, pl.cells, pl.colors, pl.points, noise_seed + n, steps, a["device"], chunk)
                 pix = made_pixels(z)
-                reads = {name: pointing_reads(jm, pix, pl.cells, pl.colors, pl.points) for name, jm in judges}
+                reads = {name: pointing_reads(jm, pix, pl.cells, pl.colors, pl.points, pl.eligible)
+                         for name, jm in judges}
                 first = reads[judges[0][0]]
                 blind = blind_reference(pl.cells, pl.colors, pl.points)
                 elig = eligible_reference(pl)
@@ -351,14 +379,16 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
     dev = a["device"]
     depth = len(next(iter(col.things.values())).blocks)
     out = {"vary": vary, "k_rows_drawn_per_engine": int(a["k"]), "by_t": {}}
+    # an engine's rows do not depend on the noise level: drawn once an engine (the same generator and seed)
+    batches = {cls: MB.member_batch(variant, cls, bed, int(a["k"]), torch.Generator().manual_seed(FIND_SEED + 100 * cls),
+                                    1.0, _exclude(a), held_pairs(a["held"])) for cls in col.things}
     for t in _levels(a):
         acc = {"rows": 0, "rows_drawn": 0, "skipped_same_color": 0, "skipped_no_candidate": 0,
                "skipped_no_pointer": 0, "nearer_asked_a": 0, "nearer_asked_b": 0, "both_nearer": 0, "only_a": 0,
                "only_b": 0, "neither": 0, "max_abs_answer_delta": 0.0, "per_engine": {}, "blocks": {}}
         sums = {}
         for cls, eng in col.things.items():
-            gen = torch.Generator().manual_seed(FIND_SEED + 100 * cls)
-            mb = MB.member_batch(variant, cls, bed, int(a["k"]), gen, 1.0, _exclude(a), held_pairs(a["held"]))
+            mb = batches[cls]
             z_all = _noisy_at(mb["x"], t, FIND_SEED + 100 * cls + 1 + int(round(1000 * t)))
             mine = {"drawn": int(mb["x"].shape[0]), "used": 0, "skipped_same_color": 0, "skipped_no_candidate": 0,
                     "skipped_no_pointer": 0}
@@ -386,9 +416,10 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
                 cb = S.COLOR_VALUES[int(mb["colors"][i, row.index(ask_b)])]
                 ca, cb = torch.tensor(ca), torch.tensor(cb)
                 acc["rows"] += 1
-                for blk in range(depth):
-                    r = MB.find_read(eng, variant, z, tt, mb["cells"][i:i + 1], mb["colors"][i:i + 1],
-                                     mb["points"][i:i + 1], 0, cell, ask_a, ask_b, blk, visible=visible, vary=vary)
+                whole = MB.find_read(eng, variant, z, tt, mb["cells"][i:i + 1], mb["colors"][i:i + 1],
+                                     mb["points"][i:i + 1], 0, cell, ask_a, ask_b, None, visible=visible, vary=vary)
+                for blk in range(depth):                 # every block from the same two forwards
+                    r = dict(whole["by_block"][blk], answer_a=whole["answer_a"], answer_b=whole["answer_b"])
                     s = sums.setdefault(blk, {"w_asked_a": 0.0, "w_asked_b": 0.0, "change": 0.0, "groups": 0.0,
                                               "max_abs_weight_delta": 0.0, "max_abs_score_delta": 0.0,
                                               "rows_exactly_equal": 0})
@@ -514,7 +545,9 @@ def _run_address(a: dict, log) -> dict:
             looks["unturned_old_after"].append(uw["after"]["looks_old"])
             unturned.append(all(torch.equal(uw[tag]["w_all"], sw[tag]["w_all"]) for tag in ("before", "after")))
             neutral.append({"old": _rel(nw["before"]["answers"][io], nw["after"]["answers"][io]),
-                            "new": _rel(nw["before"]["answers"][inew], nw["after"]["answers"][inew])})
+                            "new": _rel(nw["before"]["answers"][inew], nw["after"]["answers"][inew]),
+                            "denominator": min(float(nw["before"]["answers"][j].pow(2).mean().sqrt())
+                                               for j in (io, inew))})
             m = MB.address_missing(col, cells, i, cell)
             u = MB.address_unheld(col, cells, i, cell)
             missing.append({"largest_member": float(m["w"].max()), "smallest_base": float(m["base"].min())})
@@ -535,7 +568,8 @@ def _run_address(a: dict, log) -> dict:
                          "other_cells_unchanged": all(x["other_cells_unchanged"] for x in together),
                          "looks": mean_looks, "other_relative_change": _median_p95(others)},
             "unturned_gate_identical": all(unturned),
-            "neutral": {"old": _median_p95([x["old"] for x in neutral]), "new": _median_p95([x["new"] for x in neutral])},
+            "neutral": {"old": _median_p95([x["old"] for x in neutral]), "new": _median_p95([x["new"] for x in neutral]),
+                        "smallest_denominator": min((x["denominator"] for x in neutral), default=None)},
             "missing": {"largest_member": max((x["largest_member"] for x in missing), default=None),
                         "smallest_base": min((x["smallest_base"] for x in missing), default=None)},
             "unheld": {"largest_member": max((x["largest_member"] for x in unheld), default=None),
@@ -631,10 +665,58 @@ def _run_parts(a: dict, log) -> dict:
                          batch=int(a["batch"]), lr=float(a["lr"]), warmup=int(a["warmup"]), every=int(a["every"]),
                          heldout=int(a["heldout"]), save_every=int(a["save_every"]), p_point=float(a["p_point"]),
                          exclude=_exclude(a), held_pairs=held_pairs(a["held"]), dim=int(a["dim"]),
-                         heads=int(a["heads"]), depth=int(a["depth"]), snapshots=snaps, noise=str(a["noise"]), log=log)
-    return {"kind": variant.name, "finished": r.get("finished"), "engines": r.get("engines"),
+                         heads=int(a["heads"]), depth=int(a["depth"]), snapshots=snaps, noise=str(a["noise"]),
+                         until=int(a["until"]) if int(a["until"]) > 0 else None, group=int(a["group"]), log=log)
+    return {"kind": variant.name, "finished": r.get("finished"), "step": r.get("step"),
+            "restored": bool(r.get("restored")), "engines": r.get("engines"),
             "seconds_a_step_stack": r.get("seconds_a_step_stack"), "seconds_a_step_engine": r.get("seconds_a_step_engine"),
             "trained": r.get("trained")}
+
+
+ENGINE_WEIGHTS = ("engine.safetensors", "engine_avg.safetensors")
+
+
+def _bits(x) -> "torch.Tensor":
+    return x.detach().contiguous().reshape(-1).view(torch.uint8)
+
+
+def same_engines(a: str, b: str) -> dict:
+    """Whether two job folders hold the same engines bit for bit: the finished engines under each (by folder name,
+    ``toy_collective.index_engines``), and for every name in both, every tensor of engine.safetensors and
+    engine_avg.safetensors equal in name, shape, dtype and every byte (NaN included) -> {"same", "engines_compared",
+    "only_in_a", "only_in_b", "differing": [{"tag", "file", "tensors"}]}. "same" is True only when both hold the
+    same names, at least one, and nothing differs."""
+    from safetensors.torch import load_file
+    ia, ib = index_engines(a), index_engines(b)
+    common = sorted(set(ia) & set(ib))
+    differing = []
+    for tag in common:
+        for f in ENGINE_WEIGHTS:
+            pa, pb = os.path.join(ia[tag], f), os.path.join(ib[tag], f)
+            if not os.path.isfile(pa) and not os.path.isfile(pb):
+                continue
+            if not (os.path.isfile(pa) and os.path.isfile(pb)):
+                differing.append({"tag": tag, "file": f, "tensors": ["the file is in one folder only"]})
+                continue
+            ta, tb = load_file(pa), load_file(pb)
+            bad = sorted(k for k in set(ta) | set(tb)
+                         if k not in ta or k not in tb or ta[k].shape != tb[k].shape or ta[k].dtype != tb[k].dtype
+                         or not torch.equal(_bits(ta[k]), _bits(tb[k])))
+            if bad:
+                differing.append({"tag": tag, "file": f, "tensors": bad})
+    only_a, only_b = sorted(set(ia) - set(ib)), sorted(set(ib) - set(ia))
+    return {"same": bool(common) and not only_a and not only_b and not differing, "engines_compared": len(common),
+            "only_in_a": only_a, "only_in_b": only_b, "differing": differing, "a": a, "b": b}
+
+
+def _run_same(a: dict, log) -> dict:
+    folders = [x.strip() for x in str(a["parts"] or "").split(",") if x.strip()]
+    if len(folders) != 2:
+        raise ValueError("variant same compares two job folders: parts=<a>,<b>")
+    r = same_engines(folders[0], folders[1])
+    log(f"same engines bit for bit: {r['same']} ({r['engines_compared']} compared, {len(r['differing'])} differing, "
+        f"{len(r['only_in_a'])} only in the first, {len(r['only_in_b'])} only in the second)")
+    return r
 
 
 def _run_timing(a: dict, log) -> dict:
@@ -648,7 +730,8 @@ def _run_timing(a: dict, log) -> dict:
         r = MT.time_stack(variant, pool[:g], bed, int(a["seed"]), batch=int(a["batch"]), steps=int(a["steps"]),
                           from_step=int(a["from_step"]), p_point=float(a["p_point"]), exclude=_exclude(a),
                           held_pairs=held_pairs(a["held"]), dim=int(a["dim"]), heads=int(a["heads"]),
-                          depth=int(a["depth"]), noise=str(a["noise"]), phases=bool(int(a["phases"])))
+                          depth=int(a["depth"]), noise=str(a["noise"]), phases=bool(int(a["phases"])),
+                          group=min(int(a["group"]), g))
         rows.append(r)
         log(f"timing G={g}: {r['seconds_a_step_stack']} s a step of the stack, {r['seconds_a_step_engine']} an engine")
         if r.get("phases"):
@@ -657,7 +740,7 @@ def _run_timing(a: dict, log) -> dict:
 
 
 RUNNERS = {"parts": _run_parts, "timing": _run_timing, "compose": _run_compose, "address": _run_address,
-           "exchange": _run_exchange}
+           "exchange": _run_exchange, "same": _run_same}
 
 
 # ------------------------------------------------------------------ the result
@@ -678,7 +761,17 @@ def _m(r: dict) -> str:
 def _text(result: dict) -> str:
     v = result["variant"]
     lines = [f"# addressed_collective: {v}, kind {result.get('kind')}", ""]
-    if v == "parts":
+    if v == "same":
+        lines += [f"the same engines bit for bit: {_f(result['same'])}", "",
+                  f"first: {result['a']}", f"second: {result['b']}",
+                  f"engines compared: {result['engines_compared']}",
+                  f"only in the first: {', '.join(result['only_in_a']) or '-'}",
+                  f"only in the second: {', '.join(result['only_in_b']) or '-'}"]
+        lines += [f"differing: {d['tag']} {d['file']}: {', '.join(d['tensors'])}" for d in result["differing"]]
+    elif v == "parts" and not result.get("finished"):
+        lines.append(f"NOT FINISHED: stopped after step {result.get('step')}; the stack checkpoint is kept, and the "
+                     "same job started again without until resumes from it")
+    elif v == "parts":
         lines += ["| engine | newborn read | last read | descended |", "|---|---|---|---|"]
         lines += [f"| {e['tag']} | {_f(e['newborn_read'])} | {_f(e['last_read'])} | {_f(e['descended'])} |"
                   for e in result.get("engines") or []]
@@ -711,6 +804,12 @@ def _text(result: dict) -> str:
                       f"{r['reference_eligible']['lists']} | "
                       f"{', '.join(f'{k}: {c}' for k, c in r['reference_eligible']['k_histogram'].items())} |"
                       for n, r in by_n.items()]
+            for n, r in by_n.items():
+                if r.get("pointing_by_k"):
+                    lines += ["", f"BY THE NUMBER OF ELIGIBLE REQUESTS k ({label.replace('_', ' ')}, n = {n})", "",
+                              "| k | lists | pointing: color right | 1 / k |", "|---|---|---|---|"]
+                    lines += [f"| {k} | {x['lists']} | {_m(x['pointing_color_right'])} | {_f(x['one_over_k'])} |"
+                              for k, x in r["pointing_by_k"].items()]
         lines.append(f"\ninconclusive: {_f(result['inconclusive'])}")
     elif v == "address":
         find = result["find"]
@@ -785,7 +884,7 @@ def main(argv=(), **overrides) -> dict:
     with determinism.mode(a["det"]) as det:
         result = RUNNERS[a["variant"]](a, log)
         det.record(result)
-    result.update({"experiment": EXPERIMENT, "variant": a["variant"], "noise": str(a["noise"]),
+    result.update({"experiment": EXPERIMENT, "variant": a["variant"], "noise": str(a["noise"]), "group": int(a["group"]),
                    "args": {k: a[k] for k in sorted(a)},
                    "version": __version__, "torch": torch.__version__, "seconds": time.time() - t0})
     with open(os.path.join(a["out"], "result.json"), "w", encoding="utf-8", newline="\n") as fh:

@@ -388,12 +388,14 @@ def arguments(look_: Tensor, match: Tensor, U: float) -> Tensor:
 # ------------------------------------------------------------------ the gate
 def rest_weights(u: Tensor) -> Tuple[Tensor, Tensor]:
     """The rest form over the last axis (the members) -> (w [..., M], base [...]), float64:
-    w_i = sinh(u_i) / (1 + sum_j 2 sinh(u_j / 2)^2), base = 1 - sum_i w_i. The sums run one member at a time in order."""
+    w_i = sinh(u_i) / (1 + sum_j 2 sinh(u_j / 2)^2), base = 1 - sum_i w_i. The sums run one member at a time in order;
+    each member's term 2 sinh(u_j / 2)^2 (its cosh(u) - 1) is computed on that member's own [...] tensor, one path for
+    every platform (a sinh over the whole [..., M] tensor may take another vector path on some machines and round
+    otherwise in the last place)."""
     u = u.double()
-    term = 2.0 * torch.sinh(u / 2.0) ** 2                       # each member's cosh(u) - 1, number by number
     den = torch.ones(u.shape[:-1], dtype=torch.float64, device=u.device)
     for j in range(u.shape[-1]):
-        den = den + term[..., j]
+        den = den + 2.0 * torch.sinh(u[..., j] / 2.0) ** 2
     w = torch.sinh(u) / den[..., None]
     total = torch.zeros_like(den)
     for j in range(u.shape[-1]):

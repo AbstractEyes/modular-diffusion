@@ -443,9 +443,12 @@ def _render_core(cells: Tensor, colors: Tensor, p: Dict[str, Tensor], bed: str, 
     side = CANVAS + 2 * margin
     cov_sum = torch.zeros(b, side, side, dtype=torch.float32, device=device)
     colored = torch.zeros(b, CHANNELS, side, side, dtype=torch.float32, device=device)
-    item_b, item_c = torch.nonzero(cells_d >= 0, as_tuple=True)
+    # the indices are taken from the layout where it arrived: a CPU layout gives them without waiting for a card
+    host = cells if cells.device.type == "cpu" else cells_d
+    item_b_h, item_c_h = torch.nonzero(host >= 0, as_tuple=True)
+    things_h = host[item_b_h, item_c_h]
+    item_b, item_c = item_b_h.to(device), item_c_h.to(device)
     if item_b.numel():
-        things = cells_d[item_b, item_c]
         cx, cy = p["centers"][item_b, item_c, 0], p["centers"][item_b, item_c, 1]
         ang = torch.deg2rad(p["angle"][item_b, item_c])
         ca, sa = torch.cos(ang), torch.sin(ang)
@@ -459,12 +462,12 @@ def _render_core(cells: Tensor, colors: Tensor, p: Dict[str, Tensor], bed: str, 
         py = -sa[:, None, None] * dx + ca[:, None, None] * dy
         cov = torch.zeros(item_b.shape[0], w, w, dtype=torch.float32, device=device)
         for t in range(len(THINGS)):
-            sel = torch.nonzero(things == t, as_tuple=True)[0]
+            sel = torch.nonzero(things_h == t, as_tuple=True)[0].to(device)
             if sel.numel():
                 cov[sel] = coverage(thing_distance(t, px[sel], py[sel], scale[sel]))
         col = p["color"][item_b, item_c]
         for c in range(N_CELLS):
-            sel = torch.nonzero(item_c == c, as_tuple=True)[0]
+            sel = torch.nonzero(item_c_h == c, as_tuple=True)[0].to(device)
             if sel.numel():
                 bs = item_b[sel]
                 y0, x0 = (c // CELLS) * CELL, (c % CELLS) * CELL
