@@ -134,11 +134,61 @@ def engine_name(kind: str, cls: Optional[int] = None) -> str:
 def told_slots(told: Tensor) -> Tuple[Tensor, Tensor]:
     """The cells an engine is told about, compacted: (slots [B, R] long, the told cells in cell order, padded with 0;
     mask [B, R] bool), R = the largest count of the batch (0 when nothing is told)."""
+    b = told.shape[0]
+    if not told.numel():
+        return torch.empty((b, 0), dtype=torch.long, device=told.device), torch.empty((b, 0), dtype=torch.bool, device=told.device)
     count = told.sum(dim=1)
-    r = int(count.max()) if told.numel() else 0
+    lo, r = torch.stack([count.min(), count.max()]).tolist()
+    if r == 0:
+        return torch.empty((b, 0), dtype=torch.long, device=told.device), torch.empty((b, 0), dtype=torch.bool, device=told.device)
+    if r == 1 and lo == 1:
+        return told.long().argmax(dim=1, keepdim=True), torch.ones((b, 1), dtype=torch.bool, device=told.device)
     order = torch.argsort((~told).to(torch.int8), dim=1, stable=True)[:, :r]
     mask = torch.arange(r, device=told.device)[None] < count[:, None]
     return torch.where(mask, order, torch.zeros_like(order)), mask
+
+
+_ROTARY_TABLES_CACHE: dict = {}
+
+
+def _anchored_tables(device: torch.device) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Precomputed (img_cos [1,1,144,64], img_sin [1,1,144,64], cell_cos [9,64], cell_sin [9,64]) matching
+    ``rotary.anchored_rotary`` bit for bit on ``device``."""
+    cached = _ROTARY_TABLES_CACHE.get(device)
+    if cached is not None:
+        return cached
+    from .rotary import anchored_angles
+    fr = _FRAME
+    img_rows = (torch.arange(fr.n_tokens, device=device) // fr.grid).double()[None]
+    img_cols = (torch.arange(fr.n_tokens, device=device) % fr.grid).double()[None]
+    _, fcol, frow = fr._on(device)
+    ang_img = anchored_angles(img_rows, img_cols, fcol[None], frow[None])
+    ci, si = ang_img.cos(), ang_img.sin()
+    img_cos = torch.cat([ci, ci], dim=-1)[:, None]
+    img_sin = torch.cat([si, si], dim=-1)[:, None]
+    cells = torch.arange(N_CELLS, device=device)
+    cj, ck = cells % fr.cells, cells // fr.cells
+    ang_cell = anchored_angles((ck * fr.side).double()[None] + (fr.side - 1) / 2,
+                               (cj * fr.side).double()[None] + (fr.side - 1) / 2,
+                               cj[None], ck[None])
+    cc, sc = ang_cell.cos()[0], ang_cell.sin()[0]
+    cell_cos = torch.cat([cc, cc], dim=-1)
+    cell_sin = torch.cat([sc, sc], dim=-1)
+    cached = (img_cos, img_sin, cell_cos, cell_sin)
+    _ROTARY_TABLES_CACHE[device] = cached
+    return cached
+
+
+def _table_anchored_rotary(cos: Tensor, sin: Tensor):
+    from .rotary import rotate_half
+
+    def _rot(q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
+        if q.shape[-1] != ANCHORED_HEAD_DIM:
+            raise ValueError(f"the anchored rotary needs a head of {ANCHORED_HEAD_DIM} numbers, not {q.shape[-1]}")
+        c, s = cos.to(q.dtype), sin.to(q.dtype)
+        return q * c + rotate_half(q) * s, k * c + rotate_half(k) * s
+
+    return _rot
 
 
 class AddressedEngine(nn.Module):
@@ -185,7 +235,7 @@ class AddressedEngine(nn.Module):
         cells, colors = cells.to(dev), colors.to(dev)
         told = told.to(dev).bool() & (cells >= 0)
         slots, smask = told_slots(told)
-        codes, _ = frame.layout_codes(cells, colors)                             # [B, 9, 18]
+        codes, cmask = frame.layout_codes(cells, colors)                         # [B, 9, 18]
         req = torch.gather(codes, 1, slots[..., None].expand(-1, -1, CTX_DIM)) if slots.shape[1] else \
             codes[:, :0]
         null = torch.zeros(b, 1, CTX_DIM, device=dev, dtype=z.dtype)
@@ -193,7 +243,7 @@ class AddressedEngine(nn.Module):
         tokens = patchify(z, PATCH)
         e = self.time(t)
         if self.read == "embedding":
-            h = self.embed(tokens) + self.code_in(token_codes(cells, colors, told))
+            h = self.embed(tokens) + self.code_in(token_codes(cells, colors, told, _codes=codes, _mask=cmask))
             c = self.ctx_in(torch.cat([null, req.to(z.dtype)], dim=1))
             m = torch.cat([valid, smask], dim=1)
             rot = self.code.rotary()
@@ -203,14 +253,13 @@ class AddressedEngine(nn.Module):
         r = slots.shape[1]
         h = torch.cat([self.req_in(req[..., 6:].to(z.dtype)), self.embed(tokens)], dim=1)
         fr = _FRAME
-        img_rows = (torch.arange(fr.n_tokens, device=dev) // fr.grid).double()
-        img_cols = (torch.arange(fr.n_tokens, device=dev) % fr.grid).double()
-        sj, sk = (slots % fr.cells), (slots // fr.cells)
-        rows = torch.cat([(sk * fr.side).double() + (fr.side - 1) / 2, img_rows.expand(b, -1)], dim=1)
-        cols = torch.cat([(sj * fr.side).double() + (fr.side - 1) / 2, img_cols.expand(b, -1)], dim=1)
-        dcol = torch.cat([sj, fr.column.to(dev).expand(b, -1)], dim=1)
-        drow = torch.cat([sk, fr.row.to(dev).expand(b, -1)], dim=1)
-        rot = anchored_rotary(rows, cols, dcol, drow)
+        img_cos, img_sin, cell_cos, cell_sin = _anchored_tables(dev)
+        if r == 0:
+            rot = _table_anchored_rotary(img_cos, img_sin)
+        else:
+            cos = torch.cat([cell_cos[slots][:, None], img_cos.expand(b, -1, -1, -1)], dim=2)
+            sin = torch.cat([cell_sin[slots][:, None], img_sin.expand(b, -1, -1, -1)], dim=2)
+            rot = _table_anchored_rotary(cos, sin)
         if key_mask is None and (r == 0 or bool(smask.all())):
             km = None
         else:
@@ -279,10 +328,16 @@ def load_engine(folder: str, average: bool = True, device="cpu") -> AddressedEng
     s = info["settings"]
     with torch.random.fork_rng(devices=[]):
         eng = AddressedEngine(s["dim"], s["heads"], s["depth"], s.get("read", "embedding"))
-    state = load_file(os.path.join(folder, "engine.safetensors"))
     avg = os.path.join(folder, "engine_avg.safetensors")
     if average and os.path.isfile(avg):
-        state.update(load_file(avg))
+        state = load_file(avg)
+        expected = set(eng.state_dict().keys())
+        if expected - set(state.keys()):
+            base = load_file(os.path.join(folder, "engine.safetensors"))
+            base.update(state)
+            state = base
+    else:
+        state = load_file(os.path.join(folder, "engine.safetensors"))
     eng.load_state_dict(state, strict=True)
     eng.kind, eng.cls, eng.seed = info.get("kind"), info.get("cls"), info.get("seed")
     eng.card = info
@@ -292,16 +347,29 @@ def load_engine(folder: str, average: bool = True, device="cpu") -> AddressedEng
 # ------------------------------------------------------------------ codes
 _FRAME = frame.TokenFrame()
 _PLACE = _FRAME.place_code()                                     # [T, 16]
+_PLACE_DEV_CACHE: dict = {}
 
 
-def token_codes(cells: Tensor, colors: Tensor, content: Tensor) -> Tensor:
+def _place_on(device: torch.device) -> Tensor:
+    cached = _PLACE_DEV_CACHE.get(device)
+    if cached is None:
+        cached = _PLACE.to(device)
+        _PLACE_DEV_CACHE[device] = cached
+    return cached
+
+
+def token_codes(cells: Tensor, colors: Tensor, content: Tensor, *,
+                _codes: Optional[Tensor] = None, _mask: Optional[Tensor] = None) -> Tensor:
     """[B, T, 28]: the place code on every token and the content code of a cell's request on the tokens of the cells
     marked in ``content`` [B, 9] bool (zeros elsewhere)."""
     dev = cells.device
-    codes, mask = frame.layout_codes(cells, colors)
+    if _codes is None or _mask is None:
+        codes, mask = frame.layout_codes(cells, colors)
+    else:
+        codes, mask = _codes, _mask
     content = content.to(dev) & mask
-    c12 = (codes[..., 6:] * content[..., None].float())[:, _FRAME.cell.to(dev)]       # [B, T, 12]
-    place = _PLACE.to(dev).expand(cells.shape[0], -1, -1)
+    c12 = (codes[..., 6:] * content[..., None].float())[:, _FRAME._cell_on(dev)]     # [B, T, 12]
+    place = _place_on(dev).expand(cells.shape[0], -1, -1)
     return torch.cat([place, c12], dim=-1)
 
 
@@ -316,7 +384,8 @@ def _hidden(own: Optional[Tensor], b: int, gen: torch.Generator) -> Tensor:
     h = torch.randint(0, N_CELLS, (b,), generator=gen)
     keys = torch.rand(b, N_CELLS, generator=gen)
     if own is not None:
-        keys[torch.arange(b), own.cpu()] = 2.0
+        own_cpu = own if own.device.type == "cpu" else own.cpu()
+        keys[torch.arange(b), own_cpu] = 2.0
     order = torch.argsort(keys, dim=1, stable=True)
     rank = torch.empty_like(order)
     rank.scatter_(1, order, torch.arange(N_CELLS).expand(b, N_CELLS).contiguous())
@@ -330,7 +399,7 @@ def kind_batch(kind: str, cls: Optional[int], bed: ScenesBed, n: int, gen: torch
     module's table); the scenes' and the hidden cells' draws come from ``gen`` (a CPU generator). ``allowed_cells``:
     the thing kinds' one-thing scenes use only these cells (None: every cell, the default path)."""
     engine_name(kind, cls)
-    dev = bed.device
+    dev = torch.device(bed.device)
     if allowed_cells is not None and kind not in THING_KINDS:
         raise ValueError("allowed_cells applies to the thing kinds")
     if kind in THING_KINDS:
@@ -342,23 +411,30 @@ def kind_batch(kind: str, cls: Optional[int], bed: ScenesBed, n: int, gen: torch
     else:
         sb = bed.train_batch("mix", n, gen)
     cells, colors = sb.cells, sb.colors
+    cells_cpu = getattr(sb, "_cells_cpu", None)
     T = _FRAME.n_tokens
     none = torch.zeros(n, N_CELLS, dtype=torch.bool, device=dev)
     out = {"x": sb.x, "cells": cells, "colors": colors, "params": sb.params, "key_mask": None, "told": none,
            "loss_mask": torch.ones(n, T, dtype=torch.bool, device=dev), "hidden": None, "serving": None}
     if kind in THING_KINDS:
-        own = _own_cell(cells)
+        if cells_cpu is not None:
+            own_cpu = _own_cell(cells_cpu)
+            own = own_cpu.to(dev)
+        else:
+            own = _own_cell(cells)
+            own_cpu = own
         out["told"] = torch.nn.functional.one_hot(own, N_CELLS).bool()
         out["serving"] = own
         if kind == "addressed_thing":
-            hidden = _hidden(own, n, gen).to(dev)
+            hidden = _hidden(own_cpu, n, gen).to(dev)
             out["hidden"] = hidden
-            out["key_mask"] = frame.visible_keys(cells, own, hidden)
-            out["loss_mask"] = (_FRAME.cell.to(dev)[None] == own[:, None])
+            out["key_mask"] = frame.visible_keys(cells, own, hidden, _validate=False)
+            out["loss_mask"] = (_FRAME._cell_on(dev)[None] == own[:, None])
     elif kind == "addressed_base":
         hidden = _hidden(None, n, gen).to(dev)
         out["hidden"] = hidden
-        out["key_mask"] = frame.visible_keys(cells, torch.full((n,), -1, dtype=torch.long, device=dev), hidden)
+        out["key_mask"] = frame.visible_keys(cells, torch.full((n,), -1, dtype=torch.long, device=dev), hidden,
+                                             _validate=False)
         out["loss_mask"] = out["key_mask"].clone()
     elif kind in MODEL_KINDS:
         out["told"] = cells >= 0
@@ -374,10 +450,10 @@ def noisy(x: Tensor, gen: torch.Generator) -> Tuple[Tensor, Tensor, Tensor]:
     return (1 - tt) * z0 + tt * x, t, x - z0
 
 
-def masked_loss(v: Tensor, target: Tensor, loss_mask: Tensor) -> Tensor:
+def masked_loss(v: Tensor, target: Tensor, loss_mask: Tensor, *, _validate: bool = True) -> Tensor:
     """The mean over rows of (sum over masked tokens of the squared error) / (48 x the row's masked token count)."""
     count = loss_mask.sum(dim=1)
-    if bool((count == 0).any()):
+    if _validate and bool((count == 0).any()):
         raise ValueError("a row of the batch has no token in its loss mask")
     d = patchify(v - target, PATCH)
     sq = (d * d).sum(dim=-1)
@@ -408,6 +484,8 @@ def own_read_set(kind: str, cls: Optional[int], bed: ScenesBed, n: int, seed: in
         m = min(256, int(n) - k)
         b = kind_batch(kind, cls, bed, m, gen, allowed_cells)
         z, t, target = noisy(b["x"], gen)
+        b.pop("params", None)
+        b.pop("x", None)
         parts.append({"batch": b, "z": z, "t": t, "target": target})
     return {"parts": parts, "n": int(n)}
 
@@ -421,7 +499,7 @@ def own_read(engine: AddressedEngine, rs: dict) -> float:
     for p in rs["parts"]:
         v = engine_forward(engine, p["batch"], p["z"], p["t"])
         m = p["z"].shape[0]
-        total += float(masked_loss(v, p["target"], p["batch"]["loss_mask"])) * m
+        total += float(masked_loss(v, p["target"], p["batch"]["loss_mask"], _validate=False)) * m
         rows += m
     engine.train(was)
     return total / max(1, rows)
@@ -447,11 +525,20 @@ def _adam_load(opt, tensors: Dict[str, Tensor], groups: List[dict], device) -> N
     opt.load_state_dict({"state": state, "param_groups": groups})
 
 
+def _make_adam(params, lr: float, device) -> torch.optim.Adam:
+    if str(device).startswith("cuda"):
+        try:
+            return torch.optim.Adam(params, lr=float(lr), betas=BETAS, eps=EPS, weight_decay=0.0, fused=True)
+        except (RuntimeError, TypeError):
+            pass
+    return torch.optim.Adam(params, lr=float(lr), betas=BETAS, eps=EPS, weight_decay=0.0)
+
+
 def train_engine(kind: str, cls: Optional[int], bed: ScenesBed, seed: int, out: str, *, steps: int = 3000,
                  batch: int = 128, lr: float = 1e-3, warmup: int = 100, every: int = 250, heldout: int = 2048,
                  dim: int = 128, heads: int = 2, depth: int = 3, save_every: int = 500, until: Optional[int] = None,
                  read: str = "embedding", allowed_cells: Optional[Sequence[int]] = None,
-                 log: Callable[[str], None] = print) -> dict:
+                 log: Callable[[str], None] = print, sync_steps: bool = False) -> dict:
     """Train one engine alone (see the module's text) into ``out`` -> its result (also written as train.json): the
     settings, the curve [{"step", "loss", "own_read"}], the newborn and the last own read, "descended" (the last own
     read below the newborn's), trained numbers, train seconds (the sum of the step stamps), seconds a step (median).
@@ -479,10 +566,11 @@ def train_engine(kind: str, cls: Optional[int], bed: ScenesBed, seed: int, out: 
     from safetensors.torch import load_file, save_file
     engine = born(kind, cls, seed, dim, heads, depth, read).to(device)
     engine.train()
-    params = list(engine.parameters())
-    names = [n for n, _ in engine.named_parameters()]
-    opt = torch.optim.Adam(params, lr=float(lr), betas=BETAS, eps=EPS, weight_decay=0.0)
-    average = {n: p.detach().clone().float() for n, p in engine.named_parameters()}
+    named_params = list(engine.named_parameters())
+    params = [p for _, p in named_params]
+    names = [n for n, _ in named_params]
+    opt = _make_adam(params, lr, device)
+    average = {n: p.detach().clone().float() for n, p in named_params}
     rs = own_read_set(kind, cls, bed, heldout, allowed_cells=allowed)
     curve: List[dict] = []
     step_seconds: List[float] = []
@@ -499,6 +587,7 @@ def train_engine(kind: str, cls: Optional[int], bed: ScenesBed, seed: int, out: 
         _adam_load(opt, tensors, ck["param_groups"], device)
         curve, step_seconds, done, newborn = ck["curve"], ck["step_seconds"], int(ck["step"]), ck["newborn_read"]
         log(f"RESUME from step {done:,} of {steps:,}")
+    avg_list = [average[n] for n in names]
     trained = param_count(engine)
     log(f"JOB {engine_name(kind, cls)} bed {bed.bed} seed {seed}: {steps:,} steps x batch {batch} = {steps * batch:,} "
         f"scenes; {trained:,} trained numbers; pure Adam lr {lr:g}; device {device}")
@@ -529,19 +618,19 @@ def train_engine(kind: str, cls: Optional[int], bed: ScenesBed, seed: int, out: 
         gen = step_generator(int(seed), s, "cpu")
         b = kind_batch(kind, cls, bed, batch, gen, allowed)
         z, t, target = noisy(b["x"], gen)
-        loss = masked_loss(engine_forward(engine, b, z, t), target, b["loss_mask"])
+        loss = masked_loss(engine_forward(engine, b, z, t), target, b["loss_mask"], _validate=False)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         k = s
         dk = (1 + k) / (k + 8 + 2)
         with torch.no_grad():
-            for n_, p in engine.named_parameters():
-                average[n_].copy_(dk * average[n_] + (1.0 - dk) * p.detach().float())
+            torch._foreach_mul_(avg_list, dk)
+            torch._foreach_add_(avg_list, params, alpha=1.0 - dk)
         n = s + 1
         if every and (n % int(every) == 0 or n == steps):
             loss_v = float(loss.detach())
-        elif is_cuda:
+        elif is_cuda and sync_steps:
             torch.cuda.synchronize()
         step_seconds.append(time.perf_counter() - s0)
         if every and (n % int(every) == 0 or n == steps):
@@ -553,6 +642,8 @@ def train_engine(kind: str, cls: Optional[int], bed: ScenesBed, seed: int, out: 
                 f"{spent / max(1, n - done) * (steps - n):.0f} s")
         if save_every and n % int(save_every) == 0 and n != stop:
             checkpoint(n)
+    if is_cuda:
+        torch.cuda.synchronize()
     checkpoint(stop)
     result = {"settings": settings, "step": stop, "finished": stop >= steps}
     if stop >= steps:
@@ -604,23 +695,67 @@ class Collective:
         if len(reads) > 1:
             raise ValueError(f"a collective is built from engines of one read form, not {sorted(reads)}")
         self.read = reads.pop() if reads else "embedding"
+        self._plan = None
 
     def owners(self) -> List[List[int]]:
         return [[k] for k in sorted(self.things)]
 
+    def _get_plan(self, cells: Tensor, colors: Tensor, join: str) -> dict:
+        keys = tuple(sorted(self.things))
+        cached = self._plan
+        if (cached is not None
+                and cached["cells"] is cells and cached["c_ver"] == cells._version
+                and cached["colors"] is colors and cached["k_ver"] == colors._version
+                and cached["join"] == join and cached["keys"] == keys
+                and cached["addressed"] == self.addressed):
+            return cached
+        dev = cells.device
+        owner = frame.token_owner(cells, [[k] for k in keys])
+        cells_cpu = cells.detach().cpu()
+        pair_specs = []
+        cell_of = _FRAME._cell_on(dev)
+        for i, k in enumerate(keys):
+            rows_cpu, cols_cpu = torch.nonzero(cells_cpu == k, as_tuple=True)
+            if rows_cpu.numel() == 0:
+                continue
+            rows, cols = rows_cpu.to(dev), cols_cpu.to(dev)
+            c_sub, k_sub = cells[rows], colors[rows]
+            told = torch.nn.functional.one_hot(cols, N_CELLS).bool()
+            km = frame.visible_keys(c_sub, cols, _validate=False) if self.addressed else None
+            if join == "gate":
+                sel = (cell_of[None] == cols[:, None]) & (owner[rows] == i)
+                p_idx, tok = torch.nonzero(sel, as_tuple=True)
+                out_rows = rows[p_idx]
+            else:
+                p_idx = tok = out_rows = None
+            pair_specs.append((k, rows, cols, c_sub, k_sub, told, km, p_idx, tok, out_rows))
+        plan = {"cells": cells, "c_ver": cells._version, "colors": colors, "k_ver": colors._version,
+                "join": join, "keys": keys, "addressed": self.addressed, "owner": owner, "pairs": pair_specs}
+        if join == "gate":
+            base_idx = len(keys)
+            free_rows_cpu = torch.nonzero((cells_cpu < 0).any(dim=1), as_tuple=True)[0]
+            if free_rows_cpu.numel():
+                free_rows = free_rows_cpu.to(dev)
+                c_b, k_b = cells[free_rows], colors[free_rows]
+                none_b = torch.zeros_like(c_b, dtype=torch.bool)
+                km_b = (frame.visible_keys(c_b, torch.full((c_b.shape[0],), -1, dtype=torch.long, device=dev),
+                                           _validate=False) if self.addressed else None)
+                sel_b = (owner[free_rows] == base_idx)[..., None]
+                plan["base"] = (free_rows, c_b, k_b, none_b, km_b, sel_b)
+            else:
+                plan["base"] = None
+        else:
+            plan["cell_rows"] = [torch.nonzero(cells_cpu[:, c] >= 0, as_tuple=True)[0].to(dev) for c in range(N_CELLS)]
+        self._plan = plan
+        return plan
+
     def pair_answers(self, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor) -> Dict[int, Tuple[Tensor, Tensor, Tensor]]:
         """{class: (rows, cols, answers [P, 3, 48, 48])}: one batched forward a class present, its pairs in (scene,
         cell) order. A requested class without a part raises (``frame.token_owner``)."""
-        frame.token_owner(cells, self.owners())
+        plan = self._get_plan(cells, colors, "pairs")
         out = {}
-        for k in sorted(self.things):
-            rows, cols = torch.nonzero(cells == k, as_tuple=True)
-            if rows.numel() == 0:
-                continue
-            c, kk = cells[rows], colors[rows]
-            told = torch.nn.functional.one_hot(cols, N_CELLS).bool()
-            km = frame.visible_keys(c, cols) if self.addressed else None
-            out[k] = (rows, cols, self.things[k](z[rows], t[rows], c, kk, told, km))
+        for k, rows, cols, c_sub, k_sub, told, km, _, _, _ in plan["pairs"]:
+            out[k] = (rows, cols, self.things[k](z[rows], t[rows], c_sub, k_sub, told, km))
         return out
 
     def background(self, eng: AddressedEngine, z: Tensor, t: Tensor, cells: Tensor, colors: Tensor) -> Tensor:
@@ -632,31 +767,19 @@ class Collective:
             raise ValueError(f"the joins are {JOINS}, not {join!r}")
         cells = cells.to(z.device)
         colors = colors.to(z.device)
-        pairs = self.pair_answers(z, t, cells, colors)
+        plan = self._get_plan(cells, colors, join)
         if join == "gate":
-            owner = frame.token_owner(cells, self.owners())                  # [B, T]
-            base_idx = len(self.things)
             out = torch.zeros(z.shape[0], _FRAME.n_tokens, TOKEN_DIM, device=z.device, dtype=z.dtype)
-            free_rows = torch.nonzero((cells < 0).any(dim=1), as_tuple=True)[0]
-            if free_rows.numel():
+            base_spec = plan["base"]
+            if base_spec is not None:
                 if self.base is None:
                     raise ValueError("a scene has cells without a request and the collective has no base")
-                c, k = cells[free_rows], colors[free_rows]
-                none = torch.zeros_like(c, dtype=torch.bool)
-                km = frame.visible_keys(c, torch.full((c.shape[0],), -1, dtype=torch.long, device=z.device)) \
-                    if self.addressed else None
-                vb = patchify(self.base(z[free_rows], t[free_rows], c, k, none, km), PATCH)
-                sel = (owner[free_rows] == base_idx)[..., None]
-                out[free_rows] = torch.where(sel, vb, out[free_rows])
-            cell_of = _FRAME.cell.to(z.device)
-            for i, k in enumerate(sorted(self.things)):
-                if k not in pairs:
-                    continue
-                rows, cols, v = pairs[k]
-                vt = patchify(v, PATCH)
-                sel = (cell_of[None] == cols[:, None]) & (owner[rows] == i)      # [P, T]: the pair's own tokens
-                p_idx, tok = torch.nonzero(sel, as_tuple=True)
-                out[rows[p_idx], tok] = vt[p_idx, tok]                          # each (scene, token) written once
+                free_rows, c_b, k_b, none_b, km_b, sel_b = base_spec
+                vb = patchify(self.base(z[free_rows], t[free_rows], c_b, k_b, none_b, km_b), PATCH)
+                out[free_rows] = torch.where(sel_b, vb, out[free_rows])
+            for k, rows, cols, c_sub, k_sub, told, km, p_idx, tok, out_rows in plan["pairs"]:
+                vt = patchify(self.things[k](z[rows], t[rows], c_sub, k_sub, told, km), PATCH)
+                out[out_rows, tok] = vt[p_idx, tok]                              # each (scene, token) written once
             return unpatchify(out, (CHANNELS, CANVAS, CANVAS), PATCH, TOKEN_GRID)
         bg = self.base if join == "sum_empty" else self.unconditional
         if bg is None:
@@ -664,10 +787,9 @@ class Collective:
         ve = self.background(bg, z, t, cells, colors)
         v = ve.clone()
         slot = torch.zeros((z.shape[0], N_CELLS) + tuple(z.shape[1:]), device=z.device, dtype=z.dtype)
-        for k, (rows, cols, va) in pairs.items():
-            slot[rows, cols] = va
-        for c in range(N_CELLS):                                            # the requests in cell order
-            rows = torch.nonzero(cells[:, c] >= 0, as_tuple=True)[0]
+        for k, rows, cols, c_sub, k_sub, told, km, _, _, _ in plan["pairs"]:
+            slot[rows, cols] = self.things[k](z[rows], t[rows], c_sub, k_sub, told, km)
+        for c, rows in enumerate(plan["cell_rows"]):                             # the requests in cell order
             if rows.numel():
                 v[rows] = v[rows] + (slot[rows, c] - ve[rows])
         return v

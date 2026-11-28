@@ -139,16 +139,45 @@ def from_cell_crops(crops: Tensor) -> Tensor:
     return y.reshape(b, c, CANVAS, CANVAS)
 
 
+_CELL_CENTERS_CACHE: Dict[torch.device, Tensor] = {}
+_COLOR_TABLE_CACHE: Dict[torch.device, Tensor] = {}
+_POLY_CORNERS_CACHE: Dict[int, Tensor] = {}
+_POLY_CORNERS_DEV_CACHE: Dict[Tuple[int, torch.device, torch.dtype], Tensor] = {}
+_BLUR_KERNEL_CACHE: Dict[torch.device, Tensor] = {}
+_LOCAL_CACHE: Dict[Tuple[int, torch.device], Tensor] = {}
+
+
+def _cell_centers_on(device) -> Tensor:
+    dev = torch.device(device)
+    t = _CELL_CENTERS_CACHE.get(dev)
+    if t is None:
+        c = torch.arange(N_CELLS, device=dev)
+        t = torch.stack([(c % CELLS) * CELL + CELL / 2, (c // CELLS) * CELL + CELL / 2], dim=1).float()
+        _CELL_CENTERS_CACHE[dev] = t
+    return t
+
+
+def _color_table_on(device) -> Tensor:
+    dev = torch.device(device)
+    t = _COLOR_TABLE_CACHE.get(dev)
+    if t is None:
+        t = torch.tensor(COLOR_VALUES, dtype=torch.float32, device=dev)
+        _COLOR_TABLE_CACHE[dev] = t
+    return t
+
+
 def cell_centers() -> Tensor:
     """[9, 2] float32: the (x, y) center of every cell in pixels."""
-    c = torch.arange(N_CELLS)
-    return torch.stack([(c % CELLS) * CELL + CELL / 2, (c // CELLS) * CELL + CELL / 2], dim=1).float()
+    return _cell_centers_on("cpu").clone()
 
 
 # ------------------------------------------------------------------ shapes
 def polygon_corners(thing: int) -> Tensor:
     """[M, 2] float64: the corners of a polygon thing at R = 1, in outline order (thing 3..8)."""
     t = int(thing)
+    cached = _POLY_CORNERS_CACHE.get(t)
+    if cached is not None:
+        return cached.clone()
     if t == 3:
         a = [math.radians(45 + 90 * k) for k in range(4)]
         pts = [(math.cos(x), math.sin(x)) for x in a]
@@ -173,32 +202,48 @@ def polygon_corners(thing: int) -> Tensor:
             pts.append((r * math.cos(a), r * math.sin(a)))
     else:
         raise ValueError(f"thing {thing} is not a polygon")
-    return torch.tensor(pts, dtype=torch.float64)
+    out = torch.tensor(pts, dtype=torch.float64)
+    _POLY_CORNERS_CACHE[t] = out
+    return out.clone()
+
+
+def _polygon_corners_on(t: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    key = (t, device, dtype)
+    cached = _POLY_CORNERS_DEV_CACHE.get(key)
+    if cached is None:
+        base = _POLY_CORNERS_CACHE.get(t)
+        if base is None:
+            polygon_corners(t)
+            base = _POLY_CORNERS_CACHE[t]
+        cached = base.to(device=device, dtype=dtype)
+        _POLY_CORNERS_DEV_CACHE[key] = cached
+    return cached
 
 
 def polygon_distance(px: Tensor, py: Tensor, corners: Tensor) -> Tensor:
     """The exact signed distance from points to polygons: px, py [K, ...] (the points of item k), corners [K, M, 2]
     (one polygon an item, in outline order) -> [K, ...]: the distance to the nearest edge, negative inside (an odd
     number of edge crossings of the ray to +x)."""
-    k = px.shape[0]
-    view = (k,) + (1,) * (px.dim() - 1)
-    m = corners.shape[1]
-    best = None
-    inside = torch.zeros_like(px, dtype=torch.bool)
-    for e in range(m):
-        ax, ay = corners[:, e, 0].view(view), corners[:, e, 1].view(view)
-        bx, by = corners[:, (e + 1) % m, 0].view(view), corners[:, (e + 1) % m, 1].view(view)
-        ex, ey = bx - ax, by - ay
-        wx, wy = px - ax, py - ay
-        ee = (ex * ex + ey * ey).clamp_min(1e-30)
-        tt = ((wx * ex + wy * ey) / ee).clamp(0.0, 1.0)
-        dx, dy = wx - ex * tt, wy - ey * tt
-        dd = dx * dx + dy * dy
-        best = dd if best is None else torch.minimum(best, dd)
-        straddle = (ay > py) != (by > py)
-        safe = torch.where(ey == 0, torch.ones_like(ey), ey)
-        xcross = ax + ex * (py - ay) / safe
-        inside = inside ^ (straddle & (px < xcross))
+    k, m = corners.shape[0], corners.shape[1]
+    view = (k, m) + (1,) * (px.dim() - 1)
+    ax = corners[:, :, 0].view(view)
+    ay = corners[:, :, 1].view(view)
+    nxt = torch.roll(corners, -1, dims=1)
+    bx = nxt[:, :, 0].view(view)
+    by = nxt[:, :, 1].view(view)
+    ex, ey = bx - ax, by - ay
+    px_e = px.unsqueeze(1)
+    py_e = py.unsqueeze(1)
+    wx, wy = px_e - ax, py_e - ay
+    ee = (ex * ex + ey * ey).clamp_min(1e-30)
+    tt = ((wx * ex + wy * ey) / ee).clamp(0.0, 1.0)
+    dx, dy = wx - ex * tt, wy - ey * tt
+    dd = dx * dx + dy * dy
+    best = dd.amin(dim=1)
+    straddle = (ay > py_e) != (by > py_e)
+    safe = torch.where(ey == 0, torch.ones_like(ey), ey)
+    xcross = ax + ex * (py_e - ay) / safe
+    inside = ((straddle & (px_e < xcross)).sum(dim=1) & 1).bool()
     dist = best.sqrt()
     return torch.where(inside, -dist, dist)
 
@@ -217,7 +262,7 @@ def thing_distance(thing: int, px: Tensor, py: Tensor, scale: Tensor) -> Tensor:
     if t == 2:
         qx = px - CRESCENT_SHIFT * r
         return torch.maximum(torch.sqrt(px * px + py * py) - r, r - torch.sqrt(qx * qx + py * py))
-    corners = polygon_corners(t).to(device=px.device, dtype=px.dtype)
+    corners = _polygon_corners_on(t, px.device, px.dtype)
     corners = corners[None] * (RADIUS * scale.to(px.dtype)).view(-1, 1, 1)
     return polygon_distance(px, py, corners)
 
@@ -325,9 +370,24 @@ def request_lists(n: int, count: int = 500, seed: Optional[int] = None) -> Reque
 
 # ------------------------------------------------------------------ rendering
 def _blur_kernel(device) -> Tensor:
-    x = torch.arange(-TEXTURE_RADIUS, TEXTURE_RADIUS + 1, dtype=torch.float32, device=device)
-    k = torch.exp(-x * x / (2 * TEXTURE_SIGMA ** 2))
-    return k / k.sum()
+    dev = torch.device(device)
+    cached = _BLUR_KERNEL_CACHE.get(dev)
+    if cached is None:
+        x = torch.arange(-TEXTURE_RADIUS, TEXTURE_RADIUS + 1, dtype=torch.float32, device=dev)
+        k = torch.exp(-x * x / (2 * TEXTURE_SIGMA ** 2))
+        cached = k / k.sum()
+        _BLUR_KERNEL_CACHE[dev] = cached
+    return cached
+
+
+def _local_grid(margin: int, device: torch.device) -> Tensor:
+    key = (margin, device)
+    cached = _LOCAL_CACHE.get(key)
+    if cached is None:
+        w = CELL + 2 * margin
+        cached = torch.arange(w, dtype=torch.float32, device=device) - margin + 0.5
+        _LOCAL_CACHE[key] = cached
+    return cached
 
 
 def texture(noise: Tensor) -> Tensor:
@@ -369,27 +429,28 @@ def render(cells: Tensor, colors: Tensor, bed: str, gen: torch.Generator, device
     angle (degrees), shade, centers [B, 9, 2] (x, y in pixels), color [B, 9, 3] (the shaded colors), and on bed C tint
     [B, 3], noise and texture [B, 48, 48] (the texture before any clipping), and ground [B, 3, 48, 48]). The random
     numbers are drawn on the CPU (``draw_parameters``) before anything is computed."""
-    cells = torch.as_tensor(cells, dtype=torch.long)
-    colors = torch.as_tensor(colors, dtype=torch.long)
-    if cells.dim() != 2 or cells.shape[1] != N_CELLS or colors.shape != cells.shape:
+    cells_cpu = torch.as_tensor(cells, dtype=torch.long).detach().cpu()
+    colors_cpu = torch.as_tensor(colors, dtype=torch.long).detach().cpu()
+    if cells_cpu.dim() != 2 or cells_cpu.shape[1] != N_CELLS or colors_cpu.shape != cells_cpu.shape:
         raise ValueError("a layout is cells [B, 9] and colors [B, 9]")
-    if bool(((cells >= 0) != (colors >= 0)).any()):
+    if bool(((cells_cpu >= 0) != (colors_cpu >= 0)).any()):
         raise ValueError("a cell holds a color exactly when it holds a thing")
-    if bool((cells >= len(THINGS)).any()) or bool((colors >= len(COLORS)).any()):
+    if bool((cells_cpu >= len(THINGS)).any()) or bool((colors_cpu >= len(COLORS)).any()):
         raise ValueError("things and colors are 0..8")
     margin = int(margin)
     if not 0 <= margin <= CELL:
         raise ValueError("margin is 0..16")
-    b = cells.shape[0]
+    dev = torch.device(device)
+    b = cells_cpu.shape[0]
     p = draw_parameters(b, gen, bed)
-    p = {k: v.to(device) for k, v in p.items()}
-    cells_d, colors_d = cells.to(device), colors.to(device)
-    centers = cell_centers().to(device)
+    p = {k: v.to(dev) for k, v in p.items()}
+    colors_d = colors_cpu.to(dev)
+    centers = _cell_centers_on(dev)
     p["centers"] = torch.stack([centers[:, 0] + p["shift_x"], centers[:, 1] + p["shift_y"]], dim=-1)
-    table = torch.tensor(COLOR_VALUES, dtype=torch.float32, device=device)
+    table = _color_table_on(dev)
     p["color"] = (table[colors_d.clamp_min(0)] + p["shade"]).clamp(0.0, 1.0)
     if bed == "F":
-        ground = torch.full((b, CHANNELS, CANVAS, CANVAS), GROUND, dtype=torch.float32, device=device)
+        ground = torch.full((b, CHANNELS, CANVAS, CANVAS), GROUND, dtype=torch.float32, device=dev)
     else:
         p["texture"] = texture(p["noise"])
         ground = p["tint"][:, :, None, None] + p["texture"][:, None]
@@ -397,32 +458,35 @@ def render(cells: Tensor, colors: Tensor, bed: str, gen: torch.Generator, device
 
     w = CELL + 2 * margin
     side = CANVAS + 2 * margin
-    cov_sum = torch.zeros(b, side, side, dtype=torch.float32, device=device)
-    colored = torch.zeros(b, CHANNELS, side, side, dtype=torch.float32, device=device)
-    item_b, item_c = torch.nonzero(cells_d >= 0, as_tuple=True)
-    if item_b.numel():
-        things = cells_d[item_b, item_c]
+    cov_sum = torch.zeros(b, side, side, dtype=torch.float32, device=dev)
+    colored = torch.zeros(b, CHANNELS, side, side, dtype=torch.float32, device=dev)
+    item_b_cpu, item_c_cpu = torch.nonzero(cells_cpu >= 0, as_tuple=True)
+    if item_b_cpu.numel():
+        things_cpu = cells_cpu[item_b_cpu, item_c_cpu]
+        item_b, item_c = item_b_cpu.to(dev), item_c_cpu.to(dev)
         cx, cy = p["centers"][item_b, item_c, 0], p["centers"][item_b, item_c, 1]
         ang = torch.deg2rad(p["angle"][item_b, item_c])
         ca, sa = torch.cos(ang), torch.sin(ang)
         scale = p["scale"][item_b, item_c]
-        local = torch.arange(w, dtype=torch.float32, device=device) - margin + 0.5
+        local = _local_grid(margin, dev)
         xs = (item_c % CELLS).float()[:, None] * CELL + local[None]          # [K, w] pixel-center x
         ys = (item_c // CELLS).float()[:, None] * CELL + local[None]
         dx = (xs - cx[:, None])[:, None, :]                                 # [K, 1, w]
         dy = (ys - cy[:, None])[:, :, None]                                 # [K, w, 1]
         px = ca[:, None, None] * dx + sa[:, None, None] * dy                # [K, w, w]
         py = -sa[:, None, None] * dx + ca[:, None, None] * dy
-        cov = torch.zeros(item_b.shape[0], w, w, dtype=torch.float32, device=device)
+        cov = torch.zeros(item_b.shape[0], w, w, dtype=torch.float32, device=dev)
         for t in range(len(THINGS)):
-            sel = torch.nonzero(things == t, as_tuple=True)[0]
-            if sel.numel():
+            sel_cpu = torch.nonzero(things_cpu == t, as_tuple=True)[0]
+            if sel_cpu.numel():
+                sel = sel_cpu.to(dev)
                 cov[sel] = coverage(thing_distance(t, px[sel], py[sel], scale[sel]))
         col = p["color"][item_b, item_c]
         for c in range(N_CELLS):
-            sel = torch.nonzero(item_c == c, as_tuple=True)[0]
-            if sel.numel():
-                bs = item_b[sel]
+            sel_cpu = torch.nonzero(item_c_cpu == c, as_tuple=True)[0]
+            if sel_cpu.numel():
+                sel = sel_cpu.to(dev)
+                bs = item_b_cpu[sel_cpu].to(dev)
                 y0, x0 = (c // CELLS) * CELL, (c % CELLS) * CELL
                 cov_sum[bs, y0:y0 + w, x0:x0 + w] += cov[sel]
                 colored[bs, :, y0:y0 + w, x0:x0 + w] += cov[sel][:, None] * col[sel][:, :, None, None]
@@ -460,7 +524,9 @@ class ScenesBed:
         """n fresh scenes of a kind from the CPU generator ``gen``: the layouts first, then the render's draws."""
         cells, colors = draw_layouts(kind, n, gen, only_class=only_class, count=count, allowed_cells=allowed_cells)
         pixels, params = render(cells, colors, self.bed, gen, self.device)
-        return SceneBatch(to_model(pixels), cells.to(self.device), colors.to(self.device), params)
+        sb = SceneBatch(to_model(pixels), cells.to(self.device), colors.to(self.device), params)
+        sb._cells_cpu = cells
+        return sb
 
     def heldout(self, kind: str, n: int, seed: int, only_class: Optional[int] = None,
                 count: Optional[int] = None, allowed_cells: Optional[Sequence[int]] = None) -> SceneBatch:

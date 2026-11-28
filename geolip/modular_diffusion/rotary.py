@@ -72,13 +72,25 @@ ANCHORED_HEAD_DIM = 64
 ANCHOR_BASE = 3
 
 
+_ANCHORED_RATES_CACHE: dict = {}
+
+
+def _anchored_rates(lo: float, hi: float, device: torch.device) -> Tensor:
+    key = (float(lo), float(hi), device)
+    cached = _ANCHORED_RATES_CACHE.get(key)
+    if cached is None:
+        per = ANCHORED_PAIRS["row"][1] - ANCHORED_PAIRS["row"][0]
+        lam = float(lo) * (float(hi) / float(lo)) ** (torch.arange(per, dtype=torch.float64) / per)
+        cached = (2 * math.pi / lam).to(device)
+        _ANCHORED_RATES_CACHE[key] = cached
+    return cached
+
+
 def anchored_angles(rows: Tensor, cols: Tensor, digit_col: Tensor, digit_row: Tensor, lo: float = WHOLE[0],
                     hi: float = WHOLE[1]) -> Tensor:
     """[B, N, 32] float32: the angle of each pair for tokens at (row, column) on the relative band (floats) with the
     address digits (digit_col, digit_row); every input [B, N]."""
-    per = ANCHORED_PAIRS["row"][1] - ANCHORED_PAIRS["row"][0]
-    lam = float(lo) * (float(hi) / float(lo)) ** (torch.arange(per, dtype=torch.float64) / per)
-    rates = (2 * math.pi / lam).to(rows.device)
+    rates = _anchored_rates(lo, hi, rows.device)
     r, c = rows.double(), cols.double()
     rel = torch.cat([r[..., None] * rates, c[..., None] * rates], dim=-1)                  # [B, N, 20]
     zero = torch.zeros(rel.shape[:-1] + (4,), dtype=torch.float64, device=rows.device)
@@ -92,8 +104,9 @@ def anchored_rotary(rows: Tensor, cols: Tensor, digit_col: Tensor, digit_row: Te
     """The rotary (q, k) -> (q, k) on [B, heads, N, 64] of ``anchored_angles`` (the rotate-half pairing: pair i joins
     the numbers i and i + 32, as ``AxialBandCode`` pairs them)."""
     ang = anchored_angles(rows, cols, digit_col, digit_row, lo, hi)
-    ang = torch.cat([ang, ang], dim=-1)[:, None]                                         # [B, 1, N, 64]
-    cos, sin = ang.cos(), ang.sin()
+    c0, s0 = ang.cos(), ang.sin()
+    cos = torch.cat([c0, c0], dim=-1)[:, None]                                           # [B, 1, N, 64]
+    sin = torch.cat([s0, s0], dim=-1)[:, None]
 
     def _rot(q: Tensor, k: Tensor) -> Tuple[Tensor, Tensor]:
         if q.shape[-1] != ANCHORED_HEAD_DIM:
