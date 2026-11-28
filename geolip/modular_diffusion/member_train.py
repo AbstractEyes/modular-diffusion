@@ -631,6 +631,7 @@ def train_members(variant: Variant, classes: Sequence[Optional[int]], bed: Scene
     average = {k: v.detach().clone() for k, v in state.items()}
     sets = own_read_sets(variant, classes, bed, heldout, p_point, exclude, held)
     read_chunks = own_read_chunks(sets, device)                    # prepared and moved once, kept on the device
+    sets = [None] * len(sets)                                      # the chunks hold all a read needs: the sets' tensors are let go
     curves: List[List[dict]] = [[] for _ in classes]
     step_seconds: List[float] = []
     done = 0

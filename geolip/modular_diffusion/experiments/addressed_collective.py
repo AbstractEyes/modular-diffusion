@@ -71,7 +71,16 @@ reported apart. At a level t a picture x in model space and its noise give z = (
                  b| over rows, heads and both candidates, the same of the pair-group scores, and the rows whose
                  weights and raw answers are exactly equal under the two asks (of ``rows``); per level the largest
                  absolute change of the raw answers (block 0's pass) and the rows in which the picture is nearer the
-                 asked color under BOTH asks, under ask a only, under ask b only, under neither (of ``rows``)
+                 asked color under BOTH asks, under ask a only, under ask b only, under neither (of ``rows``).
+                 THE DIRECTION, since one step from noise the nearer of two colors is often decided by which of
+                 them lies nearer the picture's blur, whatever is asked: the cell's mean color under ask a minus
+                 its mean color under ask b, projected on (color a - color b) and divided by that gap's squared
+                 length (1 = the whole gap, 0 = nothing moved): the rows in which it is above 0 (moved toward
+                 the asked color), below 0 (moved away), exactly 0, and its mean over ``rows``.
+                 ``alternative_held``: the first ask is drawn outside the held pairs, the second candidate is
+                 not, so it can be the engine's held partner, a pair never asked in training; the rows used of
+                 which that is so, and the same joint and direction counts over those rows alone (what is said of
+                 pairs met in training rests on the other rows)
     the scenes   of the other reads: ``k`` lists of ``members.pointer_lists(4, k, 31000)`` (no pointer for the told
                  "own" kinds), rendered from a generator seeded 31001, the noise of level t from one seeded 31002 +
                  round(1000 t); on each scene the edited cell is the first request that neither points nor is asked,
@@ -379,13 +388,17 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
     dev = a["device"]
     depth = len(next(iter(col.things.values())).blocks)
     out = {"vary": vary, "k_rows_drawn_per_engine": int(a["k"]), "by_t": {}}
+    held = set(held_pairs(a["held"]))
     # an engine's rows do not depend on the noise level: drawn once an engine (the same generator and seed)
     batches = {cls: MB.member_batch(variant, cls, bed, int(a["k"]), torch.Generator().manual_seed(FIND_SEED + 100 * cls),
                                     1.0, _exclude(a), held_pairs(a["held"])) for cls in col.things}
     for t in _levels(a):
         acc = {"rows": 0, "rows_drawn": 0, "skipped_same_color": 0, "skipped_no_candidate": 0,
                "skipped_no_pointer": 0, "nearer_asked_a": 0, "nearer_asked_b": 0, "both_nearer": 0, "only_a": 0,
-               "only_b": 0, "neither": 0, "max_abs_answer_delta": 0.0, "per_engine": {}, "blocks": {}}
+               "only_b": 0, "neither": 0, "moved_toward_the_asked": 0, "moved_away": 0, "not_moved": 0,
+               "sum_share_of_the_color_gap": 0.0, "max_abs_answer_delta": 0.0, "per_engine": {}, "blocks": {},
+               "alternative_held": {"rows": 0, "both_nearer": 0, "only_a": 0, "only_b": 0, "neither": 0,
+                                    "moved_toward_the_asked": 0, "moved_away": 0, "not_moved": 0}}
         sums = {}
         for cls, eng in col.things.items():
             mb = batches[cls]
@@ -416,6 +429,10 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
                 cb = S.COLOR_VALUES[int(mb["colors"][i, row.index(ask_b)])]
                 ca, cb = torch.tensor(ca), torch.tensor(cb)
                 acc["rows"] += 1
+                # the first ask is drawn outside the held pairs; the second candidate may be the held partner
+                alt = acc["alternative_held"] if (cls, ask_b) in held else None
+                if alt is not None:
+                    alt["rows"] += 1
                 whole = MB.find_read(eng, variant, z, tt, mb["cells"][i:i + 1], mb["colors"][i:i + 1],
                                      mb["points"][i:i + 1], 0, cell, ask_a, ask_b, None, visible=visible, vary=vary)
                 for blk in range(depth):                 # every block from the same two forwards
@@ -439,14 +456,23 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
                         acc["max_abs_answer_delta"] = max(acc["max_abs_answer_delta"], float(
                             (r["answer_a"].double() - r["answer_b"].double()).abs().max()))
                         zt = patchify(z, S.PATCH)[0, MB._tokens_of(cell, z.device)].cpu()
-                        nearer = {}
+                        nearer, means = {}, {}
                         for tag, ans, want, other in (("a", r["answer_a"], ca, cb), ("b", r["answer_b"], cb, ca)):
                             m = _mean_color(zt + (1 - t) * ans.cpu())
+                            means[tag] = m.double()
                             nearer[tag] = float((m - want).norm()) < float((m - other).norm())
                             if nearer[tag]:
                                 acc["nearer_asked_" + tag] += 1
-                        acc[{(True, True): "both_nearer", (True, False): "only_a", (False, True): "only_b",
-                             (False, False): "neither"}[(nearer["a"], nearer["b"])]] += 1
+                        joint = {(True, True): "both_nearer", (True, False): "only_a", (False, True): "only_b",
+                                 (False, False): "neither"}[(nearer["a"], nearer["b"])]
+                        gap = (ca - cb).double()                       # the two candidates differ in color
+                        share = float(((means["a"] - means["b"]) * gap).sum() / (gap * gap).sum())
+                        moved = "moved_toward_the_asked" if share > 0 else "moved_away" if share < 0 else "not_moved"
+                        for counts in (acc, alt):                      # alt: the rows whose second candidate is held
+                            if counts is not None:
+                                counts[joint] += 1
+                                counts[moved] += 1
+                        acc["sum_share_of_the_color_gap"] += share
         rows = max(1, acc["rows"])
         for blk, s in sums.items():
             acc["blocks"][str(blk)] = {
@@ -458,6 +484,7 @@ def _find(a: dict, col: MB.MemberCollective, log) -> dict:
                 "rows_exactly_equal": s["rows_exactly_equal"], "rows": acc["rows"]}
         acc["share_nearer_asked_a"] = acc["nearer_asked_a"] / acc["rows"] if acc["rows"] else None
         acc["share_nearer_asked_b"] = acc["nearer_asked_b"] / acc["rows"] if acc["rows"] else None
+        acc["mean_share_of_the_color_gap"] = acc.pop("sum_share_of_the_color_gap") / acc["rows"] if acc["rows"] else None
         out["by_t"][str(t)] = acc
         log(f"FIND t={t}: {acc['rows']} rows used of {acc['rows_drawn']} drawn (skipped: {acc['skipped_same_color']} "
             f"same color, {acc['skipped_no_candidate']} no second candidate, {acc['skipped_no_pointer']} no pointer); "
@@ -829,9 +856,18 @@ def _text(result: dict) -> str:
                                      f"{_f(b['max_abs_weight_delta'])} | {_f(b['max_abs_score_delta'])} | "
                                      f"{b['rows_exactly_equal']} of {b['rows']} |")
             lines += ["", "| t | rows used | nearer the asked color under both asks | ask a only | ask b only | neither "
-                      "| largest change of the raw answers |", "|---|---|---|---|---|---|---|"]
+                      "| largest change of the raw answers | moved toward the asked color | moved away | not moved "
+                      "| mean share of the color gap |", "|---|---|---|---|---|---|---|---|---|---|---|"]
             lines += [f"| {t} | {x['rows']} | {x['both_nearer']} | {x['only_a']} | {x['only_b']} | {x['neither']} | "
-                      f"{_f(x['max_abs_answer_delta'])} |" for t, x in find["by_t"].items()]
+                      f"{_f(x['max_abs_answer_delta'])} | {x.get('moved_toward_the_asked')} | {x.get('moved_away')} | "
+                      f"{x.get('not_moved')} | {_f(x.get('mean_share_of_the_color_gap'))} |"
+                      for t, x in find["by_t"].items()]
+            lines += ["", "| t | rows whose second candidate is the held partner | nearer under both asks | ask a only "
+                      "| ask b only | neither | moved toward the asked color | moved away | not moved |",
+                      "|---|---|---|---|---|---|---|---|---|"]
+            lines += [f"| {t} | {h['rows']} | {h['both_nearer']} | {h['only_a']} | {h['only_b']} | {h['neither']} | "
+                      f"{h['moved_toward_the_asked']} | {h['moved_away']} | {h['not_moved']} |"
+                      for t, x in find["by_t"].items() for h in [x.get("alternative_held")] if h]
             lines += ["", "| t | engine | rows drawn | rows used | skipped: no pointer | same color | no second "
                       "candidate |", "|---|---|---|---|---|---|---|"]
             for t, x in find["by_t"].items():

@@ -149,6 +149,15 @@ def test_address_runs_every_read(runs, tmp_path, kind, held, depth):
                 assert key in x, key
             assert x["both_nearer"] + x["only_a"] + x["only_b"] + x["neither"] == x["rows"]
             assert x["both_nearer"] + x["only_a"] == x["nearer_asked_a"]
+            assert x["moved_toward_the_asked"] + x["moved_away"] + x["not_moved"] == x["rows"]   # the direction read
+            assert "sum_share_of_the_color_gap" not in x and (x["rows"] == 0) == (x["mean_share_of_the_color_gap"] is None)
+            if kind == "C1":                    # its answers are equal under the two asks: nothing can move
+                assert x["not_moved"] == x["rows"] and x["mean_share_of_the_color_gap"] in (0.0, None)
+            h = x["alternative_held"]           # the rows whose second candidate is the engine's held partner
+            assert 0 <= h["rows"] <= x["rows"] and (h["rows"] == 0 or held == "plus4")
+            assert h["both_nearer"] + h["only_a"] + h["only_b"] + h["neither"] == h["rows"]
+            assert h["moved_toward_the_asked"] + h["moved_away"] + h["not_moved"] == h["rows"]
+            assert all(h[key] <= x[key] for key in h)
             assert x["rows_drawn"] == 16 * len(x["per_engine"]) == sum(e["drawn"] for e in x["per_engine"].values())
             assert x["rows"] == sum(e["used"] for e in x["per_engine"].values())
             for e in x["per_engine"].values():
@@ -274,6 +283,13 @@ def test_find_with_one_batch_an_engine_and_one_pair_of_passes_writes_the_numbers
     col, _ = A.load_collective(a)
     got = A._find(a, col, lambda s: None)
     want = _reference_find(a, col)
+    for x in got["by_t"].values():              # the direction read came after the reference copy: checked, then set aside
+        assert x["moved_toward_the_asked"] + x["moved_away"] + x["not_moved"] == x["rows"]
+        for key in ("moved_toward_the_asked", "moved_away", "not_moved", "mean_share_of_the_color_gap"):
+            x.pop(key)
+        h = x.pop("alternative_held")           # as is the label of a held second candidate
+        assert h["both_nearer"] + h["only_a"] + h["only_b"] + h["neither"] == h["rows"] <= x["rows"]
+        assert (h["rows"] == 0) or held == "plus4"
     assert json.dumps(got, sort_keys=True) == json.dumps(want, sort_keys=True)
     assert any(x["rows"] for x in got["by_t"].values()), "no row was read: the comparison would be empty"
 
